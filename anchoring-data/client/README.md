@@ -23,6 +23,11 @@ cargo add data-anchor-client
 data-anchor-client = "0.1.x"
 ```
 
+* **4. Funded wallet**
+  
+  Make sure your Solana keypair has SOL on Devnet or Mainnet before running the demo.
+  
+
 ### Configuration
 
 - Clone this repo and create a `.env.local` in the same folder as `client.rs`:
