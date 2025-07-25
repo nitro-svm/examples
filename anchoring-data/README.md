@@ -14,11 +14,12 @@ Data Anchor lets you store your data blobs on Solana’s ledger—packed and ful
 
 
 ## Quickstart
+
+**Usage**
 - [CLI Usage](https://github.com/nitro-svm/examples/tree/main/anchoring-data/cli)
 - [Client Usage](https://github.com/nitro-svm/examples/tree/main/anchoring-data/client)
 
-
-## Video Demos
+**Video Demos**
 
 1. [Uploading and Verifying Data on Solana](https://youtu.be/sgjmaujHYdE?si=a4GJrxBX5B24HHvF)
 2. [Upload and Index Data on Solana](https://youtu.be/sgjmaujHYdE?si=a4GJrxBX5B24HHvF)
@@ -39,26 +40,9 @@ Data Anchor lets you store your data blobs on Solana’s ledger—packed and ful
 - **Built for scale**: Data Anchor leverages Solana’s high throughput (up to ~1,289 TPS) and sub‑second block times (≈0.4 s).
 
 
-## Configuration
+## Architecture
 
-Set these once in your shell so every command picks them up automatically:
-
-```bash
-export DATA_ANCHOR_PROGRAM_ID="<YOUR_PROGRAM_ID>"
-export DATA_ANCHOR_NAMESPACE="<YOUR_NAMESPACE>"
-export DATA_ANCHOR_PAYER="<PATH_TO_YOUR_KEYPAIR_JSON>"
-export DATA_ANCHOR_INDEXER_URL="https://<INDEXER_URL>"
-export DATA_ANCHOR_INDEXER_API_TOKEN="<YOUR_INDEXER_API_TOKEN>"
-export DATA_ANCHOR_OUTPUT="json"
-```
-
-
-## Program IDs
-
-Use the correct on‑chain program for your network:
-
-* **Solana Mainnet**: `9i2MEc7s38jLGoEkbFszuTJCL1w3Uorg7qjPjfN8Tv5Z`
-* **Solana Devnet**: `2RWsr92iL39YCLiZu7dZ5hron4oexEMbgWDg35v5U5tH`
+We built Data Anchor as a set of focused Rust crates for anchoring data, on‑chain interaction, indexing, and proof handling—so teams can pick only the pieces they need. This modular design powers DePIN networks, rollups, and data‑heavy dApps seeking verifiable, scalable storage.
 
 
 ## Examples Overview
@@ -88,11 +72,6 @@ A quick run‑through of core workflows—see the CLI or RPC docs for full comma
 
 * **get\_proof**
   Obtain a cryptographic proof for a blob.
-
-
-## Architecture
-
-We built Data Anchor as a set of focused Rust crates for anchoring data, on‑chain interaction, indexing, and proof handling—so teams can pick only the pieces they need. This modular design powers DePIN networks, rollups, and data‑heavy dApps seeking verifiable, scalable storage.
 
 
 ## Full API reference and integration guides

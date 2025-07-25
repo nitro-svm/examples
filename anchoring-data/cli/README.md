@@ -5,26 +5,26 @@ A turnkey bash script (`cli.sh`) that walks Solana developers through storing, v
 
 ### Prerequisites
 
-* **Solana CLI**
+* **1. Solana CLI**
   Install via the official installer script:
 
   ```bash
   curl --proto '=https' --tlsv1.2 -sSfL https://solana-install.solana.workers.dev | bash
   ```
 
-* **Data Anchor CLI**
+* **2. Data Anchor CLI**
   Download and install the Data Anchor tool:
 
   ```bash
   curl -sSf https://data-anchor.termina.technology/install.sh
   ```
-* **Verify installation**
+* **3. Verify installation**
   Run to list available commands and options:
 
   ```bash
   data-anchor --help
   ```
-* **Funded wallet**
+* **4. Funded wallet**
   
   Make sure your Solana keypair has SOL on Devnet or Mainnet before running the demo.
 
@@ -57,7 +57,7 @@ Edit `.env.local` with your own values with examples shown in `.env.example`:
    ./cli.sh
    ```
 
-## Demo Script Steps
+## Demo Steps
 
 Below is a high‑level summary of what `cli.sh` does:
 
@@ -107,6 +107,14 @@ Below is a high‑level summary of what `cli.sh` does:
 * **Static blob**: skip step 2 and point `--data-path` at your own JSON.
 * **Alternate payload**: swap in any JSON shape—AI metrics, DePIN session logs, etc.
 * **Mainnet usage**: update `.env.local` to Mainnet program ID and indexer URL, fund your wallet, then re‑run.
+
+
+## Program IDs
+
+Use the correct on‑chain program for your network:
+
+* **Solana Mainnet**: `9i2MEc7s38jLGoEkbFszuTJCL1w3Uorg7qjPjfN8Tv5Z`
+* **Solana Devnet**: `2RWsr92iL39YCLiZu7dZ5hron4oexEMbgWDg35v5U5tH`
 
 
 ## Further Resources
