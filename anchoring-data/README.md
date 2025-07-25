@@ -15,12 +15,8 @@ Data Anchor lets you store your data blobs on Solana’s ledger—packed and ful
 
 ## Video Demos
 
-<a href="https://www.youtube.com/playlist?list=PL4_zf7m0PJOeExwDh0ZDzGjQsTjGls2Dw">
-  <picture>
-    <source srcset=".png">
-    <img alt="Anchoring and Indexing Data" style="max-width: 100%;">
-  </picture>
-</a>
+1. [Uploading and Verifying Data on Solana](https://youtu.be/sgjmaujHYdE?si=a4GJrxBX5B24HHvF)
+2. [Upload and Index Data on Solana](https://youtu.be/sgjmaujHYdE?si=a4GJrxBX5B24HHvF)
 
 
 ## Why use Data Anchor

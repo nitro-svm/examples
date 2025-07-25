@@ -1,10 +1,9 @@
-# Data Anchor CLI End‑to‑End Demo
+## Data Anchor CLI End‑to‑End Demo
 
 A turnkey bash script (`cli.sh`) that walks Solana developers through storing, verifying, indexing, and reclaiming on‑chain data with Data Anchor—all in one go. This demo targets data‑intensive use cases (AI agents, DePIN networks, IoT telemetry, etc.) where cost and verifiability matter.
 
----
 
-## Prerequisites
+### Prerequisites
 
 * **Solana CLI**
   Install via the official installer script:
@@ -29,13 +28,12 @@ A turnkey bash script (`cli.sh`) that walks Solana developers through storing, v
   
   Make sure your Solana keypair has SOL on Devnet or Mainnet before running the demo.
 
+
 ### Optional Prerequisites
 
 * **jq**, **xxd**: for JSON parsing & hex decoding
 
----
-
-## Configuration
+### Configuration
 
 Clone this repo and create a `.env.local` in the same folder as `cli.sh`:
 
@@ -45,7 +43,6 @@ cp examples/cli/.env.example .env.local
 
 Edit `.env.local` with your own values with examples shown in `.env.example`:
 
----
 
 ## Quickstart
 
@@ -59,8 +56,6 @@ Edit `.env.local` with your own values with examples shown in `.env.example`:
    ```bash
    ./cli.sh
    ```
-
----
 
 ## Demo Script Steps
 
@@ -90,9 +85,8 @@ Below is a high‑level summary of what `cli.sh` does:
 8. **Close blober**
    Tears down the PDA to reclaim rent, cleaning up on‑chain state.
 
----
 
-## Error Handling & Validation
+### Error Handling & Validation
 
 * **Missing `.env.local`**
   Script exits with instructions if environment variables aren’t set.
@@ -107,21 +101,20 @@ Below is a high‑level summary of what `cli.sh` does:
 * **Indexer mismatch**
   Compares indexer‑returned data to on‑chain decoded bytes and errors on discrepancy.
 
----
 
-## Customization
+### Customization
 
 * **Static blob**: skip step 2 and point `--data-path` at your own JSON.
 * **Alternate payload**: swap in any JSON shape—AI metrics, DePIN session logs, etc.
 * **Mainnet usage**: update `.env.local` to Mainnet program ID and indexer URL, fund your wallet, then re‑run.
 
----
 
 ## Further Resources
 
 * **Deep dive CLI reference**: `data-anchor --help`
 * **Developer docs**: [link](https://docs.termina.technology/documentation/network-extension-stack/modules/data-anchor)
 * **Join the conversation**: [Termina's Twitter](https://x.com/Terminaxyz)
+
 
 ## Published Crates
 
@@ -132,7 +125,5 @@ The source code for the CLI and related components is published on [crates.io](h
 * [Blober Program](https://docs.rs/data-anchor-blober/latest/data_anchor_blober/)
 * [Indexer API](https://docs.rs/data-anchor-api/latest/data_anchor_api/)
 * [Proofs API](https://docs.rs/data-anchor-proofs/latest/data_anchor_proofs/)
-
----
 
 *Happy anchoring!*

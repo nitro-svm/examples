@@ -2,8 +2,6 @@
 
 Leverage the Data Anchor Rust SDK to anchor, retrieve, index, and prove data on Solana—all with simple, high‑level calls. This guide walks you through a full end‑to‑end example, from namespace initialization to cleanup.
 
----
-
 ### Installation
 
 Add the client to your project via cargo add, or pin a specific version in your `Cargo.toml`:
@@ -28,19 +26,22 @@ cp examples/cli/.env.example .env.local
 
 Edit `.env.local` with your own values with examples shown in `.env.example`:
 
----
+### Quickstart
 
-### Building the Client
+1. Install Dependencies
 
-From your project root:
+   ```bash
+   cargo build
+   ```
+2. Export Environment Variables
 
-```bash
-cargo build
-```
-
-*No extra features are needed for basic functionality.*
-
----
+   ```bash
+   export $(cat .env.local | xargs)
+   ```
+3. Run the Client
+   ```bash
+   cargo run
+   ```
 
 ### Core Methods
 
@@ -67,16 +68,12 @@ cargo build
 * `close_blober(fee, namespace, opts)` ⇒ `Vec<SuccessfulTransaction>`
   Tears down the PDA and reclaims rent.
 
----
-
 ### Error Handling & Tips
 
 * **Insufficient Balance**: ensure your payer has ≥896 160 lamports (\~0.001 SOL) for namespace init.
 * **Empty Outcomes**: always assert `!outcomes.is_empty()` after `initialize_blober` and `upload_blob`.
 * **Network**: default is Devnet - switch to Mainnet Beta by updating `DATA_ANCHOR_PROGRAM_ID` and `INDEXER_URL`.
 * **Retry Logic**: wrap RPC/indexer calls in retries for production reliability.
-
----
 
 ## Further Resources
 
@@ -93,7 +90,5 @@ The source code for the client and related components is published on [crates.io
 * [Blober Program](https://docs.rs/data-anchor-blober/latest/data_anchor_blober/)
 * [Indexer API](https://docs.rs/data-anchor-api/latest/data_anchor_api/)
 * [Proofs API](https://docs.rs/data-anchor-proofs/latest/data_anchor_proofs/)
-
----
 
 *Happy anchoring!*
