@@ -13,6 +13,11 @@ Data Anchor delivers on‑chain verifiable storage at a fraction of the cost.
 Data Anchor lets you store your data blobs on Solana’s ledger—packed and fully verifiable—while keeping costs low via efficient storage and an indexer. You pay rent once per blob, fetch data instantly via HTTP or CLI, and enjoy order‑of‑magnitude savings over naïvely stuffing bytes into on‑chain accounts 
 
 
+## Quickstart
+- [CLI Usage](https://github.com/nitro-svm/examples/tree/main/anchoring-data/cli)
+- [Client Usage](https://github.com/nitro-svm/examples/tree/main/anchoring-data/client)
+
+
 ## Video Demos
 
 1. [Uploading and Verifying Data on Solana](https://youtu.be/sgjmaujHYdE?si=a4GJrxBX5B24HHvF)
