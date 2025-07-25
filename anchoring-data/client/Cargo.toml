@@ -1,0 +1,11 @@
+[package]
+name = "anchoring-data-client"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+data-anchor-client = "0.4.0"
+serde_json = "1.0.141"
+solana-cli-config = "2.2.1"
+solana-sdk = "2.2.1"
+tokio = { version = "1.46.1", features = ["full"] }
