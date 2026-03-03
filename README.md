@@ -20,7 +20,7 @@ cargo run -- \
 ```
 
 1. Connect to the backtest WebSocket endpoint
-2. Create a session over a range of historical Solana slots (if the requested change isn't in the cache, it'll take ~90s to fetch and prepare)
+2. Create a session over a range of historical Solana slots (if the requested range isn't in the cache, it'll take ~90s to fetch and prepare)
 3. Query the simulated chain state via HTTP JSON-RPC (`getSlot`, `getLatestBlockhash`, `getAccountInfo`)
 4. Advance through each block one at a time
 5. Close the session
