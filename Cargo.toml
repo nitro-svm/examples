@@ -12,9 +12,11 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+solana-client = "3.1.0"
+solana-commitment-config = "3.1.0"
+solana-rpc-client-api = "3.1.0"
 tokio = { version = "1", features = ["full"] }
 url = "2"
 # native-tls is required for wss:// connections; remove the feature flag if
