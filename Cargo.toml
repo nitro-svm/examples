@@ -1,0 +1,22 @@
+[package]
+name = "backtest-example"
+version = "0.1.0"
+edition = "2024"
+description = "Raw backtest session example — WebSocket control + HTTP JSON-RPC, no internal libs"
+
+[[bin]]
+name = "backtest-example"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+# native-tls is required for wss:// connections; remove the feature flag if
+# you only connect to ws:// (plain, non-TLS) endpoints.
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
