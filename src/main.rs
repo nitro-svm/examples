@@ -209,7 +209,6 @@ struct Session {
     /// Full HTTP URL for JSON-RPC queries, e.g. `http://host/backtest/backtest_<uuid>`.
     rpc_endpoint: String,
     http: reqwest::Client,
-    api_key: String,
 }
 
 impl Session {
@@ -303,7 +302,6 @@ impl Session {
             session_id,
             rpc_endpoint,
             http,
-            api_key: cli.api_key.clone(),
         };
 
         // ── 4. Wait for the initial ReadyForContinue ───────────────────────────
@@ -350,7 +348,6 @@ impl Session {
     /// ```text
     /// POST {rpc_endpoint}
     /// Content-Type: application/json
-    /// X-API-Key: {api_key}
     ///
     /// {"jsonrpc":"2.0","id":1,"method":"{method}","params":[...]}
     /// ```
@@ -372,7 +369,6 @@ impl Session {
         let resp: Value = self
             .http
             .post(&self.rpc_endpoint)
-            .header("X-API-Key", &self.api_key)
             .json(&body)
             .send()
             .await

@@ -32,4 +32,4 @@ All arguments have defaults so a bare `cargo run` will attempt to connect to
 `ws://localhost:8900/backtest` with the key `local-dev-key`.
 
 HTTP JSON-RPC calls are standard Solana RPC format, posted to the
-`rpcEndpoint` from the `SessionCreated` response with an `X-API-Key` header.
+`rpcEndpoint` from the `SessionCreated` response. This endpoint is unauthenticated.
