@@ -1,10 +1,10 @@
 # backtest-example-rust
 
-A minimal Rust example of interacting with the Nitro backtest API using only
+A minimal Rust example of interacting with the backtest API using only
 standard external crates.
 
 ## Running
-```
+```bash
 # Show available ranges
 curl https://<host>/available-ranges | jq
 ```
