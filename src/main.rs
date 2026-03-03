@@ -123,8 +123,6 @@ struct CreateParams {
     preload_programs: Vec<String>,
     /// History clerk bundle IDs to preload before execution.
     preload_account_bundles: Vec<String>,
-    /// When true the server includes a `SessionSummary` in the `Completed` response.
-    send_summary: bool,
 }
 
 /// Parameters for `Continue`.
@@ -161,22 +159,13 @@ enum WsResponse {
     /// High-level progress updates during a `Continue` call.
     Status { status: String },
     /// All blocks in the requested range have been executed.
-    Completed { summary: Option<Summary> },
+    Completed { summary: Option<serde_json::Value> },
     /// Acknowledgement for `CloseBacktestSession`.
     Success,
     /// Server-side error.
     Error(Value),
 }
 
-/// Transaction execution statistics for the completed session.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Summary {
-    correct_simulation: usize,
-    incorrect_simulation: usize,
-    execution_errors: usize,
-    execution_diffs: usize,
-}
 
 // ── URL helpers ────────────────────────────────────────────────────────────────
 
@@ -283,7 +272,6 @@ impl Session {
                 signer_filter: vec![],
                 preload_programs: vec![],
                 preload_account_bundles: vec![],
-                send_summary: true,
             }),
         )
         .await?;
@@ -344,13 +332,7 @@ impl Session {
                 WsResponse::Completed { summary } => {
                     eprintln!("[ws] Completed");
                     if let Some(s) = summary {
-                        eprintln!(
-                            "[ws] summary: correct={} incorrect={} errors={} diffs={}",
-                            s.correct_simulation,
-                            s.incorrect_simulation,
-                            s.execution_errors,
-                            s.execution_diffs,
-                        );
+                        eprintln!("[ws] summary: {s}");
                     }
                     return Ok(false);
                 }
