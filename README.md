@@ -4,19 +4,30 @@ A minimal Rust example of interacting with the backtest API using only
 standard external crates.
 
 ## Running
+List the available slot ranges.
 ```bash
-# Show available ranges
-curl https://<host>/available-ranges | jq
+curl https://staging.simulator.termina.technology/available-ranges | jq
 ```
 
+Run a baseline simulation.
 ```bash
-# Run the sim
 export SIMULATOR_API_KEY=your-key
 cargo run -- \
-  --url wss://<host>/backtest \
-  --api-key local-dev-key \
-  --start-slot 399834992 \
-  --end-slot 399834999
+  --url staging.example.com \
+  --start-slot 123 \
+  --end-slot 456
+```
+
+Run a simulation while replacing and streaming logs for a program.
+```bash
+export SIMULATOR_API_KEY=your-key
+cargo run -- \
+  --url staging.simulator.termina.technology \
+  --start-slot 123 \
+  --end-slot 456 \
+  --program-id addr1234 \
+  --program-so path/to/program/bytecode
+  --log-file test.txt
 ```
 
 1. Connect to the backtest WebSocket endpoint
@@ -28,8 +39,4 @@ cargo run -- \
 ## Notes
 The API key can also be supplied via the `SIMULATOR_API_KEY` environment variable:
 
-All arguments have defaults so a bare `cargo run` will attempt to connect to
-`ws://localhost:8900/backtest` with the key `local-dev-key`.
-
-HTTP JSON-RPC calls are standard Solana RPC format, posted to the
-`rpcEndpoint` from the `SessionCreated` response. This endpoint is unauthenticated.
+HTTP JSON-RPC calls are standard Solana RPC format, posted to the `rpcEndpoint` from the `SessionCreated` response. This endpoint is unauthenticated.

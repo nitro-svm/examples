@@ -272,12 +272,15 @@ name = "backtest-example"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "clap",
  "futures",
  "serde",
  "serde_json",
  "solana-client",
  "solana-commitment-config",
+ "solana-loader-v3-interface",
+ "solana-pubkey 3.0.0",
  "solana-rpc-client-api",
  "tokio",
  "tokio-tungstenite 0.24.0",

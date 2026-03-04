@@ -39,44 +39,64 @@
 //!   |<-- Success ------------------------|
 //! ```
 
-use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::{BufWriter, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::prelude::*;
 use clap::Parser;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use solana_client::nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient};
 use solana_commitment_config::CommitmentConfig;
+use solana_loader_v3_interface::get_program_data_address;
 use solana_rpc_client_api::config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter};
-use tokio::time::timeout;
+use tokio::{sync::oneshot, time::timeout};
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{Message, client::IntoClientRequest, http::HeaderValue},
 };
-
-const PROGRAM_ID: &str = "...";
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
 #[derive(Parser)]
 #[command(about = "Backtest session example")]
 struct Cli {
-    /// WebSocket URL for the backtest endpoint (ws:// or wss://).
-    #[arg(long, default_value = "ws://localhost:8900/backtest")]
+    /// Base URL for the backtest endpoint (no scheme).
+    #[arg(long, default_value = "localhost:8900")]
     url: String,
 
     /// API key sent as the X-API-Key header on the control WebSocket.
-    #[arg(long, env = "SIMULATOR_API_KEY", default_value = "local-dev-key")]
+    #[arg(long, env = "SIMULATOR_API_KEY")]
     api_key: String,
 
     /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 300_000_000)]
+    #[arg(long, default_value_t = 399_834_992)]
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 300_000_010)]
+    #[arg(long, default_value_t = 399_834_997)]
     end_slot: u64,
+
+    /// File to write transaction logs to.
+    #[arg(long, default_value = "logs.txt")]
+    log_file: PathBuf,
+
+    /// Program ID to filter logs on.
+    #[arg(long)]
+    program_id: Option<String>,
+
+    /// Path to a compiled .so to deploy as PROGRAM_ID before the first slot.
+    /// Build with: `solana program dump addr... program.so --url mainnet-beta`
+    #[arg(long)]
+    program_so: Option<PathBuf>,
 }
 
 // ── Control WebSocket message types ───────────────────────────────────────────
@@ -110,6 +130,30 @@ struct ContinueParams {
     advance_count: u64,
     /// Base64-encoded transactions to inject before advancing.
     transactions: Vec<String>,
+    /// Account state overrides applied before execution. Keys are base58 pubkeys.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    modify_account_states: AccountModifications,
+}
+
+// ── Account modification types ────────────────────────────────────────────────
+
+/// Map of base58 pubkey → account data to inject/override before execution.
+type AccountModifications = BTreeMap<String, AccountData>;
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AccountData {
+    data: EncodedBinary,
+    executable: bool,
+    lamports: u64,
+    owner: String,
+    space: u64,
+}
+
+#[derive(Clone, Serialize)]
+struct EncodedBinary {
+    data: String,
+    encoding: &'static str,
 }
 
 /// Responses received from the server over the control WebSocket.
@@ -135,21 +179,6 @@ enum WsResponse {
 
 // ── URL helpers ────────────────────────────────────────────────────────────────
 
-/// ws://host/path → http://host  |  wss://host/path → https://host
-fn ws_url_to_http_base(ws_url: &str) -> Result<String> {
-    let url = url::Url::parse(ws_url).context("invalid WebSocket URL")?;
-    let scheme = match url.scheme() {
-        "ws" => "http",
-        "wss" => "https",
-        other => bail!("unexpected WebSocket scheme: {other}"),
-    };
-    let host = url.host_str().context("WebSocket URL has no host")?;
-    match url.port() {
-        Some(port) => Ok(format!("{scheme}://{host}:{port}")),
-        None => Ok(format!("{scheme}://{host}")),
-    }
-}
-
 /// If `endpoint` is a relative path, resolve it against `base`.
 fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
@@ -173,6 +202,15 @@ fn http_url_to_ws(url: &str) -> Result<String> {
     Ok(parsed.to_string())
 }
 
+// ── Stats ──────────────────────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct Stats {
+    total: usize,
+    successes: usize,
+    failures: usize,
+}
+
 // ── Session ────────────────────────────────────────────────────────────────────
 
 type WsStream =
@@ -189,10 +227,10 @@ struct Session {
 
 impl Session {
     async fn create(cli: &Cli) -> Result<Self> {
-        let http_base = ws_url_to_http_base(&cli.url)?;
+        let ws_url = format!("wss://{}/backtest", &cli.url);
+        let http_url = format!("https://{}", &cli.url);
 
-        let mut req = cli
-            .url
+        let mut req = ws_url
             .as_str()
             .into_client_request()
             .context("invalid WebSocket URL")?;
@@ -201,7 +239,7 @@ impl Session {
             HeaderValue::from_str(&cli.api_key).context("invalid API key")?,
         );
 
-        eprintln!("[ws] connecting to {}", cli.url);
+        eprintln!("[ws] connecting to {ws_url}");
         let (ws, _) = connect_async(req)
             .await
             .context("WebSocket handshake failed")?;
@@ -227,7 +265,7 @@ impl Session {
                     session_id,
                     rpc_endpoint,
                 } => {
-                    let rpc_endpoint = resolve_url(&http_base, &rpc_endpoint)?;
+                    let rpc_endpoint = resolve_url(&http_url, &rpc_endpoint)?;
                     eprintln!("[ws] session_id:   {session_id}");
                     eprintln!("[ws] rpc_endpoint: {rpc_endpoint}");
                     break (session_id, rpc_endpoint);
@@ -257,7 +295,7 @@ impl Session {
     /// Returns `true` if ready for another `Continue`, `false` if completed.
     async fn drain_until_ready(&mut self) -> Result<bool> {
         loop {
-            let resp = timeout(Duration::from_secs(120), ws_recv(&mut self.ws))
+            let resp = timeout(Duration::from_secs(600), ws_recv(&mut self.ws))
                 .await
                 .context("timed out waiting for ReadyForContinue")??;
 
@@ -279,10 +317,15 @@ impl Session {
     }
 
     /// Advance `advance_count` blocks. Returns `true` if more blocks remain.
-    async fn advance(&mut self, advance_count: u64, transactions: Vec<String>) -> Result<bool> {
+    async fn advance(
+        &mut self,
+        advance_count: u64,
+        transactions: Vec<String>,
+        modify_account_states: AccountModifications,
+    ) -> Result<bool> {
         ws_send(
             &mut self.ws,
-            &WsRequest::Continue(ContinueParams { advance_count, transactions }),
+            &WsRequest::Continue(ContinueParams { advance_count, transactions, modify_account_states }),
         )
         .await?;
         self.drain_until_ready().await
@@ -309,23 +352,44 @@ impl Session {
 
 // ── Log subscription ───────────────────────────────────────────────────────────
 
-/// Subscribe to logs mentioning `program` via `PubsubClient::logs_subscribe`.
+/// Subscribe to logs mentioning `program`, write every transaction to `log_file`,
+/// and accumulate totals in `stats`.
 ///
-/// The RPC endpoint accepts WebSocket connections on the same path as HTTP
-/// (just swap the scheme). `PubsubClient` handles the `logsSubscribe` /
-/// `logsNotification` wire protocol automatically.
+/// Blocks until the subscription is confirmed by the server, so the caller can
+/// safely start advancing blocks immediately after this returns.
 ///
-/// Returns a `JoinHandle` — abort it when done.
-async fn subscribe_logs(rpc_endpoint: &str, program: &str) -> Result<tokio::task::JoinHandle<()>> {
+/// Returns a `JoinHandle`. When done: call `abort()` then `await` the handle
+/// (which returns once the task has actually stopped), then read `stats`.
+async fn subscribe_logs(
+    rpc_endpoint: &str,
+    program: &str,
+    log_file: PathBuf,
+    stats: Arc<Mutex<Stats>>,
+) -> Result<tokio::task::JoinHandle<()>> {
     let ws_url = http_url_to_ws(rpc_endpoint)?;
     let program = program.to_string();
+
+    // Oneshot to signal back to the caller once the subscription is live.
+    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
 
     let handle = tokio::spawn(async move {
         eprintln!("[sub] connecting to {ws_url}");
 
+        let file = match File::create(&log_file) {
+            Ok(f) => f,
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("failed to open {log_file:?}: {e}")));
+                return;
+            }
+        };
+        let mut writer = BufWriter::new(file);
+
         let client = match PubsubClient::new(&ws_url).await {
             Ok(c) => c,
-            Err(e) => { eprintln!("[sub] connect failed: {e}"); return; }
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("connect failed: {e}")));
+                return;
+            }
         };
 
         let (mut stream, _unsubscribe) = match client
@@ -338,25 +402,147 @@ async fn subscribe_logs(rpc_endpoint: &str, program: &str) -> Result<tokio::task
             .await
         {
             Ok(s) => s,
-            Err(e) => { eprintln!("[sub] logs_subscribe failed: {e}"); return; }
+            Err(e) => {
+                let _ = ready_tx.send(Err(format!("logs_subscribe failed: {e}")));
+                return;
+            }
         };
 
-        eprintln!("[sub] subscribed to logs for {program}");
+        // Subscription is confirmed — unblock the caller.
+        let _ = ready_tx.send(Ok(()));
+        eprintln!("[sub] subscribed — writing logs to {log_file:?}");
 
         while let Some(resp) = stream.next().await {
             let slot = resp.context.slot;
             let sig = &resp.value.signature;
             let err = &resp.value.err;
-            println!("[{program}] slot={slot} sig={sig} err={err:?}");
+            let success = err.is_none();
+
+            // Update stats.
+            {
+                let mut s = stats.lock().unwrap();
+                s.total += 1;
+                if success { s.successes += 1; } else { s.failures += 1; }
+            }
+
+            // Print to stdout.
+            let status = if success { "ok" } else { "FAIL" };
+            println!("[{program}] slot={slot} {status} sig={sig}");
+
+            // Write to file.
+            let _ = writeln!(writer, "slot={slot} sig={sig} status={status}");
+            if let Some(e) = err {
+                let _ = writeln!(writer, "  err={e}");
+            }
             for log in &resp.value.logs {
                 println!("  {log}");
+                let _ = writeln!(writer, "  {log}");
             }
+            let _ = writeln!(writer); // blank line between transactions
+            let _ = writer.flush();
         }
 
         eprintln!("[sub] stream ended");
     });
 
+    // Wait until the subscription is confirmed (or fails) before returning.
+    ready_rx
+        .await
+        .context("subscribe_logs task dropped before signalling ready")?
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
     Ok(handle)
+}
+
+// ── Program injection ──────────────────────────────────────────────────────────
+
+const BPF_LOADER_UPGRADEABLE: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
+
+/// Fetch the historical programdata account, splice in new ELF bytes, patch
+/// the deployment slot, and return it as an account modification.
+///
+/// ProgramData layout (bincode):
+///   [0..4]   variant = 3  (u32 LE)
+///   [4..12]  deployment slot (u64 LE) — patched to start_slot
+///   [12]     authority Option discriminant (1 = Some)
+///   [13..45] upgrade authority pubkey (32 bytes)
+///   [45..]   ELF bytecode  ← replaced with our .so
+async fn build_program_injection(
+    program_id_str: &str,
+    so_path: &std::path::Path,
+    rpc: &RpcClient,
+    start_slot: u64,
+) -> Result<AccountModifications> {
+    let elf = std::fs::read(so_path)
+        .with_context(|| format!("failed to read {}", so_path.display()))?;
+    eprintln!("[inject] {} bytes from {}", elf.len(), so_path.display());
+
+    let program_id: solana_pubkey::Pubkey =
+        program_id_str.parse().context("invalid program id")?;
+    let programdata_addr = get_program_data_address(&program_id);
+
+    // Fetch both accounts: program account to inject as-is, programdata for its header.
+    let program_account = rpc
+        .get_account(&program_id)
+        .await
+        .context("failed to fetch program account")?;
+    let programdata_account = rpc
+        .get_account(&programdata_addr)
+        .await
+        .context("failed to fetch programdata account")?;
+
+    if programdata_account.data.len() < 45 {
+        bail!("programdata account too small ({} bytes)", programdata_account.data.len());
+    }
+
+    // Copy header (variant + slot + authority = 45 bytes), patch slot, then append new ELF.
+    // Use start_slot - 1 so the program appears deployed *before* the first executed slot.
+    // Patching to start_slot itself triggers the SVM's same-slot restriction, which marks the
+    // program Unloaded (not yet executable) and caches that failure for all subsequent slots.
+    let deploy_slot = start_slot.saturating_sub(1);
+    let mut data = programdata_account.data[..45].to_vec();
+    data[4..12].copy_from_slice(&deploy_slot.to_le_bytes());
+    data.extend_from_slice(&elf);
+
+    // Compute rent-exempt minimum for the new (possibly larger) programdata size.
+    let programdata_lamports = rpc
+        .get_minimum_balance_for_rent_exemption(data.len())
+        .await
+        .context("failed to compute rent-exempt minimum for programdata")?;
+
+    eprintln!("[inject] program      {} ({} bytes, {} lamports)", program_id, program_account.data.len(), program_account.lamports);
+    eprintln!("[inject] programdata  {} ({} bytes, {} lamports)", programdata_addr, data.len(), programdata_lamports);
+
+    let mut modifications = AccountModifications::new();
+
+    // Inject the program account as-is so the SVM can resolve the programdata address.
+    modifications.insert(
+        program_id_str.to_string(),
+        AccountData {
+            space: program_account.data.len() as u64,
+            data: EncodedBinary {
+                data: BASE64_STANDARD.encode(&program_account.data),
+                encoding: "base64",
+            },
+            executable: true,
+            lamports: program_account.lamports,
+            owner: BPF_LOADER_UPGRADEABLE.to_string(),
+        },
+    );
+
+    // Inject programdata with the patched slot, new ELF, and correct rent-exempt lamports.
+    modifications.insert(
+        programdata_addr.to_string(),
+        AccountData {
+            space: data.len() as u64,
+            data: EncodedBinary { data: BASE64_STANDARD.encode(&data), encoding: "base64" },
+            executable: false,
+            lamports: programdata_lamports,
+            owner: BPF_LOADER_UPGRADEABLE.to_string(),
+        },
+    );
+
+    Ok(modifications)
 }
 
 // ── WebSocket helpers ──────────────────────────────────────────────────────────
@@ -404,27 +590,49 @@ async fn main() -> Result<()> {
     let blockhash = session.rpc.get_latest_blockhash().await?;
     println!("latest blockhash: {blockhash}");
 
-    // ── 3. Subscribe to BisonFi program logs ──────────────────────────────────
-    let log_task = subscribe_logs(&session.rpc_endpoint, PROGRAM_ID).await?;
+    // ── 3. Subscribe to program logs (if --program-id supplied) ─────────
+    let stats = Arc::new(Mutex::new(Stats::default()));
+    let log_task = if let Some(program_id) = &cli.program_id {
+        Some(
+            subscribe_logs(
+                &session.rpc_endpoint,
+                program_id,
+                cli.log_file.clone(),
+                Arc::clone(&stats),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
 
-    // ── 4. Advance through all blocks ─────────────────────────────────────────
-    eprintln!(
-        "advancing slots {}..={} (one block at a time)...",
-        cli.start_slot, cli.end_slot
-    );
-
-    loop {
-        let more_blocks = session.advance(1, vec![]).await?;
-        if !more_blocks {
-            eprintln!("all blocks processed");
-            break;
+    // ── 4. Build program injection (if --program-so supplied) ─────────────────
+    let inject_mods = match &cli.program_so {
+        Some(path) => {
+            let id = cli.program_id.as_deref().context("--program-so requires --program-id")?;
+            build_program_injection(id, path, &session.rpc, cli.start_slot).await?
         }
-    }
+        None => AccountModifications::new(),
+    };
 
-    // ── 5. Tear down ──────────────────────────────────────────────────────────
-    log_task.abort();
+    // ── 5. Advance through all blocks ─────────────────────────────────────────
+    eprintln!("advancing slots {}..={}", cli.start_slot, cli.end_slot);
+    session.advance(cli.end_slot - cli.start_slot + 1, vec![], inject_mods).await?;
+    eprintln!("all blocks processed");
+
+    // ── 6. Tear down ──────────────────────────────────────────────────────────
+    if let Some(task) = log_task {
+        task.abort();
+        let _ = task.await;
+    }
     session.close().await?;
-    println!("done");
+
+    let s = stats.lock().unwrap();
+    println!("\n=== Summary ===");
+    println!("total:     {}", s.total);
+    println!("successes: {}", s.successes);
+    println!("failures:  {}", s.failures);
+    println!("log file:  {}", cli.log_file.display());
 
     Ok(())
 }
