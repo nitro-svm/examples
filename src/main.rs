@@ -481,11 +481,7 @@ async fn build_program_injection(
         program_id_str.parse().context("invalid program id")?;
     let programdata_addr = get_program_data_address(&program_id);
 
-    // Fetch both accounts: program account to inject as-is, programdata for its header.
-    let program_account = rpc
-        .get_account(&program_id)
-        .await
-        .context("failed to fetch program account")?;
+    // Fetch programdata for its header.
     let programdata_account = rpc
         .get_account(&programdata_addr)
         .await
@@ -510,25 +506,9 @@ async fn build_program_injection(
         .await
         .context("failed to compute rent-exempt minimum for programdata")?;
 
-    eprintln!("[inject] program      {} ({} bytes, {} lamports)", program_id, program_account.data.len(), program_account.lamports);
     eprintln!("[inject] programdata  {} ({} bytes, {} lamports)", programdata_addr, data.len(), programdata_lamports);
 
     let mut modifications = AccountModifications::new();
-
-    // Inject the program account as-is so the SVM can resolve the programdata address.
-    modifications.insert(
-        program_id_str.to_string(),
-        AccountData {
-            space: program_account.data.len() as u64,
-            data: EncodedBinary {
-                data: BASE64_STANDARD.encode(&program_account.data),
-                encoding: "base64",
-            },
-            executable: true,
-            lamports: program_account.lamports,
-            owner: BPF_LOADER_UPGRADEABLE.to_string(),
-        },
-    );
 
     // Inject programdata with the patched slot, new ELF, and correct rent-exempt lamports.
     modifications.insert(
