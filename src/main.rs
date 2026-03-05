@@ -475,7 +475,12 @@ async fn main() -> Result<()> {
         stop_tx.send(true).ok();
         eprintln!("[sub] waiting for log task to drain...");
 
-        // Send a ping every 30s while waiting so the TCP connection stays alive.
+        // Keep the control WS alive while waiting:
+        // - Send a ping every 30s so the TCP connection doesn't idle-timeout.
+        // - Read and discard all incoming messages (pongs, etc.) so the client's
+        //   TCP receive buffer stays drained. Without this, the server blocks
+        //   trying to write pongs, stops reading its own receive buffer, and
+        //   ws_send in close() hangs because the server's receive buffer is full.
         let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
         ping_interval.tick().await; // consume the immediate first tick
         let mut handle = handle;
@@ -483,11 +488,10 @@ async fn main() -> Result<()> {
             tokio::select! {
                 _ = &mut handle => break,
                 _ = ping_interval.tick() => {
-                    let _ = timeout(
-                        Duration::from_secs(5),
-                        session.ws.send(tokio_tungstenite::tungstenite::Message::Ping(vec![].into())),
-                    ).await;
+                    let _ = session.ws.send(Message::Ping(vec![].into())).await;
                 }
+                // Drain server messages to prevent TCP receive-buffer deadlock.
+                _ = session.ws.next() => {}
             }
         }
     }
