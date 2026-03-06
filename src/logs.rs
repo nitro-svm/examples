@@ -30,13 +30,13 @@ use crate::utils::fetch_balance_changes;
 ///   2. `await` the handle.
 ///   3. Close the session only after the handle resolves.
 pub async fn subscribe_logs(
-    rpc_endpoint: &str,
+    rpc_url: &str,
     program: &str,
     log_file: PathBuf,
     stats: Arc<Mutex<Stats>>,
 ) -> Result<(JoinHandle<()>, watch::Sender<bool>)> {
     let rpc = Arc::new(RpcClient::new_with_commitment(
-        rpc_endpoint.to_string(),
+        rpc_url.to_string(),
         CommitmentConfig::confirmed(),
     ));
 
@@ -50,7 +50,7 @@ pub async fn subscribe_logs(
     let program_cb = program.to_string();
 
     let LogSubscriptionHandle { join_handle: sub_handle, stop } = subscribe_program_logs(
-        rpc_endpoint,
+        rpc_url,
         program,
         CommitmentConfig::confirmed(),
         move |notification| {

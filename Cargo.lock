@@ -2886,6 +2886,7 @@ dependencies = [
  "solana-address 1.1.0",
  "solana-client",
  "solana-commitment-config",
+ "solana-loader-v3-interface",
  "solana-rpc-client-api",
  "thiserror 2.0.18",
  "tokio",

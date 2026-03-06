@@ -1,12 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 
-use anyhow::{Context, Result};
-use simulator_api::AccountData;
-use simulator_client::build_program_injection;
-use solana_address::Address;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_loader_v3_interface::get_program_data_address;
 use solana_rpc_client_api::config::RpcTransactionConfig;
 use solana_signature::Signature;
 use solana_transaction_status::{
@@ -15,47 +10,6 @@ use solana_transaction_status::{
 };
 
 use super::{SolAccount, TokenAccount};
-
-/// Reads `so_path`, constructs a patched `ProgramData` account, and returns
-/// it as an account modification map ready for `Continue::modify_account_states`.
-///
-/// The ProgramData header is built from scratch (no mainnet fetch); the deploy
-/// slot is set to `start_slot - 1` so the program appears deployed before the
-/// first executed slot.
-pub async fn build_program_injection_from_file(
-    program_id_str: &str,
-    so_path: &std::path::Path,
-    rpc: &RpcClient,
-    start_slot: u64,
-) -> Result<BTreeMap<Address, AccountData>> {
-    let elf = std::fs::read(so_path)
-        .with_context(|| format!("failed to read {}", so_path.display()))?;
-    eprintln!("[inject] {} bytes from {}", elf.len(), so_path.display());
-
-    let program_id: solana_pubkey::Pubkey =
-        program_id_str.parse().context("invalid program id")?;
-    let programdata_addr = get_program_data_address(&program_id);
-    let programdata_addr: Address = programdata_addr
-        .to_string()
-        .parse()
-        .context("invalid programdata address")?;
-
-    let deploy_slot = start_slot.saturating_sub(1);
-
-    // 13 = 4 (variant) + 8 (slot) + 1 (None discriminant)
-    let data_len = 13 + elf.len();
-    let lamports = rpc
-        .get_minimum_balance_for_rent_exemption(data_len)
-        .await
-        .context("failed to compute rent-exempt minimum for programdata")?;
-
-    eprintln!(
-        "[inject] programdata {} ({} bytes, {} lamports)",
-        programdata_addr, data_len, lamports,
-    );
-
-    Ok(build_program_injection(programdata_addr, &elf, deploy_slot, None, lamports))
-}
 
 /// Call `getTransaction` for `signature` and extract per-account balance changes.
 /// Returns `None` if the RPC call fails or the transaction has no meta.

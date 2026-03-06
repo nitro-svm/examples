@@ -2,9 +2,8 @@
 //!
 //! Demonstrates the full session lifecycle — connect, create, subscribe to
 //! logs, advance, close. The control WebSocket (session lifecycle) is managed
-//! by `simulator_client::BacktestClient`. State queries use
-//! `solana_client::nonblocking::rpc_client::RpcClient` and log subscriptions
-//! use `solana_client::nonblocking::pubsub_client::PubsubClient`.
+//! by `simulator_client::BacktestClient`. RPC queries and log subscriptions
+//! use the `RpcClient` and `PubsubClient` exposed directly on the session.
 
 mod logs;
 mod utils;
@@ -19,11 +18,8 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_client::{BacktestClient, Continue, CreateSession};
-use solana_client::nonblocking::rpc_client::RpcClient;
-use solana_commitment_config::CommitmentConfig;
 
 use logs::subscribe_logs;
-use utils::build_program_injection_from_file;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -154,26 +150,25 @@ async fn main() -> Result<()> {
 
     eprintln!("[ws] session_id: {}", session.session_id().unwrap_or("?"));
     let rpc_endpoint = session.rpc_endpoint().context("no rpc_endpoint")?.to_string();
-    let rpc_endpoint = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
-    eprintln!("[ws] rpc_endpoint: {rpc_endpoint}");
+    let rpc_url = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
+    eprintln!("[ws] rpc_endpoint: {rpc_url}");
 
     eprintln!("[ws] waiting for ReadyForContinue...");
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
     eprintln!("[ws] ready");
 
     // ── 2. Query initial chain state via RpcClient ────────────────────────────
-    let rpc = RpcClient::new_with_commitment(rpc_endpoint.clone(), CommitmentConfig::confirmed());
-    let slot = rpc.get_slot().await?;
+    let slot = session.rpc().get_slot().await?;
     println!("current slot:     {slot}");
 
-    let blockhash = rpc.get_latest_blockhash().await?;
+    let blockhash = session.rpc().get_latest_blockhash().await?;
     println!("latest blockhash: {blockhash}");
 
     // ── 3. Subscribe to program logs (if --program-id supplied) ─────────
     let stats = Arc::new(Mutex::new(Stats::default()));
     let log_task = if let Some(program_id) = &cli.program_id {
         let (handle, stop_tx) = subscribe_logs(
-            &rpc_endpoint,
+            &rpc_url,
             program_id,
             cli.log_file.clone(),
             Arc::clone(&stats),
@@ -185,10 +180,12 @@ async fn main() -> Result<()> {
     };
 
     // ── 4. Build program injection (if --program-so supplied) ─────────────────
-    let inject_mods = match &cli.program_so {
+    let modifications = match &cli.program_so {
         Some(path) => {
             let id = cli.program_id.as_deref().context("--program-so requires --program-id")?;
-            build_program_injection_from_file(id, path, &rpc, cli.start_slot).await?
+            let elf = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+            eprintln!("[inject] {} bytes from {}", elf.len(), path.display());
+            session.modify_program(id, &elf).await?
         }
         None => BTreeMap::new(),
     };
@@ -199,7 +196,7 @@ async fn main() -> Result<()> {
         .advance(
             Continue::builder()
                 .advance_count(cli.end_slot - cli.start_slot + 1)
-                .modify_account_states(inject_mods)
+                .modify_accounts(modifications)
                 .build(),
             None,
             |_| {},
