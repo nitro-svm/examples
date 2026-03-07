@@ -1,10 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
-use anyhow::{Context, Result, bail};
-use base64::prelude::*;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_loader_v3_interface::get_program_data_address;
 use solana_rpc_client_api::config::RpcTransactionConfig;
 use solana_signature::Signature;
 use solana_transaction_status::{
@@ -12,78 +9,9 @@ use solana_transaction_status::{
     option_serializer::OptionSerializer,
 };
 
-use super::{AccountData, AccountModifications, EncodedBinary, SolAccount, TokenAccount};
+use super::{SolAccount, TokenAccount};
 
-const BPF_LOADER_UPGRADEABLE: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
-
-/// Fetch the historical programdata account, splice in new ELF bytes, patch
-/// the deployment slot, and return it as an account modification.
-///
-/// ProgramData layout (bincode):
-///   [0..4]   variant = 3  (u32 LE)
-///   [4..12]  deployment slot (u64 LE) — patched to start_slot
-///   [12]     authority Option discriminant (1 = Some)
-///   [13..45] upgrade authority pubkey (32 bytes)
-///   [45..]   ELF bytecode  ← replaced with our .so
-pub async fn build_program_injection(
-    program_id_str: &str,
-    so_path: &std::path::Path,
-    rpc: &RpcClient,
-    start_slot: u64,
-) -> Result<AccountModifications> {
-    let elf = std::fs::read(so_path)
-        .with_context(|| format!("failed to read {}", so_path.display()))?;
-    eprintln!("[inject] {} bytes from {}", elf.len(), so_path.display());
-
-    let program_id: solana_pubkey::Pubkey =
-        program_id_str.parse().context("invalid program id")?;
-    let programdata_addr = get_program_data_address(&program_id);
-
-    // Fetch programdata for its header.
-    let programdata_account = rpc
-        .get_account(&programdata_addr)
-        .await
-        .context("failed to fetch programdata account")?;
-
-    if programdata_account.data.len() < 45 {
-        bail!("programdata account too small ({} bytes)", programdata_account.data.len());
-    }
-
-    // Copy header (variant + slot + authority = 45 bytes), patch slot, then append new ELF.
-    // Use start_slot - 1 so the program appears deployed *before* the first executed slot.
-    // Patching to start_slot itself triggers the SVM's same-slot restriction, which marks the
-    // program Unloaded (not yet executable) and caches that failure for all subsequent slots.
-    let deploy_slot = start_slot.saturating_sub(1);
-    let mut data = programdata_account.data[..45].to_vec();
-    data[4..12].copy_from_slice(&deploy_slot.to_le_bytes());
-    data.extend_from_slice(&elf);
-
-    // Compute rent-exempt minimum for the new (possibly larger) programdata size.
-    let programdata_lamports = rpc
-        .get_minimum_balance_for_rent_exemption(data.len())
-        .await
-        .context("failed to compute rent-exempt minimum for programdata")?;
-
-    eprintln!("[inject] programdata  {} ({} bytes, {} lamports)", programdata_addr, data.len(), programdata_lamports);
-
-    let mut modifications = AccountModifications::new();
-
-    // Inject programdata with the patched slot, new ELF, and correct rent-exempt lamports.
-    modifications.insert(
-        programdata_addr.to_string(),
-        AccountData {
-            space: data.len() as u64,
-            data: EncodedBinary { data: BASE64_STANDARD.encode(&data), encoding: "base64" },
-            executable: false,
-            lamports: programdata_lamports,
-            owner: BPF_LOADER_UPGRADEABLE.to_string(),
-        },
-    );
-
-    Ok(modifications)
-}
-
-/// Call `getTransaction` for `signature` and extract per-account token balance changes.
+/// Call `getTransaction` for `signature` and extract per-account balance changes.
 /// Returns `None` if the RPC call fails or the transaction has no meta.
 pub async fn fetch_balance_changes(
     rpc: &RpcClient,

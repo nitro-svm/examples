@@ -2,16 +2,17 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::PathBuf,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
-use anyhow::{Context, Result, anyhow, bail};
-use futures::StreamExt;
-use solana_client::nonblocking::{pubsub_client::PubsubClient, rpc_client::RpcClient};
+use anyhow::{Context, Result};
+use simulator_client::{LogSubscriptionHandle, subscribe_program_logs};
+use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
-use solana_rpc_client_api::config::{RpcTransactionLogsConfig, RpcTransactionLogsFilter};
-use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
+use tokio::{sync::watch, task::JoinHandle};
 
 use super::{Stats, Transaction};
 use crate::utils::fetch_balance_changes;
@@ -29,68 +30,40 @@ use crate::utils::fetch_balance_changes;
 ///   2. `await` the handle.
 ///   3. Close the session only after the handle resolves.
 pub async fn subscribe_logs(
-    rpc_endpoint: &str,
+    rpc_url: &str,
     program: &str,
     log_file: PathBuf,
     stats: Arc<Mutex<Stats>>,
-) -> Result<(JoinHandle<()>, tokio::sync::watch::Sender<bool>)> {
-    let ws_url = http_url_to_ws(rpc_endpoint)?;
-    let program = program.to_string();
-    let rpc_endpoint = rpc_endpoint.to_string();
+) -> Result<(JoinHandle<()>, watch::Sender<bool>)> {
+    let rpc = Arc::new(RpcClient::new_with_commitment(
+        rpc_url.to_string(),
+        CommitmentConfig::confirmed(),
+    ));
 
-    let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
-    let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+    // Shared state collected by per-notification callbacks.
+    let records: Arc<Mutex<Vec<(usize, Transaction)>>> = Arc::new(Mutex::new(Vec::new()));
+    let counter = Arc::new(AtomicUsize::new(0));
 
-    let handle = tokio::spawn(async move {
-        eprintln!("[sub] connecting to {ws_url}");
+    let rpc_cb = rpc.clone();
+    let records_cb = records.clone();
+    let counter_cb = counter.clone();
+    let program_cb = program.to_string();
 
-        let rpc = Arc::new(RpcClient::new_with_commitment(
-            rpc_endpoint.clone(),
-            CommitmentConfig::confirmed(),
-        ));
+    let LogSubscriptionHandle { join_handle: sub_handle, stop } = subscribe_program_logs(
+        rpc_url,
+        program,
+        CommitmentConfig::confirmed(),
+        move |notification| {
+            // Capture arrival index before spawning so records can be sorted later.
+            let idx = counter_cb.fetch_add(1, Ordering::Relaxed);
+            let rpc = rpc_cb.clone();
+            let records = records_cb.clone();
+            let program = program_cb.clone();
 
-        let client = match PubsubClient::new(&ws_url).await {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("connect failed: {e}")));
-                return;
-            }
-        };
-
-        let (mut stream, _unsubscribe) = match client
-            .logs_subscribe(
-                RpcTransactionLogsFilter::Mentions(vec![program.clone()]),
-                RpcTransactionLogsConfig {
-                    commitment: Some(CommitmentConfig::confirmed()),
-                },
-            )
-            .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("logs_subscribe failed: {e}")));
-                return;
-            }
-        };
-
-        let _ = ready_tx.send(Ok(()));
-        eprintln!("[sub] subscribed — will write logs to {log_file:?} on completion");
-
-        // Each spawned task returns (arrival_index, TxRecord),
-        // so we can sort after all concurrent fetches complete.
-        let mut tasks: Vec<JoinHandle<(usize, Transaction)>> = Vec::new();
-
-        // Spawn a fetch task for one notification.
-        let spawn_task = |resp: solana_client::rpc_response::Response<
-            solana_client::rpc_response::RpcLogsResponse,
-        >,
-                              idx: usize| {
-            let rpc = Arc::clone(&rpc);
-            let program = program.clone();
-            tokio::spawn(async move {
-                let slot = resp.context.slot;
-                let signature = resp.value.signature.clone();
-                let err_str = resp.value.err.as_ref().map(|e| e.to_string());
+            async move {
+                let slot = notification.context.slot;
+                let signature = notification.value.signature.clone();
+                let err_str = notification.value.err.as_ref().map(|e| e.to_string());
                 let success = err_str.is_none();
 
                 println!(
@@ -101,65 +74,35 @@ pub async fn subscribe_logs(
                 let (sol_changes, token_changes) =
                     fetch_balance_changes(&rpc, &signature).await.unwrap_or_default();
 
-                (
-                    idx,
-                    Transaction {
-                        slot,
-                        signature,
-                        success,
-                        err: err_str,
-                        logs: resp.value.logs,
-                        sol_changes,
-                        token_changes,
-                    },
-                )
-            })
-        };
+                let tx = Transaction {
+                    slot,
+                    signature,
+                    success,
+                    err: err_str,
+                    logs: notification.value.logs,
+                    sol_changes,
+                    token_changes,
+                };
 
-        // Main receive loop.
-        loop {
-            if *stop_rx.borrow() {
-                eprintln!("[sub] stop signaled — draining buffered notifications...");
-                loop {
-                    match timeout(Duration::from_secs(30), stream.next()).await {
-                        Ok(Some(resp)) => {
-                            let idx = tasks.len();
-                            tasks.push(spawn_task(resp, idx));
-                        }
-                        _ => break,
-                    }
-                }
-                break;
+                records.lock().unwrap().push((idx, tx));
             }
+        },
+    )
+    .await
+    .context("subscribe to program logs")?;
 
-            let resp = tokio::select! {
-                r = stream.next() => r,
-                _ = stop_rx.changed() => continue,
-            };
+    eprintln!("[sub] subscribed — will write logs to {log_file:?} on completion");
 
-            match resp {
-                Some(resp) => {
-                    let idx = tasks.len();
-                    tasks.push(spawn_task(resp, idx));
-                }
-                None => break,
-            }
-        }
+    // Wrap the subscription handle in an outer task that writes the log file
+    // and accumulates stats once all callbacks have completed.
+    let join_handle = tokio::spawn(async move {
+        sub_handle.await.ok();
 
-        // Await all in-flight getTransaction tasks.
-        eprintln!("[sub] waiting for {} getTransaction tasks...", tasks.len());
-        let mut records: Vec<(usize, Transaction)> = Vec::with_capacity(tasks.len());
-        for task in tasks {
-            match task.await {
-                Ok(rec) => records.push(rec),
-                Err(e) => eprintln!("[sub] fetch task panicked: {e}"),
-            }
-        }
-
-        // Restore arrival order.
+        let mut records = records.lock().unwrap().drain(..).collect::<Vec<_>>();
         records.sort_by_key(|(idx, _)| *idx);
 
-        // Write all records to file at once.
+        eprintln!("[sub] waiting for {} getTransaction tasks...", records.len());
+
         match File::create(&log_file) {
             Ok(file) => {
                 let mut writer = BufWriter::new(file);
@@ -171,14 +114,13 @@ pub async fn subscribe_logs(
             Err(e) => eprintln!("[sub] failed to create {log_file:?}: {e}"),
         }
 
-        // Accumulate stats from collected records.
         let mut s = stats.lock().unwrap();
         for (_, tx) in &records {
             s.total += 1;
-            if tx.success { 
-                s.successes += 1; 
-            } else { 
-                s.failures += 1; 
+            if tx.success {
+                s.successes += 1;
+            } else {
+                s.failures += 1;
             }
 
             for account in &tx.sol_changes {
@@ -197,26 +139,7 @@ pub async fn subscribe_logs(
         eprintln!("[sub] done");
     });
 
-    ready_rx
-        .await
-        .context("subscribe_logs task dropped before signaling ready")?
-        .map_err(|e| anyhow!("{e}"))?;
-
-    Ok((handle, stop_tx))
-}
-
-/// http://host/path → ws://host/path  |  https → wss
-fn http_url_to_ws(url: &str) -> Result<String> {
-    let mut parsed = url::Url::parse(url).context("invalid RPC endpoint URL")?;
-    let scheme = match parsed.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        other => bail!("unexpected scheme: {other}"),
-    };
-    parsed
-        .set_scheme(scheme)
-        .map_err(|()| anyhow!("failed to set WebSocket scheme"))?;
-    Ok(parsed.to_string())
+    Ok((join_handle, stop))
 }
 
 // ── Log writing ────────────────────────────────────────────────────────────────
