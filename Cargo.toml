@@ -14,6 +14,7 @@ path = "src/bin/tx_pause.rs"
 
 [dependencies]
 anyhow = "1"
+bincode = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 simulator-api = { path = "../nitro-stream/crates/simulator-api" }
@@ -26,6 +27,7 @@ solana-loader-v3-interface = "6.0.0"
 solana-pubkey = "3"
 solana-rpc-client-api = "3.1.0"
 solana-signature = "3"
+solana-transaction = "3.1"
 solana-transaction-status = "3.1"
 tokio = { version = "1", features = ["full"] }
 url = "2"

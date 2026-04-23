@@ -19,6 +19,7 @@ use clap::Parser;
 use simulator_api::DiscoveryFilter;
 use simulator_client::{BacktestClient, Continue, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
+use solana_transaction::versioned::VersionedTransaction;
 
 const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 
@@ -26,7 +27,7 @@ const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 #[command(about = "Pause before each discovered batch and inspect frozen chain state")]
 struct Cli {
     /// Simulator base URL (no scheme), e.g. `staging.simulator.example.com`.
-    #[arg(long, default_value = "localhost:8900")]
+    #[arg(long, default_value = "staging.simulator.termina.technology")]
     url: String,
 
     /// API key sent as the `X-API-Key` header.
@@ -94,8 +95,15 @@ async fn main() -> Result<()> {
                 let batch = pause.paused.batch_index.unwrap_or(0);
                 eprintln!("[pause #{pause_count}] slot={slot} batch={batch}");
 
-                for sig in &pause.discovery.signatures {
+                for bin in &pause.discovery.transactions {
+                    let bytes = bin.decode().context("base64 decode failed")?;
+                    let tx: VersionedTransaction = bincode::deserialize(&bytes)
+                        .context("deserialize VersionedTransaction failed")?;
+                    let sig = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
                     eprintln!("  matched tx: {sig}");
+                    for key in tx.message.static_account_keys() {
+                        eprintln!("    account: {key}");
+                    }
                 }
 
                 // ── Inspect chain state ───────────────────────────────────────
