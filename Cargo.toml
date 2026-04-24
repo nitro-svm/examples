@@ -8,12 +8,18 @@ description = "Backtest session example using simulator-client"
 name = "backtest-example"
 path = "src/main.rs"
 
+[[bin]]
+name = "tx-pause"
+path = "src/bin/tx_pause.rs"
+
 [dependencies]
 anyhow = "1"
+bincode = "1"
 clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
-simulator-api = "0.4.0"
-simulator-client = "0.4.0"
+simulator-api = "0.7.0"
+simulator-client = "0.7.0"
+solana-account-decoder = "3.1.0"
 solana-address = "1.0.0"
 solana-client = "3.1.0"
 solana-commitment-config = "3.1.0"
@@ -21,6 +27,8 @@ solana-loader-v3-interface = "6.0.0"
 solana-pubkey = "3"
 solana-rpc-client-api = "3.1.0"
 solana-signature = "3"
+solana-transaction = "3.1"
 solana-transaction-status = "3.1"
 tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
