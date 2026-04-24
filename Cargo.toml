@@ -30,4 +30,5 @@ solana-signature = "3"
 solana-transaction = "3.1"
 solana-transaction-status = "3.1"
 tokio = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

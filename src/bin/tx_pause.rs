@@ -17,7 +17,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_api::DiscoveryFilter;
-use simulator_client::{BacktestClient, Continue, CreateSession, DiscoveryStepResult};
+use simulator_client::{BacktestClient, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
 use solana_transaction::versioned::VersionedTransaction;
 
@@ -39,7 +39,7 @@ struct Cli {
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 399_835_010)]
+    #[arg(long, default_value_t = 399_834_999)]
     end_slot: u64,
 
     /// Program to watch; defaults to Jupiter V6 aggregator.
@@ -56,6 +56,7 @@ async fn main() -> Result<()> {
     let client = BacktestClient::builder()
         .url(format!("wss://{}/backtest", &cli.url))
         .api_key(cli.api_key)
+        .log_raw(true)
         .build();
 
     eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
@@ -74,20 +75,14 @@ async fn main() -> Result<()> {
         .await?;
 
     eprintln!("[ws] session: {}", session.session_id().unwrap_or("?"));
-    session
-        .ensure_ready(Some(Duration::from_secs(600)))
-        .await?;
+    session.ensure_ready(Some(Duration::from_secs(600))).await?;
     eprintln!("[ws] ready — scanning for {} batches", cli.program_id);
 
     let timeout = Some(Duration::from_secs(120));
     let mut pause_count = 0u64;
 
     loop {
-        // Use u64::MAX so the session runs freely until the next discovery
-        // or until the slot range is exhausted — no slot-by-slot polling.
-        let cont = Continue::builder().advance_count(u64::MAX).build();
-
-        match session.advance_to_discovery(cont, timeout).await? {
+        match session.advance_to_discovery(timeout).await? {
             DiscoveryStepResult::Paused(pause) => {
                 pause_count += 1;
 
@@ -99,7 +94,11 @@ async fn main() -> Result<()> {
                     let bytes = bin.decode().context("base64 decode failed")?;
                     let tx: VersionedTransaction = bincode::deserialize(&bytes)
                         .context("deserialize VersionedTransaction failed")?;
-                    let sig = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
+                    let sig = tx
+                        .signatures
+                        .first()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
                     eprintln!("  matched tx: {sig}");
                     for key in tx.message.static_account_keys() {
                         eprintln!("    account: {key}");
@@ -127,12 +126,6 @@ async fn main() -> Result<()> {
                 // Nothing is sent on-chain; the session state is unchanged.
             }
 
-            DiscoveryStepResult::Ready => {
-                // Shouldn't happen with advance_count=u64::MAX, but handle
-                // defensively in case the server caps advance windows.
-                continue;
-            }
-
             DiscoveryStepResult::Completed => {
                 eprintln!("[done] session completed; total pauses: {pause_count}");
                 break;
@@ -140,6 +133,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    session.close(Some(Duration::from_secs(10))).await?;
+    let _ = session.close(Some(Duration::from_secs(10))).await;
     Ok(())
 }
