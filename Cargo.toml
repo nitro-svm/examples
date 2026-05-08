@@ -14,8 +14,11 @@ path = "src/bin/tx_pause.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 bincode = "1"
 clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1"
 futures = "0.3"
 simulator-api = "0.7.0"
 simulator-client = "0.7.0"

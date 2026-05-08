@@ -15,6 +15,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::Engine as _;
 use clap::Parser;
 use simulator_api::DiscoveryFilter;
 use simulator_client::{BacktestClient, CreateSession, DiscoveryStepResult};
@@ -22,6 +23,10 @@ use solana_address::Address;
 use solana_transaction::versioned::VersionedTransaction;
 
 const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
+const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+const DART_TX_SIG: &str = "u6tf2YYLvDyG1HYfBUP9KqssUSZx3hebQMDJYh9Mug9CxDPKzTeNPgaoMZ92VPhwcCuByQqJeKqCTmo3fzgsohc";
+const HELIUS_RPC: &str = "https://mainnet.helius-rpc.com/?api-key=b364b14c-d412-4660-a6c0-ff766b7b7441";
 
 #[derive(Parser)]
 #[command(about = "Pause before each discovered batch and inspect frozen chain state")]
@@ -35,11 +40,11 @@ struct Cli {
     api_key: String,
 
     /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 399_834_992)]
+    #[arg(long, default_value_t = 417_811_170)]
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 399_834_999)]
+    #[arg(long, default_value_t = 417_811_190)]
     end_slot: u64,
 
     /// Program to watch; defaults to Jupiter V6 aggregator.
@@ -53,10 +58,32 @@ async fn main() -> Result<()> {
 
     let program_addr: Address = cli.program_id.parse().context("invalid --program-id")?;
 
+    let dart_tx: VersionedTransaction = {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 1,
+            "method": "getTransaction",
+            "params": [DART_TX_SIG, {"encoding": "base64", "maxSupportedTransactionVersion": 0}]
+        });
+        let resp: serde_json::Value = reqwest::Client::new()
+            .post(HELIUS_RPC)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
+        let encoded = resp["result"]["transaction"][0]
+            .as_str()
+            .context("dart tx not found")?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .context("base64 decode dart tx")?;
+        bincode::deserialize(&bytes).context("deserialize dart tx")?
+    };
+    eprintln!("[dart] loaded tx: {DART_TX_SIG}");
+
     let client = BacktestClient::builder()
         .url(format!("wss://{}/backtest", &cli.url))
         .api_key(cli.api_key)
-        .log_raw(true)
         .build();
 
     eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
@@ -90,40 +117,71 @@ async fn main() -> Result<()> {
                 let batch = pause.paused.batch_index.unwrap_or(0);
                 eprintln!("[pause #{pause_count}] slot={slot} batch={batch}");
 
-                for bin in &pause.discovery.transactions {
-                    let bytes = bin.decode().context("base64 decode failed")?;
-                    let tx: VersionedTransaction = bincode::deserialize(&bytes)
-                        .context("deserialize VersionedTransaction failed")?;
+                // Filter to SOL→USDC swaps: tx must reference both mints.
+                let sol_usdc_txs: Vec<VersionedTransaction> = pause
+                    .discovery
+                    .transactions
+                    .iter()
+                    .filter_map(|bin| {
+                        let bytes = bin.decode().ok()?;
+                        let tx: VersionedTransaction = bincode::deserialize(&bytes).ok()?;
+                        let keys: Vec<String> = tx
+                            .message
+                            .static_account_keys()
+                            .iter()
+                            .map(|k| k.to_string())
+                            .collect();
+                        let has_wsol = keys.iter().any(|k| k == WSOL_MINT);
+                        let has_usdc = keys.iter().any(|k| k == USDC_MINT);
+                        if has_wsol && has_usdc { Some(tx) } else { None }
+                    })
+                    .collect();
+
+                if sol_usdc_txs.is_empty() {
+                    eprintln!("  [skip] no SOL→USDC swaps in this batch");
+                    continue;
+                }
+
+                for tx in &sol_usdc_txs {
                     let sig = tx
                         .signatures
                         .first()
                         .map(|s| s.to_string())
                         .unwrap_or_default();
-                    eprintln!("  matched tx: {sig}");
-                    for key in tx.message.static_account_keys() {
-                        eprintln!("    account: {key}");
-                    }
+                    eprintln!("  [SOL→USDC] jup tx: {sig}");
                 }
 
-                // ── Inspect chain state ───────────────────────────────────────
-                // State here reflects all committed transactions *before* this
-                // batch.  The matched transactions have NOT run yet.
-                //
-                // Example: confirm the RPC reflects the pause point:
                 let current = session.rpc().get_slot().await?;
                 eprintln!("  rpc slot: {current}");
 
-                // ── Simulate a custom transaction ─────────────────────────────
-                // Build `my_tx` with your routing logic, then:
-                //
-                //   let result = session
-                //       .rpc()
-                //       .simulate_transaction(&my_tx)
-                //       .await
-                //       .context("simulate failed")?;
-                //   eprintln!("  simulate logs: {:?}", result.value.logs);
-                //
-                // Nothing is sent on-chain; the session state is unchanged.
+                for tx in &sol_usdc_txs {
+                    let jup_result = session
+                        .rpc()
+                        .simulate_transaction(tx)
+                        .await
+                        .context("simulate jup tx failed")?;
+
+                    let dart_result = session
+                        .rpc()
+                        .simulate_transaction(&dart_tx)
+                        .await
+                        .context("simulate dart tx failed")?;
+
+                    let jup_return = jup_result.value.logs.as_ref()
+                        .and_then(|logs| logs.iter().find(|l| l.starts_with("Program return:")))
+                        .cloned()
+                        .unwrap_or_else(|| "no return value".to_string());
+
+                    let dart_return = dart_result.value.logs.as_ref()
+                        .and_then(|logs| logs.iter().find(|l| l.starts_with("Program return:")))
+                        .cloned()
+                        .unwrap_or_else(|| "no return value".to_string());
+
+                    eprintln!("  [compare]");
+                    eprintln!("    jup:  {jup_return}");
+                    eprintln!("    dart: {dart_return}");
+                }
+
             }
 
             DiscoveryStepResult::Completed => {
