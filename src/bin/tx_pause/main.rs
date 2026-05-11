@@ -14,7 +14,7 @@
 
 mod utils;
 use utils::{
-    get_titan_template, parse_jupiter_swap, parse_titan_sim_result, set_titan_input_amount,
+    get_titan_template, parse_jupiter_swap_result, parse_titan_sim_result, patch_titan_template_transaction,
     JUPITER_V6, USDC_MINT, WSOL_MINT,
 };
 
@@ -27,6 +27,8 @@ use history_model::TxWithMeta;
 use simulator_api::DiscoveryFilter;
 use simulator_client::{BacktestClient, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
+
+use crate::utils::extract_signer_and_input_ata;
 
 const TEMPLATE_TX: &str =
     "u6tf2YYLvDyG1HYfBUP9KqssUSZx3hebQMDJYh9Mug9CxDPKzTeNPgaoMZ92VPhwcCuByQqJeKqCTmo3fzgsohc";
@@ -104,6 +106,10 @@ fn write_output(filename: &str, records: &[SwapRecord]) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     let cli = Cli::parse();
     let program_addr: Address = cli.program_id.parse().context("invalid --program-id")?;
     let base_template = get_titan_template(TEMPLATE_TX).await?;
@@ -130,6 +136,12 @@ async fn main() -> Result<()> {
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
     eprintln!("[ws] ready — scanning for {} batches", cli.program_id);
 
+    // Pre-load ATP into the simulator session so CreateIdempotent works in simulation.
+    let atp_addr: solana_address::Address =
+        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bL".parse()?;
+    let acc = session.rpc().get_account(&atp_addr).await;
+    eprintln!("[ws] ATP pre-loaded: {acc:?}");
+
     let timeout = Some(Duration::from_secs(120));
     let mut pause_count = 0u64;
     let mut records: Vec<SwapRecord> = Vec::new();
@@ -155,13 +167,18 @@ async fn main() -> Result<()> {
 
                 for tx_with_meta in &txs {
                     let jup_swap =
-                        match parse_jupiter_swap(tx_with_meta, USDC_MINT, WSOL_MINT) {
+                        match parse_jupiter_swap_result(tx_with_meta, USDC_MINT, WSOL_MINT) {
                             Some(s) => s,
                             None => continue,
                         };
 
+                    let (signer, in_ata) = match extract_signer_and_input_ata(tx_with_meta, USDC_MINT) {
+                        Ok(x) => x,
+                        Err(_) => continue,
+                    };
                     let modified_template =
-                        match set_titan_input_amount(&base_template, jup_swap.input_amount) {
+                        match patch_titan_template_transaction(&base_template, signer, in_ata, jup_swap.in_amount)
+                        {
                             Some(t) => t,
                             None => {
                                 eprintln!("  [skip] could not patch titan template");
@@ -171,7 +188,8 @@ async fn main() -> Result<()> {
 
                     let titan_result = session
                         .rpc()
-                        .simulate_transaction(&modified_template)
+                        .simulate_transaction(&base_template)
+                        // .simulate_transaction(&modified_template)
                         .await
                         .context("simulate titan tx failed")?;
 
@@ -189,7 +207,7 @@ async fn main() -> Result<()> {
                         .map(|s| s.to_string())
                         .unwrap_or_default();
 
-                    eprintln!("  [compare] sig={tx_sig} input={}", jup_swap.input_amount);
+                    eprintln!("  [compare] sig={tx_sig} input={}", jup_swap.in_amount);
                     eprintln!(
                         "    jup:   out={} venues={:?}",
                         jup_swap.out_amount, jup_swap.venues
@@ -201,7 +219,7 @@ async fn main() -> Result<()> {
                         tx_sig,
                         input_mint: USDC_MINT,
                         output_mint: WSOL_MINT,
-                        input_amount: jup_swap.input_amount,
+                        input_amount: jup_swap.in_amount,
                         jup_out: jup_swap.out_amount,
                         jup_venues: jup_swap.venues,
                         titan_out,
