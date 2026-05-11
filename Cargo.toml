@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "tx-pause"
-path = "src/bin/tx_pause.rs"
+path = "src/bin/tx_pause/main.rs"
 
 [dependencies]
 anyhow = "1"
@@ -30,6 +30,8 @@ solana-loader-v3-interface = "6.0.0"
 solana-pubkey = "3"
 solana-rpc-client-api = "3.1.0"
 solana-signature = "3"
+history-model = { path = "../nitro-stream/crates/history-model" }
+solana-message = "3.1"
 solana-transaction = "3.1"
 solana-transaction-status = "3.1"
 tokio = { version = "1", features = ["full"] }
