@@ -108,47 +108,70 @@ pub fn parse_jupiter_swap_result(tx_with_meta: &TxWithMeta, input: &str, output:
     Some(SwapData { in_amount: input_amount, out_amount, venues })
 }
 
-// Returns (out_amount, venues) for a simulated TITAN swap.
-// out_amount: signer's output token delta from simulation pre/post token balances.
-// venues: non-signer token accounts where input-mint balance increased; owner = venue program.
+// discriminant for Titan's per-split swap event (b71c1787ad7f7cea)
+const TITAN_SPLIT_EVENT_DISC: [u8; 8] = [0xb7, 0x1c, 0x17, 0x87, 0xad, 0x7f, 0x7c, 0xea];
+
+pub struct TitanSplitEvent {
+    pub split_idx: u8,
+    pub in_amount: u64,
+    pub expected_min_out: u64,
+    pub actual_out: u64,
+}
+
+// event layout: disc(8) | split_idx(1) | in(8) | in(8) | expected_min(8) | actual_out(8) = 41 bytes
+pub fn parse_titan_events(logs: &[String]) -> Vec<TitanSplitEvent> {
+    logs.iter()
+        .filter_map(|log| {
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(log.strip_prefix("Program data: ")?).ok()?;
+            if raw.len() < 41 || raw[..8] != TITAN_SPLIT_EVENT_DISC { return None; }
+            Some(TitanSplitEvent {
+                split_idx: raw[8],
+                in_amount: u64::from_le_bytes(raw[9..17].try_into().ok()?),
+                expected_min_out: u64::from_le_bytes(raw[25..33].try_into().ok()?),
+                actual_out: u64::from_le_bytes(raw[33..41].try_into().ok()?),
+            })
+        })
+        .collect()
+}
+
 pub fn parse_titan_sim_result(
     tx: &VersionedTransaction,
     result: &RpcSimulateTransactionResult,
-    input: &str,
-    output: &str,
+    _input: &str,
+    _output: &str,
 ) -> (u64, Vec<(String, u64)>) {
-    let signer = tx
-        .message
-        .static_account_keys()
-        .first()
-        .map(|k| k.to_string())
-        .unwrap_or_default();
-
     if let Some(err) = &result.err {
         eprintln!("  [titan sim error] {:?}", err);
-        if let Some(logs) = &result.logs {
-            for log in logs {
-                eprintln!("  [titan log] {}", log);
+    }
+
+    let logs = result.logs.as_deref().unwrap_or(&[]);
+
+    // Pair each split event with the last invoke [2] program seen before it.
+    // Titan emits a Program data: event immediately after each DEX CPI completes.
+    let mut last_invoke2: Option<String> = None;
+    let mut venues: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let mut out_amount = 0u64;
+
+    for log in logs {
+        if let Some(prog) = log.strip_prefix("Program ").and_then(|s| s.strip_suffix(" invoke [2]")) {
+            last_invoke2 = Some(prog.to_string());
+        } else if let Some(b64) = log.strip_prefix("Program data: ") {
+            if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64) {
+                if raw.len() >= 41 && raw[..8] == TITAN_SPLIT_EVENT_DISC {
+                    let in_amount  = u64::from_le_bytes(raw[9..17].try_into().unwrap());
+                    let actual_out = u64::from_le_bytes(raw[33..41].try_into().unwrap());
+                    out_amount += actual_out;
+                    if let Some(prog) = &last_invoke2 {
+                        *venues.entry(prog.clone()).or_insert(0) += in_amount;
+                    }
+                }
             }
-        } else {
-            eprintln!("  [titan sim error] (no logs — likely preflight failure)");
-        }
-        eprintln!("  [titan sim accounts]");
-        for (i, k) in tx.message.static_account_keys().iter().enumerate() {
-            eprintln!("    static[{i}] = {k}");
-        }
-        for ix in tx.message.instructions() {
-            eprintln!("    ix prog={} accts={:?}", ix.program_id_index, ix.accounts);
         }
     }
 
-    let pre = result.pre_token_balances.as_deref().unwrap_or(&[]);
-    let post = result.post_token_balances.as_deref().unwrap_or(&[]);
-
-    // Titan writes to the signer's wSOL ATA (created via CreateIdempotent).
-    // Fall back to any wSOL increase in case the ATA owner isn't set in simulation metadata.
-    let out_amount = ui_any_output_delta(pre, post, output).unwrap_or(0);
-    let venues = ui_venue_amounts(pre, post, &signer, input, &[TITAN_PROGRAM]);
+    let mut venues: Vec<(String, u64)> = venues.into_iter().collect();
+    venues.sort_by_key(|(_, a)| std::cmp::Reverse(*a));
 
     (out_amount, venues)
 }
@@ -199,10 +222,51 @@ pub fn extract_signer_and_input_ata(tx: &TxWithMeta, in_mint: &str) -> Result<(P
     Ok((signer_str.parse().context("invalid signer pubkey")?, in_ata))
 }
 
-const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bL";
+fn titan_ix_acct(tx: &VersionedTransaction, pos: usize) -> Option<Pubkey> {
+    use solana_message::compiled_instruction::CompiledInstruction as IX;
+    fn ix_acct(ixs: &[IX], prog: u8, pos: usize) -> Option<u8> {
+        ixs.iter().find(|ix| ix.program_id_index == prog)?.accounts.get(pos).copied()
+    }
+    let static_keys = tx.message.static_account_keys();
+    let titan_idx = static_keys.iter().position(|k| k.to_string() == TITAN_PROGRAM)? as u8;
+    let idx = match &tx.message {
+        VersionedMessage::Legacy(msg) => ix_acct(&msg.instructions, titan_idx, pos)?,
+        VersionedMessage::V0(msg)     => ix_acct(&msg.instructions, titan_idx, pos)?,
+    } as usize;
+    Some(*static_keys.get(idx)?)
+}
+
+/// Returns the address of the input ATA in the template's Titan instruction (account slot 3).
+pub fn template_in_ata_addr(tx: &VersionedTransaction) -> Option<Pubkey> {
+    titan_ix_acct(tx, 3)
+}
+
+/// Returns the address of the output ATA in the template's Titan instruction (account slot 5).
+pub fn template_out_ata_addr(tx: &VersionedTransaction) -> Option<Pubkey> {
+    titan_ix_acct(tx, 5)
+}
+
+/// Bumps the per-split slippage tolerance byte (experimentally byte 23 = ~20 bps) to avoid
+/// stale-price rejections when simulating the template at a different slot.
+pub fn relax_titan_slippage(tx: &VersionedTransaction) -> Option<VersionedTransaction> {
+    let static_keys = tx.message.static_account_keys();
+    let titan_idx = static_keys.iter().position(|k| k.to_string() == TITAN_PROGRAM)? as u8;
+    let mut new_tx = tx.clone();
+    let ixs = match &mut new_tx.message {
+        VersionedMessage::Legacy(msg) => &mut msg.instructions,
+        VersionedMessage::V0(msg)     => &mut msg.instructions,
+    };
+    let titan_ix = ixs.iter_mut().find(|ix| ix.program_id_index == titan_idx)?;
+    if titan_ix.data.len() <= 23 { return None; }
+    titan_ix.data[18] = (titan_ix.data[18] as u16 * 11 / 10) as u8;
+    titan_ix.data[23] = (titan_ix.data[23] as u16 * 11 / 10) as u8;
+    Some(new_tx)
+}
+
+const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
-fn derive_ata(wallet: &Pubkey, mint_str: &str) -> Option<Pubkey> {
+pub fn derive_ata(wallet: &Pubkey, mint_str: &str) -> Option<Pubkey> {
     let assoc: Pubkey = ASSOCIATED_TOKEN_PROGRAM.parse().ok()?;
     let token: Pubkey = TOKEN_PROGRAM.parse().ok()?;
     let mint: Pubkey = mint_str.parse().ok()?;
@@ -213,9 +277,8 @@ fn derive_ata(wallet: &Pubkey, mint_str: &str) -> Option<Pubkey> {
     Some(ata)
 }
 
-/// Patches the template to simulate a swap for `signer` with their `in_ata` and `in_amount`.
-/// Derives the signer's wSOL ATA, ensures it's created via CreateIdempotent, zeros slippage.
-/// Requires ATP to be pre-loaded into the simulator session via getAccountInfo before use.
+/// Patches the template for a JUP-comparison simulation: replaces signer, in_ata, in_amount,
+/// derives and injects the signer's wSOL output ATA, prepends CreateIdempotent, zeros slippage.
 pub fn patch_titan_template_transaction(
     tx: &VersionedTransaction,
     signer: Pubkey,
@@ -228,7 +291,6 @@ pub fn patch_titan_template_transaction(
         ixs.iter().find(|ix| ix.program_id_index == prog)?.accounts.get(pos).copied()
     }
 
-    // Appends `key` to static keys if absent, shifting all LUT-based account indices up by 1.
     fn get_or_add(keys: &mut Vec<Pubkey>, ixs: &mut Vec<IX>, key: Pubkey) -> u8 {
         if let Some(i) = keys.iter().position(|k| k == &key) { return i as u8; }
         let idx = keys.len() as u8;

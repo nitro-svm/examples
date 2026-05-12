@@ -14,21 +14,24 @@
 
 mod utils;
 use utils::{
-    get_titan_template, parse_jupiter_swap_result, parse_titan_sim_result, patch_titan_template_transaction,
-    JUPITER_V6, USDC_MINT, WSOL_MINT,
+    extract_signer_and_input_ata,
+    get_titan_template, parse_jupiter_swap_result, parse_titan_sim_result,
+    derive_ata, JUPITER_V6, USDC_MINT, WSOL_MINT,
 };
+use std::collections::BTreeMap;
 
 use std::io::{BufWriter, Write as _};
 use std::time::Duration;
 
+use solana_transaction::versioned::VersionedTransaction;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use history_model::TxWithMeta;
-use simulator_api::DiscoveryFilter;
+use simulator_api::{AccountData, AccountModifications, BinaryEncoding, DiscoveryFilter, EncodedBinary};
 use simulator_client::{BacktestClient, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
 
-use crate::utils::extract_signer_and_input_ata;
 
 const TEMPLATE_TX: &str =
     "u6tf2YYLvDyG1HYfBUP9KqssUSZx3hebQMDJYh9Mug9CxDPKzTeNPgaoMZ92VPhwcCuByQqJeKqCTmo3fzgsohc";
@@ -136,12 +139,6 @@ async fn main() -> Result<()> {
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
     eprintln!("[ws] ready — scanning for {} batches", cli.program_id);
 
-    // Pre-load ATP into the simulator session so CreateIdempotent works in simulation.
-    let atp_addr: solana_address::Address =
-        "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bL".parse()?;
-    let acc = session.rpc().get_account(&atp_addr).await;
-    eprintln!("[ws] ATP pre-loaded: {acc:?}");
-
     let timeout = Some(Duration::from_secs(120));
     let mut pause_count = 0u64;
     let mut records: Vec<SwapRecord> = Vec::new();
@@ -155,7 +152,7 @@ async fn main() -> Result<()> {
                 let batch = pause.paused.batch_index.unwrap_or(0);
                 eprintln!("[pause #{pause_count}] slot={slot} batch={batch}");
 
-                let txs: Vec<TxWithMeta> = pause
+                let txs: Vec<VersionedTransaction> = pause
                     .discovery
                     .transactions
                     .iter()
@@ -166,66 +163,124 @@ async fn main() -> Result<()> {
                     .collect();
 
                 for tx_with_meta in &txs {
-                    let jup_swap =
-                        match parse_jupiter_swap_result(tx_with_meta, USDC_MINT, WSOL_MINT) {
-                            Some(s) => s,
-                            None => continue,
+                    // let jup_swap =
+                    //     match parse_jupiter_swap_result(tx_with_meta, USDC_MINT, WSOL_MINT) {
+                    //         Some(s) => s,
+                    //         None => continue,
+                    //     };
+
+                    // let (signer, in_ata) = match extract_signer_and_input_ata(tx_with_meta, USDC_MINT) {
+                    //     Ok(x) => x,
+                    //     Err(_) => continue,
+                    // };
+
+                    // Inject USDC input ATA and wSOL output ATA so the baseline tx has valid accounts.
+                    {
+                        let signer = base_template.message.static_account_keys()[0];
+                        let in_ata_key = utils::template_in_ata_addr(&base_template)
+                            .context("no in_ata in template")?;
+                        let out_ata_key = utils::derive_ata(&signer, WSOL_MINT)
+                            .context("could not derive out_ata")?;
+
+                        let make_token_acct = |mint: &str, amount: u64| -> Result<AccountData> {
+                            let mut data = [0u8; 165];
+                            data[0..32].copy_from_slice(mint.parse::<solana_pubkey::Pubkey>()?.as_ref());
+                            data[32..64].copy_from_slice(signer.as_ref());
+                            data[64..72].copy_from_slice(&amount.to_le_bytes());
+                            data[108] = 1;
+                            Ok(AccountData {
+                                data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
+                                executable: false,
+                                lamports: 2_039_280,
+                                owner: utils::TOKEN_PROGRAM.parse()?,
+                                space: 165,
+                            })
                         };
 
-                    let (signer, in_ata) = match extract_signer_and_input_ata(tx_with_meta, USDC_MINT) {
-                        Ok(x) => x,
-                        Err(_) => continue,
-                    };
-                    let modified_template =
-                        match patch_titan_template_transaction(&base_template, signer, in_ata, jup_swap.in_amount)
-                        {
-                            Some(t) => t,
-                            None => {
-                                eprintln!("  [skip] could not patch titan template");
-                                continue;
-                            }
-                        };
+                        let mods = AccountModifications(BTreeMap::from([
+                            (in_ata_key.to_string().parse::<Address>()?, make_token_acct(USDC_MINT, 30_000_000_000)?),
+                            (out_ata_key.to_string().parse::<Address>()?, make_token_acct(WSOL_MINT, 0)?),
+                        ]));
+                        session.modify_accounts(&mods).await.context("modify_accounts failed")?;
+                    }
+                    // let modified_template =
+                    //     match patch_titan_in_amount(&base_template, in_amount)
+                    //     // match patch_titan_template_transaction(&base_template, signer, in_ata, jup_swap.in_amount)
+                    //     {
+                    //         Some(t) => t,
+                    //         None => {
+                    //             eprintln!("  [skip] could not patch titan template");
+                    //             continue;
+                    //         }
+                    //     };
 
+                    for (i, key) in base_template.message.static_account_keys().iter().enumerate() {
+                        match session.rpc().get_account(key).await {
+                            Ok(acct) => eprintln!("  [acct {i}] {key} owner={}", acct.owner),
+                            Err(_)   => eprintln!("  [acct {i}] {key} owner=<not found>"),
+                        }
+                    }
+
+                    // let patched = utils::relax_titan_slippage(&base_template).context("relax_titan_slippage failed")?;
                     let titan_result = session
                         .rpc()
                         .simulate_transaction(&base_template)
-                        // .simulate_transaction(&modified_template)
                         .await
                         .context("simulate titan tx failed")?;
 
+                    for log in titan_result.value.logs.as_deref().unwrap_or(&[]) {
+                        eprintln!("  [log] {log}");
+                    }
+
                     let (titan_out, titan_venues) = parse_titan_sim_result(
-                        &modified_template,
+                        &base_template,
                         &titan_result.value,
                         USDC_MINT,
                         WSOL_MINT,
                     );
 
-                    let tx_sig = tx_with_meta
-                        .transaction
-                        .signatures
-                        .first()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-
-                    eprintln!("  [compare] sig={tx_sig} input={}", jup_swap.in_amount);
-                    eprintln!(
-                        "    jup:   out={} venues={:?}",
-                        jup_swap.out_amount, jup_swap.venues
+                    let events = utils::parse_titan_events(
+                        titan_result.value.logs.as_deref().unwrap_or(&[])
                     );
+                    let keys = base_template.message.static_account_keys();
+                    for e in &events {
+                        if let Some(key) = keys.get(e.split_idx as usize) {
+                            match session.rpc().get_account(key).await {
+                                Ok(account) => eprintln!("    [split {}] owner={}", e.split_idx, account.owner),
+                                Err(err) => eprintln!("    [split {}] get_account err: {err}", e.split_idx),
+                            }
+                        }
+                    }
+
+                    // let tx_sig = tx_with_meta
+                    //     .transaction
+                    //     .signatures
+                    //     .first()
+                    //     .map(|s| s.to_string())
+                    //     .unwrap_or_default();
+
+                    // eprintln!("  [compare] sig={tx_sig} input={}", jup_swap.in_amount);
+                    // eprintln!(
+                    //     "    jup:   out={} venues={:?}",
+                    //     jup_swap.out_amount, jup_swap.venues
+                    // );
                     eprintln!("    titan: out={titan_out} venues={titan_venues:?}");
 
-                    records.push(SwapRecord {
-                        slot,
-                        tx_sig,
-                        input_mint: USDC_MINT,
-                        output_mint: WSOL_MINT,
-                        input_amount: jup_swap.in_amount,
-                        jup_out: jup_swap.out_amount,
-                        jup_venues: jup_swap.venues,
-                        titan_out,
-                        titan_venues,
-                    });
+                    // records.push(SwapRecord {
+                    //     slot,
+                    //     tx_sig,
+                    //     input_mint: USDC_MINT,
+                    //     output_mint: WSOL_MINT,
+                    //     input_amount: jup_swap.in_amount,
+                    //     jup_out: jup_swap.out_amount,
+                    //     jup_venues: jup_swap.venues,
+                    //     titan_out,
+                    //     titan_venues,
+                    // });
+
+                    break;
                 }
+                break;
             }
 
             DiscoveryStepResult::Completed => {
