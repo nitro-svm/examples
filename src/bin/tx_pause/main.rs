@@ -209,6 +209,7 @@ async fn main() -> Result<()> {
                     })
                     .collect();
 
+                eprintln!("  [batch] {} JUP txs discovered", txs.len());
                 for tx_with_meta in &txs {
                     let signature = tx_with_meta
                         .transaction

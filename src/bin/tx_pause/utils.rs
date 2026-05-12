@@ -15,14 +15,9 @@ pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 pub const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
-// Anchor discriminants
-// - route: user provides all ATAs
-// - sharedAccountsRoute: uses a shared intermediate ATA to allow fee-free hops
-pub const JUP_ROUTE_DISCRIMINANT: [u8; 8] = [229, 23, 203, 151, 122, 227, 173, 42];
-pub const JUP_SHARED_DISCRIMINANT: [u8; 8] = [193, 32, 155, 51, 65, 214, 156, 129];
+pub const JUP_FEE_AUTHORITY: &str = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
 
 pub const TITAN_PROGRAM: &str = "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT";
-// discriminant for Titan's per-split swap event (b71c1787ad7f7cea)
 const TITAN_SPLIT_EVENT_DISCRIMINANT: [u8; 8] = [0xb7, 0x1c, 0x17, 0x87, 0xad, 0x7f, 0x7c, 0xea];
 
 pub struct SwapData {
@@ -46,6 +41,11 @@ pub fn parse_jupiter_swap_result(
     output: &str,
 ) -> Option<SwapData> {
     let tx = &tx_with_meta.transaction;
+    let sig = tx
+        .signatures
+        .first()
+        .map(|s| s.to_string())
+        .unwrap_or_default();
     let keys: Vec<String> = tx
         .message
         .static_account_keys()
@@ -53,48 +53,43 @@ pub fn parse_jupiter_swap_result(
         .map(|k| k.to_string())
         .collect();
 
-    let jup_idx = keys.iter().position(|k| k == JUPITER_V6)? as u8;
-    let jup_ix = tx
-        .message
-        .instructions()
-        .iter()
-        .find(|ix| ix.program_id_index == jup_idx)?;
-
-    // Jupiter swap instruction only has two entrypoints
-    if !jup_ix.data.starts_with(&JUP_ROUTE_DISCRIMINANT)
-        && !jup_ix.data.starts_with(&JUP_SHARED_DISCRIMINANT)
-    {
-        return None;
-    }
-
-    // Direction check: USDC input → USDC mint in static keys; wSOL input → SyncNative present
-    let has_input = match input {
-        USDC_MINT => keys.iter().any(|k| k == USDC_MINT),
-        WSOL_MINT => {
-            let tokenkeg_idx = keys
-                .iter()
-                .position(|k| k == TOKEN_PROGRAM)
-                .map(|i| i as u8);
-            tokenkeg_idx.is_some_and(|idx| {
-                tx.message
-                    .instructions()
-                    .iter()
-                    .any(|ix| ix.program_id_index == idx && ix.data == [17])
-            })
-        }
-        _ => false,
-    };
-    if !has_input {
-        return None;
-    }
-
+    keys.iter().position(|k| k == JUPITER_V6)?;
+    // Direction check: prefer balance diffs (works even when mint is LUT-resolved);
+    // fall back to static-key / SyncNative heuristics when diffs are absent.
     let signer = &keys[0];
+    let has_input = tx_with_meta
+        .balance_diffs
+        .as_ref()
+        .and_then(|bd| {
+            let (pre, post) = bd.token_balances_or_empty();
+            token_delta(pre, post, signer, input, true).map(|d| d > 0)
+        })
+        .unwrap_or_else(|| match input {
+            USDC_MINT => keys.iter().any(|k| k == USDC_MINT),
+            WSOL_MINT => {
+                let tokenkeg_idx = keys
+                    .iter()
+                    .position(|k| k == TOKEN_PROGRAM)
+                    .map(|i| i as u8);
+                tokenkeg_idx.is_some_and(|idx| {
+                    tx.message
+                        .instructions()
+                        .iter()
+                        .any(|ix| ix.program_id_index == idx && ix.data == [17])
+                })
+            }
+            _ => false,
+        });
+    if !has_input {
+        eprintln!("  [jup filter] {sig}... input mint not detected");
+        return None;
+    }
+
     let (input_amount, out_amount, venues) = tx_with_meta
         .balance_diffs
         .as_ref()
         .map(|bd| {
             let (pre, post) = bd.token_balances_or_empty();
-            let input_amount = token_delta(pre, post, signer, input, true).unwrap_or(0);
             // Many USDC→SOL JUP swaps use wSOL unwrap: create wSOL ATA → swap into it →
             // CloseAccount. The wSOL ATA ends at 0, so token_delta returns 0. Fall back
             // to the signer's native SOL increase (Account 0).
@@ -110,12 +105,14 @@ pub fn parse_jupiter_swap_result(
                     }
                 })
                 .unwrap_or(0);
-            let venues = venue_amounts(pre, post, signer, input, &[JUPITER_V6]);
+            let venues = venue_amounts(pre, post, signer, input, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
+            let input_amount = venues.iter().map(|(_, a)| a).sum();
             (input_amount, out_amount, venues)
         })
         .unwrap_or_default();
 
     if out_amount == 0 {
+        eprintln!("  [jup filter] {sig}... out_amount=0");
         return None;
     }
 
