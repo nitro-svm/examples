@@ -241,19 +241,11 @@ async fn main() -> Result<()> {
                         .map(|s| s.to_string())
                         .unwrap_or_default();
 
-                    // let (jup_swap, dir) = if let Some(s) =
-                    //     parse_jupiter_swap_result(tx_with_meta, USDC_MINT, WSOL_MINT)
-                    // {
-                    //     (s, &dir_templates[0])
-                    // } else if let Some(s) =
-                    //     parse_jupiter_swap_result(tx_with_meta, WSOL_MINT, USDC_MINT)
-                    // {
-                    //     (s, &dir_templates[1])
-                    // } else {
-                    //     continue;
-                    // };
-
                     let (jup_swap, dir) = if let Some(s) =
+                        parse_jupiter_swap_result(tx_with_meta, USDC_MINT, WSOL_MINT)
+                    {
+                        (s, &dir_templates[0])
+                    } else if let Some(s) =
                         parse_jupiter_swap_result(tx_with_meta, WSOL_MINT, USDC_MINT)
                     {
                         (s, &dir_templates[1])
