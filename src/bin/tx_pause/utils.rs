@@ -27,100 +27,76 @@ pub struct SwapData {
     pub venues: Vec<(String, u64)>,
 }
 
-// JUP V6 direction detection:
-//   USDC input: USDC_MINT appears in static keys (SharedAccountsRoute pattern)
-//   wSOL input: SyncNative instruction (tag=17) present in tx
-//
-// input_amount, out_amount: signer's pre/post token balance deltas.
-// venues: non-signer token accounts where the input-mint balance increased are DEX pool vaults;
-//         their owner program identifies the venue. JUP's own pass-through accounts net to zero
-//         and are filtered out naturally.
 pub fn parse_jupiter_swap_result(
     tx_with_meta: &TxWithMeta,
     input: &str,
     output: &str,
 ) -> Option<SwapData> {
     let tx = &tx_with_meta.transaction;
-    let sig = tx
-        .signatures
-        .first()
-        .map(|s| s.to_string())
-        .unwrap_or_default();
+    let sig = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
     let keys: Vec<String> = tx
         .message
         .static_account_keys()
         .iter()
         .map(|k| k.to_string())
         .collect();
-
     keys.iter().position(|k| k == JUPITER_V6)?;
-    // Direction check: prefer balance diffs (works even when mint is LUT-resolved);
-    // fall back to static-key / SyncNative heuristics when diffs are absent.
+
     let signer = &keys[0];
-    let has_input = tx_with_meta
-        .balance_diffs
-        .as_ref()
-        .and_then(|bd| {
-            let (pre, post) = bd.token_balances_or_empty();
-            token_delta(pre, post, signer, input, true).map(|d| d > 0)
-        })
-        .unwrap_or_else(|| match input {
-            USDC_MINT => keys.iter().any(|k| k == USDC_MINT),
-            WSOL_MINT => {
-                let tokenkeg_idx = keys
-                    .iter()
-                    .position(|k| k == TOKEN_PROGRAM)
-                    .map(|i| i as u8);
-                tokenkeg_idx.is_some_and(|idx| {
-                    tx.message
-                        .instructions()
-                        .iter()
-                        .any(|ix| ix.program_id_index == idx && ix.data == [17])
-                })
-            }
-            _ => false,
-        });
+    let bd = tx_with_meta.balance_diffs.as_ref();
+    let (pre, post) = bd.map(|b| b.token_balances_or_empty()).unwrap_or((&[], &[]));
+
+    let input_consumed = token_delta(pre, post, signer, input, true).is_some_and(|d| d > 0);
+    let has_input = input_consumed || match input {
+        USDC_MINT => keys.iter().any(|k| k == USDC_MINT),
+        WSOL_MINT => {
+            let tokenkeg_idx = keys.iter().position(|k| k == TOKEN_PROGRAM).map(|i| i as u8);
+            let has_sync_native = tokenkeg_idx.is_some_and(|idx| {
+                tx.message.instructions().iter().any(|ix| ix.program_id_index == idx && ix.data == [17])
+            });
+            has_sync_native || signer_received(pre, post, signer, output).is_some()
+        }
+        _ => false,
+    };
     if !has_input {
-        eprintln!("  [jup filter] {sig}... input mint not detected");
         return None;
     }
 
-    let (input_amount, out_amount, venues) = tx_with_meta
-        .balance_diffs
-        .as_ref()
-        .map(|bd| {
-            let (pre, post) = bd.token_balances_or_empty();
-            // Many USDC→SOL JUP swaps use wSOL unwrap: create wSOL ATA → swap into it →
-            // CloseAccount. The wSOL ATA ends at 0, so token_delta returns 0. Fall back
-            // to the signer's native SOL increase (Account 0).
-            let out_amount = token_delta(pre, post, signer, output, false)
-                .filter(|&a| a > 0)
-                .or_else(|| {
-                    if output == WSOL_MINT {
-                        bd.post_balances
-                            .first()?
-                            .checked_sub(*bd.pre_balances.first()?)
-                    } else {
-                        None
-                    }
+    // USDC→SOL JUP swaps often unwrap via CloseAccount so the wSOL ATA ends at 0;
+    // fall back to the signer's native SOL gain at account[0].
+    let out_amount = signer_received(pre, post, signer, output)
+        .or_else(|| {
+            if output == WSOL_MINT {
+                bd.and_then(|b| {
+                    b.post_balances.first().zip(b.pre_balances.first())
+                        .and_then(|(&post_b, &pre_b)| post_b.checked_sub(pre_b))
                 })
-                .unwrap_or(0);
-            let venues = venue_amounts(pre, post, signer, input, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
-            let input_amount = venues.iter().map(|(_, a)| a).sum();
-            (input_amount, out_amount, venues)
+            } else {
+                None
+            }
         })
-        .unwrap_or_default();
-
+        .unwrap_or(0);
     if out_amount == 0 {
         eprintln!("  [jup filter] {sig}... out_amount=0");
         return None;
     }
 
-    Some(SwapData {
-        in_amount: input_amount,
-        out_amount,
-        venues,
-    })
+    let venues = venue_amounts(pre, post, signer, input, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
+    let input_amount = if input == WSOL_MINT {
+        token_delta(pre, post, signer, WSOL_MINT, true)
+            .filter(|&d| d > 0)
+            .or_else(|| {
+                bd.and_then(|b| {
+                    b.pre_balances.first().zip(b.post_balances.first())
+                        .and_then(|(&pre_b, &post_b)| pre_b.checked_sub(post_b))
+                })
+            })
+            .unwrap_or(0)
+    } else {
+        venues.iter().map(|(_, a)| a).sum()
+    };
+
+    Some(SwapData { in_amount: input_amount, out_amount, venues })
 }
 
 pub async fn get_titan_template_transaction(signature: &str) -> Result<VersionedTransaction> {
@@ -176,10 +152,57 @@ pub fn patch_titan_template_transaction(
         .iter_mut()
         .find(|ix| ix.program_id_index == titan_idx)
         .context("titan ix not found")?;
-    anyhow::ensure!(titan_ix.data.len() >= 10, "titan ix data too short");
+    // v3 layout: [0]=disc(0x2a) [1]=config [2..10]=amount [10..18]=expected_amount_out [18..20]=slippage_threshold_bps
+    anyhow::ensure!(titan_ix.data.len() >= 20, "titan ix data too short for v3");
+    anyhow::ensure!(titan_ix.data[0] == 0x2a, "unexpected titan ix discriminator (not swap_route_v3)");
     titan_ix.data[2..10].copy_from_slice(&in_amount.to_le_bytes());
+    // zero expected_amount_out so simulation never fails on stale slippage
+    titan_ix.data[10..18].copy_from_slice(&0u64.to_le_bytes());
 
     Ok(new_tx)
+}
+
+// SwapRouteV3Details event layout (after 8-byte discriminator):
+//   [8..16]  input_amount  (u64 LE)
+//   [16..24] output_amount (u64 LE)
+//   [24..32] expected_output, [32..40] fee_collected, [40..48] surplus_collected, [48..56] dynamic_allocation_fee_collected
+const TITAN_V3_DETAILS_DISCRIMINANT: [u8; 8] = [79, 62, 249, 87, 62, 217, 136, 30];
+
+pub fn parse_titan_sim_result(result: &RpcSimulateTransactionResult) -> SwapData {
+    if let Some(err) = &result.err {
+        eprintln!("  [titan sim error] {:?}", err);
+    }
+
+    let logs = result.logs.as_deref().unwrap_or(&[]);
+    let mut in_amount = 0u64;
+    let mut out_amount = 0u64;
+    let mut last_invoke2: Option<String> = None;
+    let mut venues: HashMap<String, u64> = HashMap::new();
+
+    for log in logs {
+        if let Some(prog) = log
+            .strip_prefix("Program ")
+            .and_then(|s| s.strip_suffix(" invoke [2]"))
+        {
+            last_invoke2 = Some(prog.to_string());
+        } else if let Some(b64) = log.strip_prefix("Program data: ")
+            && let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(b64)
+        {
+            if raw.len() >= 24 && raw[..8] == TITAN_V3_DETAILS_DISCRIMINANT {
+                in_amount = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+                out_amount = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+            } else if raw.len() >= 41 && raw[..8] == TITAN_SPLIT_EVENT_DISCRIMINANT {
+                let split_in = u64::from_le_bytes(raw[9..17].try_into().unwrap());
+                if let Some(prog) = &last_invoke2 {
+                    *venues.entry(prog.clone()).or_insert(0) += split_in;
+                }
+            }
+        }
+    }
+
+    let mut venues: Vec<(String, u64)> = venues.into_iter().collect();
+    venues.sort_by_key(|(_, a)| std::cmp::Reverse(*a));
+    SwapData { in_amount, out_amount, venues }
 }
 
 pub fn parse_titan_sim_events(result: &RpcSimulateTransactionResult) -> SwapData {
@@ -207,8 +230,15 @@ pub fn parse_titan_sim_events(result: &RpcSimulateTransactionResult) -> SwapData
             && raw.len() >= 41
             && raw[..8] == TITAN_SPLIT_EVENT_DISCRIMINANT
         {
-            let split_in = u64::from_le_bytes(raw[9..17].try_into().unwrap());
+            let split_idx = raw[8];
+            let field_a = u64::from_le_bytes(raw[9..17].try_into().unwrap());
+            let field_b = u64::from_le_bytes(raw[17..25].try_into().unwrap());
+            let field_c = u64::from_le_bytes(raw[25..33].try_into().unwrap());
             let actual_out = u64::from_le_bytes(raw[33..41].try_into().unwrap());
+            eprintln!(
+                "    [titan event] split={split_idx} a={field_a} b={field_b} c={field_c} out={actual_out}"
+            );
+            let split_in = field_a;
             in_amount += split_in;
             out_amount += actual_out;
             if let Some(prog) = &last_invoke2 {
@@ -253,6 +283,28 @@ fn ix_acct(ixs: &[CompiledInstruction], prog: u8, pos: usize) -> Option<u8> {
         .accounts
         .get(pos)
         .copied()
+}
+
+// Positive amount of `mint` received by `signer` in this tx.
+// Handles both existing ATAs (pre→post delta) and new ATAs (no pre-entry → full post balance).
+fn signer_received(
+    pre: &[TransactionTokenBalanceSerde],
+    post: &[TransactionTokenBalanceSerde],
+    signer: &str,
+    mint: &str,
+) -> Option<u64> {
+    if let Some(d) = token_delta(pre, post, signer, mint, false).filter(|&d| d > 0) {
+        return Some(d);
+    }
+    // Pre-entry present but no increase → nothing received.
+    if pre.iter().any(|b| b.owner.to_string() == signer && b.mint.to_string() == mint) {
+        return None;
+    }
+    // No pre-entry: new ATA created in this tx; full post-balance is the received amount.
+    post.iter()
+        .find(|b| b.owner.to_string() == signer && b.mint.to_string() == mint)
+        .and_then(|b| b.ui_token_amount.amount.parse().ok())
+        .filter(|&a: &u64| a > 0)
 }
 
 // Signer's token delta for `mint`. `consumed=true` for input (pre > post), false for output.

@@ -21,8 +21,8 @@ reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde_json = "1"
 futures = "0.3"
-simulator-api = "0.7.0"
-simulator-client = "0.7.0"
+simulator-api = { path = "../nitro-stream/crates/simulator-api" }
+simulator-client = { path = "../nitro-stream/crates/simulator-client" }
 solana-account-decoder = "3.1.0"
 solana-address = "1.0.0"
 solana-client = "3.1.0"
