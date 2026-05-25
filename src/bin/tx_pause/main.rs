@@ -12,6 +12,7 @@
 //!
 //! After your inspection, the session jumps directly to the next matching batch.
 
+mod types;
 mod utils;
 use utils::{
     JUPITER_V6, TOKEN_PROGRAM, USDC_MINT, WSOL_MINT, derive_ata, extract_signer,
@@ -25,12 +26,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use history_model::TxWithMeta;
+use types::TxWithMeta;
 use simulator_api::{
     AccountData, AccountModifications, BinaryEncoding, DiscoveryFilter, EncodedBinary,
 };
 use simulator_client::{BacktestClient, BacktestSession, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
+use solana_transaction::versioned::VersionedTransaction;
+use solana_pubkey::Pubkey;
 
 
 const SOL_TO_USDC_TEMPLATE: &str = "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
@@ -73,9 +76,18 @@ struct SwapRecord {
     output_mint: &'static str,
     input_amount: u64,
     jup_out: u64,
+    jup_quote: Option<u64>,
     jup_venues: Vec<(String, u64)>,
     titan_out: u64,
     titan_venues: Vec<(String, u64)>,
+}
+
+struct Template {
+    transaction: VersionedTransaction,
+    signer: Pubkey,
+    in_ata: Pubkey,
+    in_mint: &'static str,
+    out_mint: &'static str,
 }
 
 fn make_token_account(signer: &Address, mint: &str, amount: u64) -> Result<AccountData> {
@@ -128,7 +140,7 @@ fn write_output(filename: &str, records: &[SwapRecord]) -> Result<()> {
     let mut w = BufWriter::new(f);
     writeln!(
         w,
-        "slot,tx_sig,input_mint,output_mint,input_amount,jup_out,jup_venues,titan_out,titan_venues"
+        "slot,tx_sig,input_mint,output_mint,input_amount,jup_out,jup_quote,jup_venues,titan_out,titan_venues"
     )?;
     for r in records {
         let fmt = |v: &[(String, u64)]| -> String {
@@ -139,13 +151,14 @@ fn write_output(filename: &str, records: &[SwapRecord]) -> Result<()> {
         };
         writeln!(
             w,
-            "{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{}",
             r.slot,
             r.signature,
             r.input_mint,
             r.output_mint,
             r.input_amount,
             r.jup_out,
+            r.jup_quote.map_or(String::new(), |q| q.to_string()),
             fmt(&r.jup_venues),
             r.titan_out,
             fmt(&r.titan_venues),
@@ -154,12 +167,29 @@ fn write_output(filename: &str, records: &[SwapRecord]) -> Result<()> {
     Ok(())
 }
 
+async fn get_template_transactions() -> Result<[Template; 2]> {
+    let usdc_to_sol = {
+        let tx = get_titan_template_transaction(USDC_TO_SOL_TEMPLATE).await?;
+        let signer = extract_signer(&tx)?;
+        let ata = derive_ata(&signer, USDC_MINT).context("derive USDC ATA")?;
+        Template { transaction: tx, signer, in_ata: ata, in_mint: USDC_MINT, out_mint: WSOL_MINT }
+    };
+
+    let sol_to_usdc = {
+        let tx = get_titan_template_transaction(SOL_TO_USDC_TEMPLATE).await?;
+        let signer = extract_signer(&tx)?;
+        let ata = derive_ata(&signer, WSOL_MINT).context("derive WSOL ATA")?;
+        Template { transaction: tx, signer, in_ata: ata, in_mint: WSOL_MINT, out_mint: USDC_MINT }
+    };
+
+    Ok([usdc_to_sol, sol_to_usdc])
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
-    tracing_subscriber::fmt::init();
 
     let cli = Cli::parse();
     let program_addr: Address = cli.program_id.parse().context("invalid --program-id")?;
@@ -167,7 +197,6 @@ async fn main() -> Result<()> {
     let client = BacktestClient::builder()
         .url(format!("wss://{}/backtest", &cli.url))
         .api_key(cli.api_key)
-        .log_raw(true)
         .build();
 
     eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
@@ -191,28 +220,7 @@ async fn main() -> Result<()> {
     let timeout = Some(Duration::from_secs(120));
     let mut pause_count = 0u64;
     let mut records: Vec<SwapRecord> = Vec::new();
-
-    struct DirTemplate {
-        template: solana_transaction::versioned::VersionedTransaction,
-        signer: solana_pubkey::Pubkey,
-        in_ata: solana_pubkey::Pubkey,
-        in_mint: &'static str,
-        out_mint: &'static str,
-    }
-
-    let usdc_to_sol = {
-        let t = get_titan_template_transaction(USDC_TO_SOL_TEMPLATE).await?;
-        let s = extract_signer(&t)?;
-        let a = derive_ata(&s, USDC_MINT).context("derive USDC ATA")?;
-        DirTemplate { template: t, signer: s, in_ata: a, in_mint: USDC_MINT, out_mint: WSOL_MINT }
-    };
-    let sol_to_usdc = {
-        let t = get_titan_template_transaction(SOL_TO_USDC_TEMPLATE).await?;
-        let s = extract_signer(&t)?;
-        let a = derive_ata(&s, WSOL_MINT).context("derive WSOL ATA")?;
-        DirTemplate { template: t, signer: s, in_ata: a, in_mint: WSOL_MINT, out_mint: USDC_MINT }
-    };
-    let dir_templates = [usdc_to_sol, sol_to_usdc];
+    let template_txs = get_template_transactions().await?;
 
     loop {
         match session.advance_to_discovery(timeout).await? {
@@ -241,14 +249,14 @@ async fn main() -> Result<()> {
                         .map(|s| s.to_string())
                         .unwrap_or_default();
 
-                    let (jup_swap, dir) = if let Some(s) =
+                    let (jup_swap, original_template) = if let Some(s) =
                         parse_jupiter_swap_result(tx_with_meta, USDC_MINT, WSOL_MINT)
                     {
-                        (s, &dir_templates[0])
+                        (s, &template_txs[0])
                     } else if let Some(s) =
                         parse_jupiter_swap_result(tx_with_meta, WSOL_MINT, USDC_MINT)
                     {
-                        (s, &dir_templates[1])
+                        (s, &template_txs[1])
                     } else {
                         continue;
                     };
@@ -260,12 +268,12 @@ async fn main() -> Result<()> {
                     );
 
                     let original_balance =
-                        set_account_modifications(&session, &dir.signer, dir.in_mint, jup_swap.in_amount)
+                        set_account_modifications(&session, &original_template.signer, original_template.in_mint, jup_swap.in_amount)
                             .await?;
 
                     let modified_template = patch_titan_template_transaction(
-                        &dir.template,
-                        dir.in_ata,
+                        &original_template.transaction,
+                        original_template.in_ata,
                         jup_swap.in_amount,
                     )
                     .context("patch_titan_template_transaction failed")?;
@@ -290,16 +298,17 @@ async fn main() -> Result<()> {
                         titan_swap.out_amount, titan_swap.venues, titan_err
                     );
 
-                    set_account_modifications(&session, &dir.signer, dir.in_mint, original_balance)
+                    set_account_modifications(&session, &original_template.signer, original_template.in_mint, original_balance)
                         .await?;
 
                     records.push(SwapRecord {
                         slot,
                         signature,
-                        input_mint: dir.in_mint,
-                        output_mint: dir.out_mint,
+                        input_mint: original_template.in_mint,
+                        output_mint: original_template.out_mint,
                         input_amount: jup_swap.in_amount,
                         jup_out: jup_swap.out_amount,
+                        jup_quote: jup_swap.quote_amount,
                         jup_venues: jup_swap.venues,
                         titan_out: titan_swap.out_amount,
                         titan_venues: titan_swap.venues,
