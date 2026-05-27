@@ -36,6 +36,8 @@ use solana_transaction::versioned::VersionedTransaction;
 use solana_pubkey::Pubkey;
 
 
+const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
+
 const SOL_TO_USDC_TEMPLATE: &str = "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
 const USDC_TO_SOL_TEMPLATE: &str =
     "2RtLqCUeYBVhRppiJ2DFZoyVcwuJtPWprauRFfocynoiREYrGeJoqbpLM8bKsJkSoYpgr4oLnYEwCvrpDpiEZZV8";
@@ -94,8 +96,8 @@ fn make_token_account(signer: &Address, mint: &str, amount: u64) -> Result<Accou
     let mut data = [0u8; 165];
     data[0..32].copy_from_slice(mint.parse::<solana_pubkey::Pubkey>()?.as_ref());
     data[32..64].copy_from_slice(signer.as_ref());
-    data[64..72].copy_from_slice(&amount.to_le_bytes());
     data[108] = 1;
+    data[64..72].copy_from_slice(&amount.to_le_bytes());
 
     Ok(AccountData {
         data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
@@ -106,7 +108,41 @@ fn make_token_account(signer: &Address, mint: &str, amount: u64) -> Result<Accou
     })
 }
 
-async fn set_account_modifications(
+async fn set_native_modification(
+    session: &BacktestSession,
+    owner: &solana_pubkey::Pubkey,
+    new_balance: u64,
+) -> Result<u64> {
+    let owner_addr: Address = owner.to_string().parse()?;
+
+    let original_balance = session
+        .rpc()
+        .get_account(&owner_addr)
+        .await
+        .ok()
+        .map(|a| a.lamports)
+        .unwrap_or(0);
+
+    let modifications = AccountModifications(BTreeMap::from([(
+        owner_addr,
+        AccountData {
+            data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
+            executable: false,
+            // preserve original lamports so fees are covered, then add the swap amount on top
+            lamports: original_balance + new_balance,
+            owner: SYSTEM_PROGRAM.parse()?,
+            space: 0,
+        },
+    )]));
+    session
+        .modify_accounts(&modifications)
+        .await
+        .context("modify_accounts failed")?;
+
+    Ok(original_balance)
+}
+
+async fn set_ata_modification(
     session: &BacktestSession,
     owner: &solana_pubkey::Pubkey,
     mint: &str,
@@ -132,7 +168,21 @@ async fn set_account_modifications(
         .modify_accounts(&modifications)
         .await
         .context("modify_accounts failed")?;
+
     Ok(original_balance)
+}
+
+async fn set_account_modifications(
+    session: &BacktestSession,
+    owner: &solana_pubkey::Pubkey,
+    mint: &str,
+    new_balance: u64,
+) -> Result<u64> {
+    if mint == WSOL_MINT {
+        set_native_modification(session, owner, new_balance).await
+    } else {
+        set_ata_modification(session, owner, mint, new_balance).await
+    }
 }
 
 fn write_output(filename: &str, records: &[SwapRecord]) -> Result<()> {
