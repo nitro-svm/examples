@@ -28,24 +28,41 @@ pub struct SwapData {
     pub venues: Vec<(String, u64)>,
 }
 
-// route / sharedAccountsRoute fixed suffix:
-//   [...route_plan] [in_amount: u64] [quoted_amount: u64] [slippage_bps: u16] [platform_fee_bps: u8]
-// quoted_amount is always at data[len-11..len-3].
+// All discriminants are sha256("global:<instruction_name>")[..8] for JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4.
+//
+// V1 layout: [discriminant: 8] [...route_plan] [in_amount: u64] [quoted_out: u64] [slippage_bps: u16] [platform_fee_bps: u8]
+//   → quoted_out at data[len-11..len-3]
+// V2 layout: [discriminant: 8] [in_amount: u64] [quoted_out: u64] [...]
+//   → quoted_out at data[16..24]
+const JUP_V1_DISCRIMINANTS: &[[u8; 8]] = &[
+    [0xe5, 0x17, 0xcb, 0x97, 0x7a, 0xe3, 0xad, 0x2a], // route
+    [0xc1, 0x20, 0x9b, 0x33, 0x41, 0xd6, 0x9c, 0x81], // shared_accounts_route
+    [0x96, 0x56, 0x47, 0x74, 0xa7, 0x5d, 0x0e, 0x68], // route_with_token_ledger
+    [0xe6, 0x79, 0x8f, 0x50, 0x77, 0x9f, 0x6a, 0xaa], // shared_accounts_route_with_token_ledger
+    [0xd0, 0x33, 0xef, 0x97, 0x7b, 0x2b, 0xed, 0x5c], // exact_out_route
+    [0xb0, 0xd1, 0x69, 0xa8, 0x9a, 0x7d, 0x45, 0x3e], // shared_accounts_exact_out_route
+];
+const JUP_V2_DISCRIMINANTS: &[[u8; 8]] = &[
+    [0xbb, 0x64, 0xfa, 0xcc, 0x31, 0xc4, 0xaf, 0x14], // route_v2
+    [0xd1, 0x98, 0x53, 0x93, 0x7c, 0xfe, 0xd8, 0xe9], // shared_accounts_route_v2
+    [0x9d, 0x8a, 0xb8, 0x52, 0x15, 0xf4, 0xf3, 0x24], // exact_out_route_v2
+    [0x35, 0x60, 0xe5, 0xca, 0xd8, 0xbb, 0xfa, 0x18], // shared_accounts_exact_out_route_v2
+];
+
 pub fn extract_jup_quoted_out(tx: &VersionedTransaction) -> Option<u64> {
     let keys = tx.message.static_account_keys();
     let jup_idx = keys.iter().position(|k| k.to_string() == JUPITER_V6)? as u8;
-    let data = tx
-        .message
-        .instructions()
-        .iter()
-        .find(|ix| ix.program_id_index == jup_idx)?
-        .data
-        .as_slice();
-    if data.len() < 19 {
-        return None;
+    for ix in tx.message.instructions().iter().filter(|ix| ix.program_id_index == jup_idx) {
+        let data = ix.data.as_slice();
+        let Ok(disc) = <[u8; 8]>::try_from(data.get(..8)?) else { continue };
+        if JUP_V2_DISCRIMINANTS.contains(&disc) {
+            return data.get(16..24)?.try_into().ok().map(u64::from_le_bytes);
+        } else if JUP_V1_DISCRIMINANTS.contains(&disc) && data.len() >= 19 {
+            let len = data.len();
+            return Some(u64::from_le_bytes(data[len - 11..len - 3].try_into().unwrap()));
+        }
     }
-    let len = data.len();
-    Some(u64::from_le_bytes(data[len - 11..len - 3].try_into().unwrap()))
+    None
 }
 
 fn has_sync_native(keys: &[String], tx: &VersionedTransaction) -> bool {
