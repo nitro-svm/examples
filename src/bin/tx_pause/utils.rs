@@ -28,25 +28,36 @@ pub struct SwapData {
     pub venues: Vec<(String, u64)>,
 }
 
-// All discriminants are sha256("global:<instruction_name>")[..8] for JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4.
+// All discriminants are sha256("global:<instruction_name>")[..8].
 //
-// V1 layout: [discriminant: 8] [...route_plan] [in_amount: u64] [quoted_out: u64] [slippage_bps: u16] [platform_fee_bps: u8]
-//   → quoted_out at data[len-11..len-3]
-// V2 layout: [discriminant: 8] [in_amount: u64] [quoted_out: u64] [...]
-//   → quoted_out at data[16..24]
-const JUP_V1_DISCRIMINANTS: &[[u8; 8]] = &[
+// V1 suffix layout (route_plan is variable, so fixed fields are at fixed negative offsets):
+//   regular:   [disc:8][route_plan:var][in:8][quoted_out:8][slippage:2][fee:1]  → quoted_out at [len-11..len-3]
+//   exact_out: [disc:8][route_plan:var][out:8][quoted_in:8][slippage:2][fee:1]  → out at [len-19..len-11]
+//
+// V2 fixed layout (route_plan moved to end, fields at fixed positive offsets):
+//   non-shared: [disc:8][in:8][quoted_out:8]        → quoted_out at 16
+//   shared:     [disc:8][id:1][in:8][quoted_out:8]  → quoted_out at 17
+//   exact_out variants: out_amount comes first at offset 8 or 9 (with id)
+const JUP_V1_ROUTE_DISCRIMINANTS: &[[u8; 8]] = &[
     [0xe5, 0x17, 0xcb, 0x97, 0x7a, 0xe3, 0xad, 0x2a], // route
     [0xc1, 0x20, 0x9b, 0x33, 0x41, 0xd6, 0x9c, 0x81], // shared_accounts_route
     [0x96, 0x56, 0x47, 0x74, 0xa7, 0x5d, 0x0e, 0x68], // route_with_token_ledger
     [0xe6, 0x79, 0x8f, 0x50, 0x77, 0x9f, 0x6a, 0xaa], // shared_accounts_route_with_token_ledger
+];
+const JUP_V1_EXACT_OUT_DISCRIMINANTS: &[[u8; 8]] = &[
     [0xd0, 0x33, 0xef, 0x97, 0x7b, 0x2b, 0xed, 0x5c], // exact_out_route
     [0xb0, 0xd1, 0x69, 0xa8, 0x9a, 0x7d, 0x45, 0x3e], // shared_accounts_exact_out_route
 ];
-const JUP_V2_DISCRIMINANTS: &[[u8; 8]] = &[
-    [0xbb, 0x64, 0xfa, 0xcc, 0x31, 0xc4, 0xaf, 0x14], // route_v2
-    [0xd1, 0x98, 0x53, 0x93, 0x7c, 0xfe, 0xd8, 0xe9], // shared_accounts_route_v2
-    [0x9d, 0x8a, 0xb8, 0x52, 0x15, 0xf4, 0xf3, 0x24], // exact_out_route_v2
-    [0x35, 0x60, 0xe5, 0xca, 0xd8, 0xbb, 0xfa, 0x18], // shared_accounts_exact_out_route_v2
+// (discriminant, byte offset of the output amount field)
+// non-shared route_v2:             [disc:8][in:8][quoted_out:8]        → 16
+// shared_accounts_route_v2:        [disc:8][id:1][in:8][quoted_out:8]  → 17
+// exact_out_route_v2:              [disc:8][out:8][quoted_in:8]        →  8
+// shared_accounts_exact_out_route_v2: [disc:8][id:1][out:8][quoted_in:8] → 9
+const JUP_V2_OFFSETS: &[([u8; 8], usize)] = &[
+    ([0xbb, 0x64, 0xfa, 0xcc, 0x31, 0xc4, 0xaf, 0x14], 16), // route_v2
+    ([0xd1, 0x98, 0x53, 0x93, 0x7c, 0xfe, 0xd8, 0xe9], 17), // shared_accounts_route_v2
+    ([0x9d, 0x8a, 0xb8, 0x52, 0x15, 0xf4, 0xf3, 0x24],  8), // exact_out_route_v2
+    ([0x35, 0x60, 0xe5, 0xca, 0xd8, 0xbb, 0xfa, 0x18],  9), // shared_accounts_exact_out_route_v2
 ];
 
 pub fn extract_jup_quoted_out(tx: &VersionedTransaction) -> Option<u64> {
@@ -55,11 +66,16 @@ pub fn extract_jup_quoted_out(tx: &VersionedTransaction) -> Option<u64> {
     for ix in tx.message.instructions().iter().filter(|ix| ix.program_id_index == jup_idx) {
         let data = ix.data.as_slice();
         let Ok(disc) = <[u8; 8]>::try_from(data.get(..8)?) else { continue };
-        if JUP_V2_DISCRIMINANTS.contains(&disc) {
-            return data.get(16..24)?.try_into().ok().map(u64::from_le_bytes);
-        } else if JUP_V1_DISCRIMINANTS.contains(&disc) && data.len() >= 19 {
+        // Filter out quoted_out <= 1: senders often set 1 to bypass slippage checks.
+        let filter = |q: u64| if q > 1 { Some(q) } else { None };
+        if let Some(&(_, off)) = JUP_V2_OFFSETS.iter().find(|(d, _)| d == &disc) {
+            return data.get(off..off + 8)?.try_into().ok().map(u64::from_le_bytes).and_then(filter);
+        } else if JUP_V1_ROUTE_DISCRIMINANTS.contains(&disc) && data.len() >= 19 {
             let len = data.len();
-            return Some(u64::from_le_bytes(data[len - 11..len - 3].try_into().unwrap()));
+            return filter(u64::from_le_bytes(data[len - 11..len - 3].try_into().unwrap()));
+        } else if JUP_V1_EXACT_OUT_DISCRIMINANTS.contains(&disc) && data.len() >= 27 {
+            let len = data.len();
+            return filter(u64::from_le_bytes(data[len - 19..len - 11].try_into().unwrap()));
         }
     }
     None
@@ -78,6 +94,11 @@ pub fn parse_jupiter_swap_result(
     out_mint: &str,
 ) -> Option<SwapData> {
     let tx = &tx_with_meta.transaction;
+    let quote_amount = extract_jup_quoted_out(tx);
+    // if quote_amount.is_none() {
+    //     return None;
+    // }
+
     let keys: Vec<String> = tx
         .message
         .static_account_keys()
@@ -122,7 +143,6 @@ pub fn parse_jupiter_swap_result(
         return None;
     }
 
-    let quote_amount = extract_jup_quoted_out(tx);
     let venues: Vec<(String, u64)> = venue_amounts(pre, post, signer, in_mint, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
 
     Some(SwapData { in_amount, out_amount, quote_amount, venues })
