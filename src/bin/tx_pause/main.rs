@@ -93,16 +93,17 @@ struct Template {
 }
 
 fn make_token_account(signer: &Address, mint: &str, amount: u64) -> Result<AccountData> {
+    const RENT_EXEMPT: u64 = 2_039_280;
     let mut data = [0u8; 165];
     data[0..32].copy_from_slice(mint.parse::<solana_pubkey::Pubkey>()?.as_ref());
     data[32..64].copy_from_slice(signer.as_ref());
-    data[108] = 1;
     data[64..72].copy_from_slice(&amount.to_le_bytes());
+    data[108] = 1; // state = initialized
 
     Ok(AccountData {
         data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
         executable: false,
-        lamports: 2_039_280,
+        lamports: RENT_EXEMPT,
         owner: TOKEN_PROGRAM.parse()?,
         space: 165,
     })
@@ -123,13 +124,15 @@ async fn set_native_modification(
         .map(|a| a.lamports)
         .unwrap_or(0);
 
+    const ATA_RENT: u64 = 2_039_280;
+    const FEE: u64 = 1_000_000;
     let modifications = AccountModifications(BTreeMap::from([(
         owner_addr,
         AccountData {
             data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
             executable: false,
-            // new_balance is absolute; +1_000_000 covers base fee + priority fees
-            lamports: new_balance.saturating_add(1_000_000),
+            // add on extra to cover potential ATA creation and gas or priority fees
+            lamports: new_balance.saturating_add(ATA_RENT).saturating_add(FEE),
             owner: SYSTEM_PROGRAM.parse()?,
             space: 0,
         },
@@ -179,6 +182,7 @@ async fn set_account_modifications(
     new_balance: u64,
 ) -> Result<u64> {
     if mint == WSOL_MINT {
+        // Don't pre-create the wSOL ATA: Titan's swap_route_v3 creates and closes it
         set_native_modification(session, owner, new_balance).await
     } else {
         set_ata_modification(session, owner, mint, new_balance).await

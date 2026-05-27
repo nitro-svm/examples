@@ -56,6 +56,8 @@ const JUP_V1_EXACT_OUT_DISCRIMINANTS: &[[u8; 8]] = &[
 const JUP_V2_OFFSETS: &[([u8; 8], usize)] = &[
     ([0xbb, 0x64, 0xfa, 0xcc, 0x31, 0xc4, 0xaf, 0x14], 16), // route_v2
     ([0xd1, 0x98, 0x53, 0x93, 0x7c, 0xfe, 0xd8, 0xe9], 17), // shared_accounts_route_v2
+    ([0x98, 0x0c, 0xa4, 0x79, 0x4a, 0x67, 0xad, 0xcd], 16), // route_with_token_ledger_v2
+    ([0x79, 0xf7, 0xe0, 0x05, 0xd0, 0xea, 0x42, 0xfc], 17), // shared_accounts_route_with_token_ledger_v2
     ([0x9d, 0x8a, 0xb8, 0x52, 0x15, 0xf4, 0xf3, 0x24],  8), // exact_out_route_v2
     ([0x35, 0x60, 0xe5, 0xca, 0xd8, 0xbb, 0xfa, 0x18],  9), // shared_accounts_exact_out_route_v2
 ];
@@ -66,8 +68,8 @@ pub fn extract_jup_quoted_out(tx: &VersionedTransaction) -> Option<u64> {
     for ix in tx.message.instructions().iter().filter(|ix| ix.program_id_index == jup_idx) {
         let data = ix.data.as_slice();
         let Ok(disc) = <[u8; 8]>::try_from(data.get(..8)?) else { continue };
-        // Filter out quoted_out <= 1: senders often set 1 to bypass slippage checks.
-        let filter = |q: u64| if q > 1 { Some(q) } else { None };
+        // Filter out quoted_out <= 0: senders often set 1 to bypass slippage checks.
+        let filter = |q: u64| if q > 0 { Some(q) } else { None };
         if let Some(&(_, off)) = JUP_V2_OFFSETS.iter().find(|(d, _)| d == &disc) {
             return data.get(off..off + 8)?.try_into().ok().map(u64::from_le_bytes).and_then(filter);
         } else if JUP_V1_ROUTE_DISCRIMINANTS.contains(&disc) && data.len() >= 19 {
