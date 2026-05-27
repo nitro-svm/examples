@@ -128,8 +128,8 @@ async fn set_native_modification(
         AccountData {
             data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
             executable: false,
-            // preserve original lamports so fees are covered, then add the swap amount on top
-            lamports: original_balance + new_balance,
+            // new_balance is absolute; +1_000_000 covers base fee + priority fees
+            lamports: new_balance.saturating_add(1_000_000),
             owner: SYSTEM_PROGRAM.parse()?,
             space: 0,
         },
