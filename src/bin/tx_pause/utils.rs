@@ -61,7 +61,6 @@ pub fn parse_jupiter_swap_result(
     out_mint: &str,
 ) -> Option<SwapData> {
     let tx = &tx_with_meta.transaction;
-    let sig = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
     let keys: Vec<String> = tx
         .message
         .static_account_keys()
@@ -74,14 +73,15 @@ pub fn parse_jupiter_swap_result(
     let balances = tx_with_meta.balance_diffs.as_ref();
     let (pre, post) = balances.map(|b| b.token_balances_or_empty()).unwrap_or((&[], &[]));
 
-    let venues = venue_amounts(pre, post, signer, in_mint, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
     let in_amount = if in_mint == WSOL_MINT && has_sync_native(&keys, tx) {
+        // pre[0]-post[0] = swap_amount + fee. Subtract the 5000-lamport base fee to
+        // approximate the wrapped amount; priority fees are not accounted for here.
         balances.and_then(|b| {
             b.pre_balances.first().zip(b.post_balances.first())
-                .and_then(|(&pre_b, &post_b)| pre_b.checked_sub(post_b))
+                .and_then(|(&pre_b, &post_b)| pre_b.checked_sub(post_b + 5_000))
         }).unwrap_or(0)
     } else {
-        venues.iter().map(|(_, a)| *a).sum()
+        token_delta(pre, post, signer, in_mint, true).unwrap_or(0)
     };
     if in_amount == 0 {
         return None;
@@ -102,11 +102,12 @@ pub fn parse_jupiter_swap_result(
         })
         .unwrap_or(0);
     if out_amount == 0 {
-        eprintln!("  [jup filter] {sig}... out_amount=0");
         return None;
     }
 
     let quote_amount = extract_jup_quoted_out(tx);
+    let venues: Vec<(String, u64)> = venue_amounts(pre, post, signer, in_mint, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
+
     Some(SwapData { in_amount, out_amount, quote_amount, venues })
 }
 

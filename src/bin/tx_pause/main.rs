@@ -57,7 +57,7 @@ struct Cli {
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 417_811_240)]
+    #[arg(long, default_value_t = 417_811_175)]
     end_slot: u64,
 
     /// CSV output file path.
