@@ -10,15 +10,20 @@ path = "src/main.rs"
 
 [[bin]]
 name = "tx-pause"
-path = "src/bin/tx_pause.rs"
+path = "src/bin/tx_pause/main.rs"
 
 [dependencies]
 anyhow = "1"
+base64 = "0.22"
 bincode = "1"
 clap = { version = "4", features = ["derive", "env"] }
+reqwest = { version = "0.12", features = ["json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde_json = "1"
 futures = "0.3"
-simulator-api = "0.7.0"
-simulator-client = "0.7.0"
+serde = { version = "1", features = ["derive"] }
+simulator-api = "0.7.2"
+simulator-client = "0.7.2"
 solana-account-decoder = "3.1.0"
 solana-address = "1.0.0"
 solana-client = "3.1.0"
@@ -27,7 +32,9 @@ solana-loader-v3-interface = "6.0.0"
 solana-pubkey = "3"
 solana-rpc-client-api = "3.1.0"
 solana-signature = "3"
+solana-message = "3.1"
 solana-transaction = "3.1"
+solana-transaction-error = "3.1"
 solana-transaction-status = "3.1"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
