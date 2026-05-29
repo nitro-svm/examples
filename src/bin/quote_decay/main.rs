@@ -208,13 +208,21 @@ async fn simulate_swap(session: &BacktestSession, swap: &OriginalSwap) -> Result
         set_account_balance(session, &swap.signer, &swap.in_mint, swap.in_amount).await?;
 
     let out_addr = out_ata(swap).context("could not derive out address")?;
+    // For WSOL output, also request the wSOL ATA: CloseAccount may not run in
+    // resimulation, leaving the output in the ATA rather than native SOL.
+    let mut addrs = vec![out_addr];
+    if swap.out_mint == WSOL_MINT {
+        if let Some(w) = derive_ata(&swap.signer, WSOL_MINT) {
+            addrs.push(w.to_string());
+        }
+    }
     let config = RpcSimulateTransactionConfig {
         sig_verify: false,
         replace_recent_blockhash: true,
         encoding: Some(UiTransactionEncoding::Base64),
         accounts: Some(RpcSimulateTransactionAccountsConfig {
             encoding: Some(UiAccountEncoding::Base64),
-            addresses: vec![out_addr],
+            addresses: addrs,
         }),
         ..Default::default()
     };
@@ -229,12 +237,34 @@ async fn simulate_swap(session: &BacktestSession, swap: &OriginalSwap) -> Result
         eprintln!("    [sim err] sig={} {:?}", &swap.signature[..16], err);
     }
 
-    let sim_out = result
-        .value
-        .accounts
-        .as_deref()
-        .map(|accts| parse_post_balance(accts, &swap.out_mint).saturating_sub(pre))
-        .unwrap_or(0);
+    let accts = result.value.accounts.as_deref();
+
+    let sim_out = if let Some(accts) = accts {
+        if swap.out_mint == WSOL_MINT {
+            // accounts[0] = signer (native SOL), accounts[1] = wSOL ATA.
+            // Try native SOL gain first (CloseAccount ran). If that's 0, the
+            // output is still in the wSOL ATA; subtract rent-exempt to get the
+            // wrapped SOL amount.
+            const RENT_EXEMPT: u64 = 2_039_280;
+            let signer_post = accts.first()
+                .and_then(|o| o.as_ref())
+                .map(|a| a.lamports)
+                .unwrap_or(0);
+            let native_gain = signer_post.saturating_sub(pre);
+            if native_gain > 0 {
+                native_gain
+            } else {
+                accts.get(1)
+                    .and_then(|o| o.as_ref())
+                    .map(|a| a.lamports.saturating_sub(RENT_EXEMPT))
+                    .unwrap_or(0)
+            }
+        } else {
+            parse_post_balance(accts, &swap.out_mint).saturating_sub(pre)
+        }
+    } else {
+        0
+    };
 
     set_account_balance(session, &swap.signer, &swap.in_mint, original_in).await?;
 
