@@ -3153,6 +3153,8 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 [[package]]
 name = "simulator-api"
 version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6b7d5bca97814536befb70e6005896bc7c42ea193b44024088d70b61379db9b"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -3163,6 +3165,8 @@ dependencies = [
 [[package]]
 name = "simulator-client"
 version = "0.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42c0e1611b7fbcb494f9bf663056d9c72266d58efc12c35da8601a438e04faf5"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",
