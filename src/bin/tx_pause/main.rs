@@ -12,13 +12,12 @@
 //!
 //! After your inspection, the session jumps directly to the next matching batch.
 
-mod types;
-mod utils;
-use utils::{
+use backtest_example::utils::parse::{
     JUPITER_V6, TOKEN_PROGRAM, USDC_MINT, WSOL_MINT, derive_ata, extract_signer,
     get_titan_template_transaction, parse_jupiter_swap_result, parse_titan_sim_result,
     patch_titan_template_transaction,
 };
+use backtest_example::utils::types::TxWithMeta;
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write as _};
@@ -26,7 +25,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use types::TxWithMeta;
 use simulator_api::{
     AccountData, AccountModifications, BinaryEncoding, DiscoveryFilter, EncodedBinary,
 };

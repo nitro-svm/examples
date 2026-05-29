@@ -15,7 +15,7 @@ use solana_commitment_config::CommitmentConfig;
 use tokio::{sync::watch, task::JoinHandle};
 
 use super::{Stats, Transaction};
-use crate::utils::fetch_balance_changes;
+use backtest_example::fetch::fetch_balance_changes;
 
 // ── Log subscription ───────────────────────────────────────────────────────────
 

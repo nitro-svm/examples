@@ -20,6 +20,7 @@ use clap::Parser;
 use simulator_client::{BacktestClient, Continue, CreateSession};
 
 use logs::subscribe_logs;
+use backtest_example::fetch::{SolAccount, TokenAccount};
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -67,39 +68,6 @@ fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
     Ok(format!("{base}/{path}"))
 }
 
-// ── Balance change types ───────────────────────────────────────────────────────
-
-/// SOL balance change for a single account within a transaction.
-struct SolAccount {
-    pubkey: String,
-    pre_lamports: u64,
-    post_lamports: u64,
-}
-
-impl SolAccount {
-    fn delta(&self) -> i64 {
-        self.post_lamports as i64 - self.pre_lamports as i64
-    }
-}
-
-/// SPL token balance change for a single ATA within a transaction.
-struct TokenAccount {
-    pubkey: String,
-    mint: String,
-    owner: String,
-    pre_amount: u64,
-    post_amount: u64,
-    decimals: u8,
-}
-
-impl TokenAccount {
-    fn delta(&self) -> i64 {
-        self.post_amount as i64 - self.pre_amount as i64
-    }
-    fn to_ui(&self, raw: u64) -> f64 {
-        raw as f64 / 10f64.powi(self.decimals as i32)
-    }
-}
 
 /// All data captured for a single transaction.
 struct Transaction {

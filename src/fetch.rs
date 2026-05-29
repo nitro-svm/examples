@@ -9,7 +9,35 @@ use solana_transaction_status::{
     option_serializer::OptionSerializer,
 };
 
-use super::{SolAccount, TokenAccount};
+pub struct SolAccount {
+    pub pubkey: String,
+    pub pre_lamports: u64,
+    pub post_lamports: u64,
+}
+
+impl SolAccount {
+    pub fn delta(&self) -> i64 {
+        self.post_lamports as i64 - self.pre_lamports as i64
+    }
+}
+
+pub struct TokenAccount {
+    pub pubkey: String,
+    pub mint: String,
+    pub owner: String,
+    pub pre_amount: u64,
+    pub post_amount: u64,
+    pub decimals: u8,
+}
+
+impl TokenAccount {
+    pub fn delta(&self) -> i64 {
+        self.post_amount as i64 - self.pre_amount as i64
+    }
+    pub fn to_ui(&self, raw: u64) -> f64 {
+        raw as f64 / 10f64.powi(self.decimals as i32)
+    }
+}
 
 /// Call `getTransaction` for `signature` and extract per-account balance changes.
 /// Returns `None` if the RPC call fails or the transaction has no meta.

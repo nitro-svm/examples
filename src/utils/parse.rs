@@ -256,6 +256,96 @@ pub fn parse_titan_sim_result(result: &RpcSimulateTransactionResult) -> SwapData
     SwapData { in_amount, out_amount, quote_amount: None, venues }
 }
 
+/// Detect any non-circular Jupiter swap by scanning the signer's token balance
+/// changes. Returns `(in_mint, out_mint, SwapData)` or `None` if the tx is not
+/// a Jupiter swap or is a circular arb.
+pub fn parse_any_jupiter_swap(tx_with_meta: &TxWithMeta) -> Option<(String, String, SwapData)> {
+    let tx = &tx_with_meta.transaction;
+    let keys: Vec<String> = tx.message.static_account_keys().iter().map(|k| k.to_string()).collect();
+    keys.iter().position(|k| k == JUPITER_V6)?;
+
+    let signer = &keys[0];
+    let balances = tx_with_meta.balance_diffs.as_ref()?;
+    let (pre, post) = balances.token_balances_or_empty();
+
+    // Signer's pre amounts keyed by mint.
+    let signer_pre: HashMap<&str, u64> = pre
+        .iter()
+        .filter(|b| &b.owner == signer)
+        .filter_map(|b| b.ui_token_amount.amount.parse().ok().map(|a| (b.mint.as_str(), a)))
+        .collect();
+
+    // Largest token decrease → in_mint.
+    let token_in = pre
+        .iter()
+        .filter(|b| &b.owner == signer)
+        .filter_map(|b| {
+            let pre_amt: u64 = b.ui_token_amount.amount.parse().ok()?;
+            let post_amt: u64 = post
+                .iter()
+                .find(|p| p.account_index == b.account_index)
+                .and_then(|p| p.ui_token_amount.amount.parse().ok())
+                .unwrap_or(0);
+            pre_amt.checked_sub(post_amt).filter(|&d| d > 0).map(|d| (b.mint.clone(), d))
+        })
+        .max_by_key(|(_, d)| *d);
+
+    // Largest token increase → out_mint.
+    let token_out = post
+        .iter()
+        .filter(|b| &b.owner == signer)
+        .filter_map(|b| {
+            let post_amt: u64 = b.ui_token_amount.amount.parse().ok()?;
+            let pre_amt = signer_pre.get(b.mint.as_str()).copied().unwrap_or(0);
+            post_amt.checked_sub(pre_amt).filter(|&d| d > 0).map(|d| (b.mint.clone(), d))
+        })
+        .max_by_key(|(_, d)| *d);
+
+    // SOL as input: present when SyncNative wraps lamports.
+    let has_sync = has_sync_native(&keys, tx);
+    let sol_in = if has_sync {
+        balances.pre_balances.first()
+            .zip(balances.post_balances.first())
+            .and_then(|(&pre_b, &post_b)| pre_b.checked_sub(post_b + 5_000))
+            .unwrap_or(0)
+    } else { 0 };
+
+    // SOL as output: native balance increase (no SyncNative means SOL wasn't wrapped in).
+    let sol_out = if !has_sync {
+        balances.post_balances.first()
+            .zip(balances.pre_balances.first())
+            .and_then(|(&post_b, &pre_b)| post_b.checked_sub(pre_b))
+            .unwrap_or(0)
+    } else { 0 };
+
+    let (in_mint, in_amount) =
+        if has_sync && sol_in > 0 && token_in.as_ref().map_or(true, |(_, d)| sol_in >= *d) {
+            (WSOL_MINT.to_string(), sol_in)
+        } else {
+            token_in?
+        };
+
+    let (out_mint, out_amount) =
+        if sol_out > 0 && token_out.as_ref().map_or(true, |(_, d)| sol_out >= *d) {
+            (WSOL_MINT.to_string(), sol_out)
+        } else if let Some(t) = token_out {
+            t
+        } else if sol_out > 0 {
+            (WSOL_MINT.to_string(), sol_out)
+        } else {
+            return None;
+        };
+
+    if in_mint == out_mint || in_amount == 0 || out_amount == 0 {
+        return None;
+    }
+
+    let quote_amount = extract_jup_quoted_out(tx);
+    let venues = venue_amounts(pre, post, signer, &in_mint, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
+
+    Some((in_mint, out_mint, SwapData { in_amount, out_amount, quote_amount, venues }))
+}
+
 pub fn extract_signer(tx: &VersionedTransaction) -> Result<Pubkey> {
     let signer = tx
         .message
