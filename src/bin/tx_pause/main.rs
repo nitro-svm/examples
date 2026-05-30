@@ -17,7 +17,7 @@ use backtest_example::utils::parse::{
     get_titan_template_transaction, parse_jupiter_swap_result, parse_titan_sim_result,
     patch_titan_template_transaction,
 };
-use backtest_example::utils::types::TxWithMeta;
+use backtest_example::utils::{accounts::set_account_balance, types::TxWithMeta};
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write as _};
@@ -30,13 +30,13 @@ use simulator_api::{
 };
 use simulator_client::{BacktestClient, BacktestSession, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
-use solana_transaction::versioned::VersionedTransaction;
 use solana_pubkey::Pubkey;
-
+use solana_transaction::versioned::VersionedTransaction;
 
 const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
-const SOL_TO_USDC_TEMPLATE: &str = "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
+const SOL_TO_USDC_TEMPLATE: &str =
+    "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
 const USDC_TO_SOL_TEMPLATE: &str =
     "2RtLqCUeYBVhRppiJ2DFZoyVcwuJtPWprauRFfocynoiREYrGeJoqbpLM8bKsJkSoYpgr4oLnYEwCvrpDpiEZZV8";
 // "u6tf2YYLvDyG1HYfBUP9KqssUSZx3hebQMDJYh9Mug9CxDPKzTeNPgaoMZ92VPhwcCuByQqJeKqCTmo3fzgsohc";
@@ -90,103 +90,6 @@ struct Template {
     out_mint: &'static str,
 }
 
-fn make_token_account(signer: &Address, mint: &str, amount: u64) -> Result<AccountData> {
-    const RENT_EXEMPT: u64 = 2_039_280;
-    let mut data = [0u8; 165];
-    data[0..32].copy_from_slice(mint.parse::<solana_pubkey::Pubkey>()?.as_ref());
-    data[32..64].copy_from_slice(signer.as_ref());
-    data[64..72].copy_from_slice(&amount.to_le_bytes());
-    data[108] = 1; // state = initialized
-
-    Ok(AccountData {
-        data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
-        executable: false,
-        lamports: RENT_EXEMPT,
-        owner: TOKEN_PROGRAM.parse()?,
-        space: 165,
-    })
-}
-
-async fn set_native_modification(
-    session: &BacktestSession,
-    owner: &solana_pubkey::Pubkey,
-    new_balance: u64,
-) -> Result<u64> {
-    let owner_addr: Address = owner.to_string().parse()?;
-
-    let original_balance = session
-        .rpc()
-        .get_account(&owner_addr)
-        .await
-        .ok()
-        .map(|a| a.lamports)
-        .unwrap_or(0);
-
-    const ATA_RENT: u64 = 2_039_280;
-    const FEE: u64 = 1_000_000;
-    let modifications = AccountModifications(BTreeMap::from([(
-        owner_addr,
-        AccountData {
-            data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
-            executable: false,
-            // add on extra to cover potential ATA creation and gas or priority fees
-            lamports: new_balance.saturating_add(ATA_RENT).saturating_add(FEE),
-            owner: SYSTEM_PROGRAM.parse()?,
-            space: 0,
-        },
-    )]));
-    session
-        .modify_accounts(&modifications)
-        .await
-        .context("modify_accounts failed")?;
-
-    Ok(original_balance)
-}
-
-async fn set_ata_modification(
-    session: &BacktestSession,
-    owner: &solana_pubkey::Pubkey,
-    mint: &str,
-    new_balance: u64,
-) -> Result<u64> {
-    let ata = derive_ata(owner, mint).context("should derive ata")?;
-    let owner_addr: Address = owner.to_string().parse()?;
-
-    let original_balance = session
-        .rpc()
-        .get_account(&ata)
-        .await
-        .ok()
-        .filter(|a| a.data.len() >= 72)
-        .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap()))
-        .unwrap_or(0);
-
-    let modifications = AccountModifications(BTreeMap::from([(
-        ata.to_string().parse::<Address>()?,
-        make_token_account(&owner_addr, mint, new_balance)?,
-    )]));
-    session
-        .modify_accounts(&modifications)
-        .await
-        .context("modify_accounts failed")?;
-
-    Ok(original_balance)
-}
-
-async fn set_account_modifications(
-    session: &BacktestSession,
-    owner: &solana_pubkey::Pubkey,
-    mint: &str,
-    new_balance: u64,
-) -> Result<u64> {
-    if mint == WSOL_MINT {
-        // Don't pre-create the wSOL ATA: Titan's swap_route_v3 creates and closes it
-        set_native_modification(session, owner, new_balance).await
-    } else {
-        set_ata_modification(session, owner, mint, new_balance).await
-    }
-}
-
 fn write_output(filename: &str, records: &[SwapRecord]) -> Result<()> {
     let f = std::fs::File::create(filename)?;
     let mut w = BufWriter::new(f);
@@ -224,14 +127,26 @@ async fn get_template_transactions() -> Result<[Template; 2]> {
         let tx = get_titan_template_transaction(USDC_TO_SOL_TEMPLATE).await?;
         let signer = extract_signer(&tx)?;
         let ata = derive_ata(&signer, USDC_MINT).context("derive USDC ATA")?;
-        Template { transaction: tx, signer, in_ata: ata, in_mint: USDC_MINT, out_mint: WSOL_MINT }
+        Template {
+            transaction: tx,
+            signer,
+            in_ata: ata,
+            in_mint: USDC_MINT,
+            out_mint: WSOL_MINT,
+        }
     };
 
     let sol_to_usdc = {
         let tx = get_titan_template_transaction(SOL_TO_USDC_TEMPLATE).await?;
         let signer = extract_signer(&tx)?;
         let ata = derive_ata(&signer, WSOL_MINT).context("derive WSOL ATA")?;
-        Template { transaction: tx, signer, in_ata: ata, in_mint: WSOL_MINT, out_mint: USDC_MINT }
+        Template {
+            transaction: tx,
+            signer,
+            in_ata: ata,
+            in_mint: WSOL_MINT,
+            out_mint: USDC_MINT,
+        }
     };
 
     Ok([usdc_to_sol, sol_to_usdc])
@@ -319,9 +234,14 @@ async fn main() -> Result<()> {
                         jup_swap.out_amount, jup_swap.venues
                     );
 
-                    let original_balance =
-                        set_account_modifications(&session, &original_template.signer, original_template.in_mint, jup_swap.in_amount)
-                            .await?;
+                    let original_balance = set_account_balance(
+                        &session,
+                        &original_template.signer,
+                        original_template.in_mint,
+                        jup_swap.in_amount,
+                        true,
+                    )
+                    .await?;
 
                     let modified_template = patch_titan_template_transaction(
                         &original_template.transaction,
@@ -350,8 +270,14 @@ async fn main() -> Result<()> {
                         titan_swap.out_amount, titan_swap.venues, titan_err
                     );
 
-                    set_account_modifications(&session, &original_template.signer, original_template.in_mint, original_balance)
-                        .await?;
+                    set_account_balance(
+                        &session,
+                        &original_template.signer,
+                        original_template.in_mint,
+                        original_balance,
+                        true,
+                    )
+                    .await?;
 
                     records.push(SwapRecord {
                         slot,

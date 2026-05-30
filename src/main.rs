@@ -19,8 +19,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_client::{BacktestClient, Continue, CreateSession};
 
-use logs::subscribe_logs;
 use backtest_example::fetch::{SolAccount, TokenAccount};
+use logs::subscribe_logs;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -67,7 +67,6 @@ fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
     let path = endpoint.trim_start_matches('/');
     Ok(format!("{base}/{path}"))
 }
-
 
 /// All data captured for a single transaction.
 struct Transaction {
@@ -117,7 +116,10 @@ async fn main() -> Result<()> {
         .await?;
 
     eprintln!("[ws] session_id: {}", session.session_id().unwrap_or("?"));
-    let rpc_endpoint = session.rpc_endpoint().context("no rpc_endpoint")?.to_string();
+    let rpc_endpoint = session
+        .rpc_endpoint()
+        .context("no rpc_endpoint")?
+        .to_string();
     let rpc_url = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
     eprintln!("[ws] rpc_endpoint: {rpc_url}");
 
@@ -150,8 +152,12 @@ async fn main() -> Result<()> {
     // ── 4. Build program injection (if --program-so supplied) ─────────────────
     let modifications = match &cli.program_so {
         Some(path) => {
-            let id = cli.program_id.as_deref().context("--program-so requires --program-id")?;
-            let elf = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+            let id = cli
+                .program_id
+                .as_deref()
+                .context("--program-so requires --program-id")?;
+            let elf = std::fs::read(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
             eprintln!("[inject] {} bytes from {}", elf.len(), path.display());
             session.modify_program(id, &elf).await?
         }

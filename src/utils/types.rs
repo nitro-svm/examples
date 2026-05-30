@@ -24,7 +24,10 @@ pub struct BalanceDiffs {
 impl BalanceDiffs {
     pub fn token_balances_or_empty(
         &self,
-    ) -> (&[TransactionTokenBalanceSerde], &[TransactionTokenBalanceSerde]) {
+    ) -> (
+        &[TransactionTokenBalanceSerde],
+        &[TransactionTokenBalanceSerde],
+    ) {
         let empty: &[TransactionTokenBalanceSerde] = &[];
         (
             self.pre_token_balances.as_deref().unwrap_or(empty),

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use super::types::{TransactionTokenBalanceSerde, TxWithMeta};
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use super::types::{TransactionTokenBalanceSerde, TxWithMeta};
 use solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction};
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::RpcSimulateTransactionResult;
@@ -58,35 +58,97 @@ const JUP_V2_OFFSETS: &[([u8; 8], usize)] = &[
     ([0xd1, 0x98, 0x53, 0x93, 0x7c, 0xfe, 0xd8, 0xe9], 17), // shared_accounts_route_v2
     ([0x98, 0x0c, 0xa4, 0x79, 0x4a, 0x67, 0xad, 0xcd], 16), // route_with_token_ledger_v2
     ([0x79, 0xf7, 0xe0, 0x05, 0xd0, 0xea, 0x42, 0xfc], 17), // shared_accounts_route_with_token_ledger_v2
-    ([0x9d, 0x8a, 0xb8, 0x52, 0x15, 0xf4, 0xf3, 0x24],  8), // exact_out_route_v2
-    ([0x35, 0x60, 0xe5, 0xca, 0xd8, 0xbb, 0xfa, 0x18],  9), // shared_accounts_exact_out_route_v2
+    ([0x9d, 0x8a, 0xb8, 0x52, 0x15, 0xf4, 0xf3, 0x24], 8),  // exact_out_route_v2
+    ([0x35, 0x60, 0xe5, 0xca, 0xd8, 0xbb, 0xfa, 0x18], 9),  // shared_accounts_exact_out_route_v2
 ];
 
 pub fn extract_jup_quoted_out(tx: &VersionedTransaction) -> Option<u64> {
     let keys = tx.message.static_account_keys();
     let jup_idx = keys.iter().position(|k| k.to_string() == JUPITER_V6)? as u8;
-    for ix in tx.message.instructions().iter().filter(|ix| ix.program_id_index == jup_idx) {
+    for ix in tx
+        .message
+        .instructions()
+        .iter()
+        .filter(|ix| ix.program_id_index == jup_idx)
+    {
         let data = ix.data.as_slice();
-        let Ok(disc) = <[u8; 8]>::try_from(data.get(..8)?) else { continue };
+        let Ok(disc) = <[u8; 8]>::try_from(data.get(..8)?) else {
+            continue;
+        };
         // Filter out quoted_out <= 0: senders often set 1 to bypass slippage checks.
         let filter = |q: u64| if q > 0 { Some(q) } else { None };
         if let Some(&(_, off)) = JUP_V2_OFFSETS.iter().find(|(d, _)| d == &disc) {
-            return data.get(off..off + 8)?.try_into().ok().map(u64::from_le_bytes).and_then(filter);
+            return data
+                .get(off..off + 8)?
+                .try_into()
+                .ok()
+                .map(u64::from_le_bytes)
+                .and_then(filter);
         } else if JUP_V1_ROUTE_DISCRIMINANTS.contains(&disc) && data.len() >= 19 {
             let len = data.len();
-            return filter(u64::from_le_bytes(data[len - 11..len - 3].try_into().unwrap()));
+            return filter(u64::from_le_bytes(
+                data[len - 11..len - 3].try_into().unwrap(),
+            ));
         } else if JUP_V1_EXACT_OUT_DISCRIMINANTS.contains(&disc) && data.len() >= 27 {
             let len = data.len();
-            return filter(u64::from_le_bytes(data[len - 19..len - 11].try_into().unwrap()));
+            return filter(u64::from_le_bytes(
+                data[len - 19..len - 11].try_into().unwrap(),
+            ));
         }
     }
     None
 }
 
+/// Zero out the minimum-out (quoted_out) field in every Jupiter instruction so
+/// that slippage checks never fail during resimulation. Mirrors what
+/// `patch_titan_template_transaction` does for Titan's expected_amount_out.
+pub fn patch_jup_min_out(tx: &VersionedTransaction) -> VersionedTransaction {
+    let keys = tx.message.static_account_keys();
+    let Some(jup_idx) = keys
+        .iter()
+        .position(|k| k.to_string() == JUPITER_V6)
+        .map(|i| i as u8)
+    else {
+        return tx.clone();
+    };
+
+    let mut new_tx = tx.clone();
+    let ixs = match &mut new_tx.message {
+        VersionedMessage::Legacy(msg) => &mut msg.instructions,
+        VersionedMessage::V0(msg) => &mut msg.instructions,
+    };
+
+    for ix in ixs.iter_mut().filter(|ix| ix.program_id_index == jup_idx) {
+        let data = &mut ix.data;
+        let Ok(disc) = <[u8; 8]>::try_from(data.get(..8).unwrap_or(&[])) else {
+            continue;
+        };
+
+        if let Some(&(_, off)) = JUP_V2_OFFSETS.iter().find(|(d, _)| d == &disc) {
+            if data.len() >= off + 8 {
+                data[off..off + 8].copy_from_slice(&0u64.to_le_bytes());
+            }
+        } else if JUP_V1_ROUTE_DISCRIMINANTS.contains(&disc) && data.len() >= 19 {
+            let len = data.len();
+            data[len - 11..len - 3].copy_from_slice(&0u64.to_le_bytes());
+        } else if JUP_V1_EXACT_OUT_DISCRIMINANTS.contains(&disc) && data.len() >= 27 {
+            let len = data.len();
+            data[len - 19..len - 11].copy_from_slice(&0u64.to_le_bytes());
+        }
+    }
+    new_tx
+}
+
 fn has_sync_native(keys: &[String], tx: &VersionedTransaction) -> bool {
-    let tokenkeg_idx = keys.iter().position(|k| k == TOKEN_PROGRAM).map(|i| i as u8);
+    let tokenkeg_idx = keys
+        .iter()
+        .position(|k| k == TOKEN_PROGRAM)
+        .map(|i| i as u8);
     tokenkeg_idx.is_some_and(|idx| {
-        tx.message.instructions().iter().any(|ix| ix.program_id_index == idx && ix.data == [17])
+        tx.message
+            .instructions()
+            .iter()
+            .any(|ix| ix.program_id_index == idx && ix.data == [17])
     })
 }
 
@@ -111,15 +173,21 @@ pub fn parse_jupiter_swap_result(
 
     let signer = &keys[0];
     let balances = tx_with_meta.balance_diffs.as_ref();
-    let (pre, post) = balances.map(|b| b.token_balances_or_empty()).unwrap_or((&[], &[]));
+    let (pre, post) = balances
+        .map(|b| b.token_balances_or_empty())
+        .unwrap_or((&[], &[]));
 
     let in_amount = if in_mint == WSOL_MINT && has_sync_native(&keys, tx) {
         // pre[0]-post[0] = swap_amount + fee. Subtract the 5000-lamport base fee to
         // approximate the wrapped amount; priority fees are not accounted for here.
-        balances.and_then(|b| {
-            b.pre_balances.first().zip(b.post_balances.first())
-                .and_then(|(&pre_b, &post_b)| pre_b.checked_sub(post_b + 5_000))
-        }).unwrap_or(0)
+        balances
+            .and_then(|b| {
+                b.pre_balances
+                    .first()
+                    .zip(b.post_balances.first())
+                    .and_then(|(&pre_b, &post_b)| pre_b.checked_sub(post_b + 5_000))
+            })
+            .unwrap_or(0)
     } else {
         token_delta(pre, post, signer, in_mint, true).unwrap_or(0)
     };
@@ -133,7 +201,9 @@ pub fn parse_jupiter_swap_result(
         .or_else(|| {
             if out_mint == WSOL_MINT {
                 balances.and_then(|b| {
-                    b.post_balances.first().zip(b.pre_balances.first())
+                    b.post_balances
+                        .first()
+                        .zip(b.pre_balances.first())
                         .and_then(|(&post_b, &pre_b)| post_b.checked_sub(pre_b))
                 })
             } else {
@@ -145,9 +215,15 @@ pub fn parse_jupiter_swap_result(
         return None;
     }
 
-    let venues: Vec<(String, u64)> = venue_amounts(pre, post, signer, in_mint, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
+    let venues: Vec<(String, u64)> =
+        venue_amounts(pre, post, signer, in_mint, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
 
-    Some(SwapData { in_amount, out_amount, quote_amount, venues })
+    Some(SwapData {
+        in_amount,
+        out_amount,
+        quote_amount,
+        venues,
+    })
 }
 
 pub async fn get_titan_template_transaction(signature: &str) -> Result<VersionedTransaction> {
@@ -205,7 +281,10 @@ pub fn patch_titan_template_transaction(
         .context("titan ix not found")?;
     // v3 layout: [0]=disc(0x2a) [1]=config [2..10]=amount [10..18]=expected_amount_out [18..20]=slippage_threshold_bps
     anyhow::ensure!(titan_ix.data.len() >= 20, "titan ix data too short for v3");
-    anyhow::ensure!(titan_ix.data[0] == 0x2a, "unexpected titan ix discriminator (not swap_route_v3)");
+    anyhow::ensure!(
+        titan_ix.data[0] == 0x2a,
+        "unexpected titan ix discriminator (not swap_route_v3)"
+    );
     titan_ix.data[2..10].copy_from_slice(&in_amount.to_le_bytes());
     // zero expected_amount_out so simulation never fails on stale slippage
     titan_ix.data[10..18].copy_from_slice(&0u64.to_le_bytes());
@@ -253,7 +332,12 @@ pub fn parse_titan_sim_result(result: &RpcSimulateTransactionResult) -> SwapData
 
     let mut venues: Vec<(String, u64)> = venues.into_iter().collect();
     venues.sort_by_key(|(_, a)| std::cmp::Reverse(*a));
-    SwapData { in_amount, out_amount, quote_amount: None, venues }
+    SwapData {
+        in_amount,
+        out_amount,
+        quote_amount: None,
+        venues,
+    }
 }
 
 /// Detect any non-circular Jupiter swap by scanning the signer's token balance
@@ -261,7 +345,12 @@ pub fn parse_titan_sim_result(result: &RpcSimulateTransactionResult) -> SwapData
 /// a Jupiter swap or is a circular arb.
 pub fn parse_any_jupiter_swap(tx_with_meta: &TxWithMeta) -> Option<(String, String, SwapData)> {
     let tx = &tx_with_meta.transaction;
-    let keys: Vec<String> = tx.message.static_account_keys().iter().map(|k| k.to_string()).collect();
+    let keys: Vec<String> = tx
+        .message
+        .static_account_keys()
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
     keys.iter().position(|k| k == JUPITER_V6)?;
 
     let signer = &keys[0];
@@ -272,7 +361,13 @@ pub fn parse_any_jupiter_swap(tx_with_meta: &TxWithMeta) -> Option<(String, Stri
     let signer_pre: HashMap<&str, u64> = pre
         .iter()
         .filter(|b| &b.owner == signer)
-        .filter_map(|b| b.ui_token_amount.amount.parse().ok().map(|a| (b.mint.as_str(), a)))
+        .filter_map(|b| {
+            b.ui_token_amount
+                .amount
+                .parse()
+                .ok()
+                .map(|a| (b.mint.as_str(), a))
+        })
         .collect();
 
     // Largest token decrease → in_mint.
@@ -286,7 +381,10 @@ pub fn parse_any_jupiter_swap(tx_with_meta: &TxWithMeta) -> Option<(String, Stri
                 .find(|p| p.account_index == b.account_index)
                 .and_then(|p| p.ui_token_amount.amount.parse().ok())
                 .unwrap_or(0);
-            pre_amt.checked_sub(post_amt).filter(|&d| d > 0).map(|d| (b.mint.clone(), d))
+            pre_amt
+                .checked_sub(post_amt)
+                .filter(|&d| d > 0)
+                .map(|d| (b.mint.clone(), d))
         })
         .max_by_key(|(_, d)| *d);
 
@@ -297,36 +395,47 @@ pub fn parse_any_jupiter_swap(tx_with_meta: &TxWithMeta) -> Option<(String, Stri
         .filter_map(|b| {
             let post_amt: u64 = b.ui_token_amount.amount.parse().ok()?;
             let pre_amt = signer_pre.get(b.mint.as_str()).copied().unwrap_or(0);
-            post_amt.checked_sub(pre_amt).filter(|&d| d > 0).map(|d| (b.mint.clone(), d))
+            post_amt
+                .checked_sub(pre_amt)
+                .filter(|&d| d > 0)
+                .map(|d| (b.mint.clone(), d))
         })
         .max_by_key(|(_, d)| *d);
 
     // SOL as input: present when SyncNative wraps lamports.
     let has_sync = has_sync_native(&keys, tx);
     let sol_in = if has_sync {
-        balances.pre_balances.first()
+        balances
+            .pre_balances
+            .first()
             .zip(balances.post_balances.first())
             .and_then(|(&pre_b, &post_b)| pre_b.checked_sub(post_b + 5_000))
             .unwrap_or(0)
-    } else { 0 };
+    } else {
+        0
+    };
 
     // SOL as output: native balance increase (no SyncNative means SOL wasn't wrapped in).
     let sol_out = if !has_sync {
-        balances.post_balances.first()
+        balances
+            .post_balances
+            .first()
             .zip(balances.pre_balances.first())
             .and_then(|(&post_b, &pre_b)| post_b.checked_sub(pre_b))
             .unwrap_or(0)
-    } else { 0 };
+    } else {
+        0
+    };
 
     let (in_mint, in_amount) =
-        if has_sync && sol_in > 0 && token_in.as_ref().map_or(true, |(_, d)| sol_in >= *d) {
+        if has_sync && sol_in > 0 && token_in.as_ref().is_none_or(|(_, d)| sol_in >= *d) {
             (WSOL_MINT.to_string(), sol_in)
         } else {
             token_in?
         };
 
     let (out_mint, out_amount) =
-        if sol_out > 0 && token_out.as_ref().map_or(true, |(_, d)| sol_out >= *d) {
+        if sol_out > 0 && token_out.as_ref().is_none_or(|(_, d)| sol_out >= *d) {
             (WSOL_MINT.to_string(), sol_out)
         } else if let Some(t) = token_out {
             t
@@ -341,9 +450,24 @@ pub fn parse_any_jupiter_swap(tx_with_meta: &TxWithMeta) -> Option<(String, Stri
     }
 
     let quote_amount = extract_jup_quoted_out(tx);
-    let venues = venue_amounts(pre, post, signer, &in_mint, &[JUPITER_V6, JUP_FEE_AUTHORITY]);
+    let venues = venue_amounts(
+        pre,
+        post,
+        signer,
+        &in_mint,
+        &[JUPITER_V6, JUP_FEE_AUTHORITY],
+    );
 
-    Some((in_mint, out_mint, SwapData { in_amount, out_amount, quote_amount, venues }))
+    Some((
+        in_mint,
+        out_mint,
+        SwapData {
+            in_amount,
+            out_amount,
+            quote_amount,
+            venues,
+        },
+    ))
 }
 
 pub fn extract_signer(tx: &VersionedTransaction) -> Result<Pubkey> {
@@ -404,9 +528,7 @@ fn token_delta(
     mint: &str,
     consumed: bool,
 ) -> Option<u64> {
-    let pre_e = pre
-        .iter()
-        .find(|b| b.owner == signer && b.mint == mint)?;
+    let pre_e = pre.iter().find(|b| b.owner == signer && b.mint == mint)?;
     let post_e = post
         .iter()
         .find(|b| b.account_index == pre_e.account_index)?;
@@ -436,10 +558,7 @@ fn venue_amounts(
     let mut by_owner: HashMap<String, u64> = HashMap::new();
     for b in pre {
         let owner = b.owner.to_string();
-        if b.mint != input_mint
-            || owner == signer
-            || skip_owners.contains(&owner.as_str())
-        {
+        if b.mint != input_mint || owner == signer || skip_owners.contains(&owner.as_str()) {
             continue;
         }
         let pre_amt: u64 = match b.ui_token_amount.amount.parse() {

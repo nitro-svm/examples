@@ -6,11 +6,10 @@
 //!   each slot's frozen chain state and record the output token amount so you
 //!   can track slippage decay over time.
 
-use backtest_example::utils::parse::{
-    JUPITER_V6, WSOL_MINT,
-    derive_ata, extract_signer, parse_any_jupiter_swap,
-};
 use backtest_example::utils::accounts::set_account_balance;
+use backtest_example::utils::parse::{
+    JUPITER_V6, WSOL_MINT, derive_ata, extract_signer, parse_any_jupiter_swap, patch_jup_min_out,
+};
 use backtest_example::utils::types::TxWithMeta;
 
 use std::io::{BufWriter, Write as _};
@@ -20,15 +19,17 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use clap::Parser;
 use simulator_api::DiscoveryFilter;
-use simulator_client::{BacktestClient, BacktestSession, Continue, CreateSession, DiscoveryStepResult};
+use simulator_client::{
+    BacktestClient, BacktestSession, Continue, CreateSession, DiscoveryStepResult,
+};
 use solana_address::Address;
 use solana_client::rpc_config::{
     RpcSimulateTransactionAccountsConfig, RpcSimulateTransactionConfig,
 };
+use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::{UiAccountData, UiAccountEncoding};
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_status::UiTransactionEncoding;
-use solana_pubkey::Pubkey;
 
 const SLOT_ADVANCE: u64 = 50;
 const MAX_SWAPS: usize = 5;
@@ -41,7 +42,7 @@ struct Cli {
     #[arg(long, env = "SIMULATOR_API_KEY")]
     api_key: String,
     /// Starting slot: collect swaps here, then simulate over the next 50 slots.
-    #[arg(long, default_value_t = 417_811_170)]
+    #[arg(long, default_value_t = 422_818_048)]
     start_slot: u64,
     #[arg(long, default_value = "results.csv")]
     output: String,
@@ -126,17 +127,28 @@ async fn collect_swaps(cli: &Cli) -> Result<Vec<OriginalSwap>> {
                     if captured.len() >= MAX_SWAPS {
                         break;
                     }
-                    let Some((in_mint, out_mint, swap_data)) =
-                        parse_any_jupiter_swap(tx_with_meta) else { continue };
+                    let Some((in_mint, out_mint, swap_data)) = parse_any_jupiter_swap(tx_with_meta)
+                    else {
+                        continue;
+                    };
 
                     let tx = tx_with_meta.transaction.clone();
-                    let Ok(signer) = extract_signer(&tx) else { continue };
-                    let signature = tx.signatures.first().map(|s| s.to_string()).unwrap_or_default();
+                    let Ok(signer) = extract_signer(&tx) else {
+                        continue;
+                    };
+                    let signature = tx
+                        .signatures
+                        .first()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
 
                     eprintln!(
                         "  [collect] sig={} {}->{}  in={} out={}",
-                        &signature[..16], in_mint, out_mint,
-                        swap_data.in_amount, swap_data.out_amount
+                        &signature[..16],
+                        in_mint,
+                        out_mint,
+                        swap_data.in_amount,
+                        swap_data.out_amount
                     );
                     captured.push(OriginalSwap {
                         slot: event.paused.slot,
@@ -169,9 +181,15 @@ fn out_ata(swap: &OriginalSwap) -> Option<String> {
 }
 
 async fn out_balance(session: &BacktestSession, swap: &OriginalSwap) -> u64 {
-    let Some(addr_str) = out_ata(swap) else { return 0 };
-    let Ok(addr) = addr_str.parse::<Address>() else { return 0 };
-    let Ok(acct) = session.rpc().get_account(&addr).await else { return 0 };
+    let Some(addr_str) = out_ata(swap) else {
+        return 0;
+    };
+    let Ok(addr) = addr_str.parse::<Address>() else {
+        return 0;
+    };
+    let Ok(acct) = session.rpc().get_account(&addr).await else {
+        return 0;
+    };
     if swap.out_mint == WSOL_MINT {
         acct.lamports
     } else if acct.data.len() >= 72 {
@@ -185,7 +203,9 @@ fn parse_post_balance(
     result_accounts: &[Option<solana_rpc_client_api::response::UiAccount>],
     out_mint: &str,
 ) -> u64 {
-    let Some(Some(acct)) = result_accounts.first() else { return 0 };
+    let Some(Some(acct)) = result_accounts.first() else {
+        return 0;
+    };
     if out_mint == WSOL_MINT {
         acct.lamports
     } else {
@@ -193,7 +213,9 @@ fn parse_post_balance(
             UiAccountData::Binary(s, UiAccountEncoding::Base64) => s,
             _ => return 0,
         };
-        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else { return 0 };
+        let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(b64) else {
+            return 0;
+        };
         if bytes.len() >= 72 {
             u64::from_le_bytes(bytes[64..72].try_into().unwrap())
         } else {
@@ -202,19 +224,54 @@ fn parse_post_balance(
     }
 }
 
+fn contains_wsol_creation(swap: &OriginalSwap) -> bool {
+    let ata = derive_ata(&swap.signer, WSOL_MINT)
+        .map(|k| k.to_string())
+        .unwrap_or_default();
+
+    let keys = swap.transaction.message.static_account_keys();
+    const SYS: &str = "11111111111111111111111111111111";
+
+    keys.iter()
+        .position(|k| k.to_string() == SYS)
+        .is_some_and(|si| {
+            swap.transaction.message.instructions().iter().any(|ix| {
+                ix.program_id_index as usize == si
+                    && ix
+                        .accounts
+                        .get(1)
+                        .and_then(|&ai| keys.get(ai as usize))
+                        .is_some_and(|k| k.to_string() == ata)
+            })
+        })
+}
+
 async fn simulate_swap(session: &BacktestSession, swap: &OriginalSwap) -> Result<u64> {
     let pre = out_balance(session, swap).await;
-    let original_in =
-        set_account_balance(session, &swap.signer, &swap.in_mint, swap.in_amount).await?;
+
+    // For WSOL input, check whether the tx funds its own wSOL ATA via a
+    // System::Transfer to that address (e.g. wrap-and-swap pattern).
+    // If it does, we only need to set native SOL and let the tx handle the ATA.
+    // If it doesn't, the ATA must exist, so we need to create it for the sim.
+    let set_native = contains_wsol_creation(swap);
+
+    let original_in = set_account_balance(
+        session,
+        &swap.signer,
+        &swap.in_mint,
+        swap.in_amount,
+        set_native,
+    )
+    .await?;
 
     let out_addr = out_ata(swap).context("could not derive out address")?;
     // For WSOL output, also request the wSOL ATA: CloseAccount may not run in
     // resimulation, leaving the output in the ATA rather than native SOL.
     let mut addrs = vec![out_addr];
-    if swap.out_mint == WSOL_MINT {
-        if let Some(w) = derive_ata(&swap.signer, WSOL_MINT) {
-            addrs.push(w.to_string());
-        }
+    if swap.out_mint == WSOL_MINT
+        && let Some(w) = derive_ata(&swap.signer, WSOL_MINT)
+    {
+        addrs.push(w.to_string());
     }
     let config = RpcSimulateTransactionConfig {
         sig_verify: false,
@@ -227,9 +284,10 @@ async fn simulate_swap(session: &BacktestSession, swap: &OriginalSwap) -> Result
         ..Default::default()
     };
 
+    let patched = patch_jup_min_out(&swap.transaction);
     let result = session
         .rpc()
-        .simulate_transaction_with_config(&swap.transaction, config)
+        .simulate_transaction_with_config(&patched, config)
         .await
         .context("simulate_transaction_with_config failed")?;
 
@@ -242,11 +300,11 @@ async fn simulate_swap(session: &BacktestSession, swap: &OriginalSwap) -> Result
     let sim_out = if let Some(accts) = accts {
         if swap.out_mint == WSOL_MINT {
             // accounts[0] = signer (native SOL), accounts[1] = wSOL ATA.
-            // Try native SOL gain first (CloseAccount ran). If that's 0, the
-            // output is still in the wSOL ATA; subtract rent-exempt to get the
-            // wrapped SOL amount.
+            // - Try native SOL first (CloseAccount ran)
+            // - If it's 0, try wSOL ATA (CloseAccount failed)
             const RENT_EXEMPT: u64 = 2_039_280;
-            let signer_post = accts.first()
+            let signer_post = accts
+                .first()
                 .and_then(|o| o.as_ref())
                 .map(|a| a.lamports)
                 .unwrap_or(0);
@@ -254,7 +312,8 @@ async fn simulate_swap(session: &BacktestSession, swap: &OriginalSwap) -> Result
             if native_gain > 0 {
                 native_gain
             } else {
-                accts.get(1)
+                accts
+                    .get(1)
                     .and_then(|o| o.as_ref())
                     .map(|a| a.lamports.saturating_sub(RENT_EXEMPT))
                     .unwrap_or(0)
@@ -266,12 +325,23 @@ async fn simulate_swap(session: &BacktestSession, swap: &OriginalSwap) -> Result
         0
     };
 
-    set_account_balance(session, &swap.signer, &swap.in_mint, original_in).await?;
+    set_account_balance(
+        session,
+        &swap.signer,
+        &swap.in_mint,
+        original_in,
+        set_native,
+    )
+    .await?;
 
     Ok(sim_out)
 }
 
-async fn run_simulations(mut session: BacktestSession, swaps: &[OriginalSwap], start_slot: u64) -> Result<Vec<SimulatedSwap>> {
+async fn run_simulations(
+    mut session: BacktestSession,
+    swaps: &[OriginalSwap],
+    start_slot: u64,
+) -> Result<Vec<SimulatedSwap>> {
     let timeout = Some(Duration::from_secs(120));
     let mut records: Vec<SimulatedSwap> = Vec::new();
 
@@ -283,7 +353,9 @@ async fn run_simulations(mut session: BacktestSession, swaps: &[OriginalSwap], s
             let sim_out = simulate_swap(&session, swap).await?;
             eprintln!(
                 "  sig={} orig={} sim={}",
-                &swap.signature[..16], swap.out_amount, sim_out
+                &swap.signature[..16],
+                swap.out_amount,
+                sim_out
             );
             records.push(SimulatedSwap {
                 signature: swap.signature.clone(),
@@ -299,7 +371,11 @@ async fn run_simulations(mut session: BacktestSession, swaps: &[OriginalSwap], s
 
         if offset < SLOT_ADVANCE {
             let result = session
-                .advance(Continue::builder().advance_count(1).build(), timeout, |_| {})
+                .advance(
+                    Continue::builder().advance_count(1).build(),
+                    timeout,
+                    |_| {},
+                )
                 .await?;
             if result.completed {
                 eprintln!("[simulate] session completed early at slot {slot}");
@@ -317,13 +393,22 @@ async fn run_simulations(mut session: BacktestSession, swaps: &[OriginalSwap], s
 fn write_output(path: &str, records: &[SimulatedSwap]) -> Result<()> {
     let f = std::fs::File::create(path)?;
     let mut w = BufWriter::new(f);
-    writeln!(w, "transaction,in_mint,out_mint,in_amount,original_slot,original_out,simulated_slot,simulated_out")?;
+    writeln!(
+        w,
+        "transaction,in_mint,out_mint,in_amount,original_slot,original_out,simulated_slot,simulated_out"
+    )?;
     for r in records {
         writeln!(
             w,
             "{},{},{},{},{},{},{},{}",
-            r.signature, r.in_mint, r.out_mint, r.in_amount,
-            r.original_slot, r.original_out, r.sim_slot, r.sim_out
+            r.signature,
+            r.in_mint,
+            r.out_mint,
+            r.in_amount,
+            r.original_slot,
+            r.original_out,
+            r.sim_slot,
+            r.sim_out
         )?;
     }
     Ok(())
@@ -333,42 +418,49 @@ fn write_output(path: &str, records: &[SimulatedSwap]) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     let cli = Cli::parse();
 
     // Create both sessions concurrently so Phase 2 is ready the moment Phase 1 finishes.
-    eprintln!("[phase1] collecting up to {MAX_SWAPS} swaps from slot {}", cli.start_slot);
-    let (captured, sim_session) = tokio::try_join!(
-        collect_swaps(&cli),
-        async {
-            let program_addr: Address = cli.program_id.parse().context("invalid --program-id")?;
-            let _ = program_addr; // suppress unused warning — no filter on Phase 2 session
-            let mut s = build_client(&cli)
-                .create_session(
-                    CreateSession::builder()
-                        .start_slot(cli.start_slot)
-                        .end_slot(cli.start_slot + SLOT_ADVANCE)
-                        .disconnect_timeout_secs(900u16)
-                        .capacity_wait_timeout_secs(900u16)
-                        .build(),
-                )
-                .await?;
-            eprintln!("[simulate] session: {}", s.session_id().unwrap_or("?"));
-            s.ensure_ready(Some(Duration::from_secs(600))).await?;
-            Ok::<_, anyhow::Error>(s)
-        },
-    )?;
+    eprintln!(
+        "[phase1] collecting up to {MAX_SWAPS} swaps from slot {}",
+        cli.start_slot
+    );
+    let (captured, sim_session) = tokio::try_join!(collect_swaps(&cli), async {
+        let program_addr: Address = cli.program_id.parse().context("invalid --program-id")?;
+        let _ = program_addr; // suppress unused warning — no filter on Phase 2 session
+        let mut s = build_client(&cli)
+            .create_session(
+                CreateSession::builder()
+                    .start_slot(cli.start_slot)
+                    .end_slot(cli.start_slot + SLOT_ADVANCE)
+                    .disconnect_timeout_secs(900u16)
+                    .capacity_wait_timeout_secs(900u16)
+                    .build(),
+            )
+            .await?;
+        eprintln!("[simulate] session: {}", s.session_id().unwrap_or("?"));
+        s.ensure_ready(Some(Duration::from_secs(600))).await?;
+        Ok::<_, anyhow::Error>(s)
+    },)?;
     eprintln!("[phase1] collected {} swaps", captured.len());
 
     if captured.is_empty() {
-        eprintln!("[warn] no Jupiter swaps found in slot {} — exiting", cli.start_slot);
+        eprintln!(
+            "[warn] no Jupiter swaps found in slot {} — exiting",
+            cli.start_slot
+        );
         let _ = sim_session; // dropped, closes on its own timeout
         return Ok(());
     }
 
     eprintln!(
         "[phase2] simulating {} swaps over slots {}..={}",
-        captured.len(), cli.start_slot, cli.start_slot + SLOT_ADVANCE
+        captured.len(),
+        cli.start_slot,
+        cli.start_slot + SLOT_ADVANCE
     );
     let records = run_simulations(sim_session, &captured, cli.start_slot).await?;
 
