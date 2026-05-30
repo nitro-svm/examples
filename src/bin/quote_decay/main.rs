@@ -1,10 +1,10 @@
 //! Track Jupiter swap output decay across slots.
 //!
-//! Phase 1 (start_slot): discover the first 10 Jupiter swaps and capture their
+//! Phase 1 (start_slot): discover the first x Jupiter swaps and capture their
 //!   transactions, signers, and on-chain amounts.
 //! Phase 2 (start_slot..=start_slot+50): simulate each captured swap against
-//!   each slot's frozen chain state and record the output token amount so you
-//!   can track slippage decay over time.
+//!   each slot's frozen chain state and record the output token amount to
+//!   track slippage decay over time.
 
 use backtest_example::utils::accounts::set_account_balance;
 use backtest_example::utils::parse::{
