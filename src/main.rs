@@ -16,6 +16,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use solana_pubkey::Pubkey;
+use std::str::FromStr;
 use clap::Parser;
 use simulator_client::{BacktestClient, Continue, CreateSession};
 
@@ -165,19 +167,19 @@ async fn main() -> Result<()> {
     println!("latest blockhash: {blockhash}");
 
     // ── 3. Subscribe to program logs (if --program-id supplied) ─────────
-    let stats = Arc::new(Mutex::new(Stats::default()));
-    let log_task = if let Some(program_id) = &cli.program_id {
-        let (handle, stop_tx) = subscribe_logs(
-            &rpc_url,
-            program_id,
-            cli.log_file.clone(),
-            Arc::clone(&stats),
-        )
-        .await?;
-        Some((handle, stop_tx))
-    } else {
-        None
-    };
+    // let stats = Arc::new(Mutex::new(Stats::default()));
+    // let log_task = if let Some(program_id) = &cli.program_id {
+    //     let (handle, stop_tx) = subscribe_logs(
+    //         &rpc_url,
+    //         program_id,
+    //         cli.log_file.clone(),
+    //         Arc::clone(&stats),
+    //     )
+    //     .await?;
+    //     Some((handle, stop_tx))
+    // } else {
+    //     None
+    // };
 
     // ── 4. Build program injection (if --program-so supplied) ─────────────────
     let modifications = match &cli.program_so {
@@ -190,77 +192,83 @@ async fn main() -> Result<()> {
         None => BTreeMap::new(),
     };
 
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
     // ── 5. Advance through all blocks ─────────────────────────────────────────
-    eprintln!("advancing slots {}..={}", cli.start_slot, cli.end_slot);
-    session
-        .advance(
-            Continue::builder()
-                .advance_count(cli.end_slot - cli.start_slot + 1)
-                .modify_accounts(modifications)
-                .build(),
-            None,
-            |_| {},
-        )
-        .await?;
-    eprintln!("all blocks processed");
+    let addr = Pubkey::from_str("Sett1erwx2eqT5A8uvu8GBxDFT2W5TNnhirL7hLmb8m").unwrap();
+    let acc = session.rpc().get_account(&addr).await;
+    println!("{acc:?}");
+
+    // eprintln!("advancing slots {}..={}", cli.start_slot, cli.end_slot);
+    // session
+    //     .advance(
+    //         Continue::builder()
+    //             .advance_count(cli.end_slot - cli.start_slot + 1)
+    //             .modify_accounts(modifications)
+    //             .build(),
+    //         None,
+    //         |_| {},
+    //     )
+    //     .await?;
+    // eprintln!("all blocks processed");
 
     // ── 6. Tear down ──────────────────────────────────────────────────────────
     // Signal the log task to drain remaining buffered notifications and exit.
     // Wait for it to finish (all getTransaction calls complete) BEFORE
     // closing the session, since closing destroys all RPC state.
-    if let Some((handle, stop_tx)) = log_task {
-        stop_tx.send(true).ok();
-        eprintln!("[sub] waiting for log task to drain...");
+    // if let Some((handle, stop_tx)) = log_task {
+    //     stop_tx.send(true).ok();
+    //     eprintln!("[sub] waiting for log task to drain...");
 
-        // Keep the control WS alive while waiting by draining any incoming
-        // messages. next_event times out after 30s, keeping the loop active.
-        let mut handle = handle;
-        loop {
-            tokio::select! {
-                _ = &mut handle => break,
-                _ = session.next_event(Some(Duration::from_secs(30))) => {}
-            }
-        }
-    }
+    //     // Keep the control WS alive while waiting by draining any incoming
+    //     // messages. next_event times out after 30s, keeping the loop active.
+    //     let mut handle = handle;
+    //     loop {
+    //         tokio::select! {
+    //             _ = &mut handle => break,
+    //             _ = session.next_event(Some(Duration::from_secs(30))) => {}
+    //         }
+    //     }
+    // }
     session.close(Some(Duration::from_secs(10))).await?;
 
     // ── 7. Summary ────────────────────────────────────────────────────────────
-    let s = stats.lock().unwrap();
-    println!("\n=== Summary ===");
-    println!("total:     {}", s.total);
-    println!("successes: {}", s.successes);
-    println!("failures:  {}", s.failures);
-    println!("log file:  {}", cli.log_file.display());
+    // let s = stats.lock().unwrap();
+    // println!("\n=== Summary ===");
+    // println!("total:     {}", s.total);
+    // println!("successes: {}", s.successes);
+    // println!("failures:  {}", s.failures);
+    // println!("log file:  {}", cli.log_file.display());
 
-    if !s.sol_net.is_empty() {
-        println!("\n=== SOL P&L (all accounts, sorted by absolute change) ===");
-        let mut sorted: Vec<_> = s.sol_net.iter().collect();
-        sorted.sort_by_key(|(_, d)| -d.abs());
-        for (pubkey, delta) in &sorted {
-            println!(
-                "  {}  {:+.9} SOL  ({:+} lamports)",
-                pubkey,
-                **delta as f64 / 1e9,
-                delta,
-            );
-        }
-    }
+    // if !s.sol_net.is_empty() {
+    //     println!("\n=== SOL P&L (all accounts, sorted by absolute change) ===");
+    //     let mut sorted: Vec<_> = s.sol_net.iter().collect();
+    //     sorted.sort_by_key(|(_, d)| -d.abs());
+    //     for (pubkey, delta) in &sorted {
+    //         println!(
+    //             "  {}  {:+.9} SOL  ({:+} lamports)",
+    //             pubkey,
+    //             **delta as f64 / 1e9,
+    //             delta,
+    //         );
+    //     }
+    // }
 
-    if !s.token_net.is_empty() {
-        println!("\n=== Token P&L (all ATAs, sorted by absolute change) ===");
-        let mut sorted: Vec<_> = s.token_net.iter().collect();
-        sorted.sort_by_key(|(_, (d, _))| -d.abs());
-        for ((pubkey, mint), (delta, decimals)) in &sorted {
-            println!(
-                "  {}  {}  {:+.prec$}  ({:+} raw)",
-                pubkey,
-                mint,
-                *delta as f64 / 10f64.powi(*decimals as i32),
-                delta,
-                prec = *decimals as usize,
-            );
-        }
-    }
+    // if !s.token_net.is_empty() {
+    //     println!("\n=== Token P&L (all ATAs, sorted by absolute change) ===");
+    //     let mut sorted: Vec<_> = s.token_net.iter().collect();
+    //     sorted.sort_by_key(|(_, (d, _))| -d.abs());
+    //     for ((pubkey, mint), (delta, decimals)) in &sorted {
+    //         println!(
+    //             "  {}  {}  {:+.prec$}  ({:+} raw)",
+    //             pubkey,
+    //             mint,
+    //             *delta as f64 / 10f64.powi(*decimals as i32),
+    //             delta,
+    //             prec = *decimals as usize,
+    //         );
+    //     }
+    // }
 
     Ok(())
 }
