@@ -15,7 +15,7 @@ use solana_commitment_config::CommitmentConfig;
 use tokio::{sync::watch, task::JoinHandle};
 
 use super::{Stats, Transaction};
-use crate::utils::fetch_balance_changes;
+use backtest_example::fetch::fetch_balance_changes;
 
 // ── Log subscription ───────────────────────────────────────────────────────────
 
@@ -49,7 +49,10 @@ pub async fn subscribe_logs(
     let counter_cb = counter.clone();
     let program_cb = program.to_string();
 
-    let LogSubscriptionHandle { join_handle: sub_handle, stop } = subscribe_program_logs(
+    let LogSubscriptionHandle {
+        join_handle: sub_handle,
+        stop,
+    } = subscribe_program_logs(
         rpc_url,
         program,
         CommitmentConfig::confirmed(),
@@ -71,8 +74,9 @@ pub async fn subscribe_logs(
                     if success { "ok" } else { "FAIL" }
                 );
 
-                let (sol_changes, token_changes) =
-                    fetch_balance_changes(&rpc, &signature).await.unwrap_or_default();
+                let (sol_changes, token_changes) = fetch_balance_changes(&rpc, &signature)
+                    .await
+                    .unwrap_or_default();
 
                 let tx = Transaction {
                     slot,
@@ -101,7 +105,10 @@ pub async fn subscribe_logs(
         let mut records = records.lock().unwrap().drain(..).collect::<Vec<_>>();
         records.sort_by_key(|(idx, _)| *idx);
 
-        eprintln!("[sub] waiting for {} getTransaction tasks...", records.len());
+        eprintln!(
+            "[sub] waiting for {} getTransaction tasks...",
+            records.len()
+        );
 
         match File::create(&log_file) {
             Ok(file) => {
@@ -146,7 +153,11 @@ pub async fn subscribe_logs(
 
 fn write_tx_record(writer: &mut impl Write, tx: &Transaction) {
     let status = if tx.success { "OK" } else { "FAIL" };
-    let _ = writeln!(writer, "slot={} sig={} status={}", tx.slot, tx.signature, status);
+    let _ = writeln!(
+        writer,
+        "slot={} sig={} status={}",
+        tx.slot, tx.signature, status
+    );
     if let Some(e) = &tx.err {
         let _ = writeln!(writer, "  err={e}");
     }

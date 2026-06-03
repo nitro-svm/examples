@@ -19,6 +19,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_client::{BacktestClient, Continue, CreateSession};
 
+use backtest_example::fetch::{SolAccount, TokenAccount};
 use logs::subscribe_logs;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
@@ -65,40 +66,6 @@ fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
     }
     let path = endpoint.trim_start_matches('/');
     Ok(format!("{base}/{path}"))
-}
-
-// ── Balance change types ───────────────────────────────────────────────────────
-
-/// SOL balance change for a single account within a transaction.
-struct SolAccount {
-    pubkey: String,
-    pre_lamports: u64,
-    post_lamports: u64,
-}
-
-impl SolAccount {
-    fn delta(&self) -> i64 {
-        self.post_lamports as i64 - self.pre_lamports as i64
-    }
-}
-
-/// SPL token balance change for a single ATA within a transaction.
-struct TokenAccount {
-    pubkey: String,
-    mint: String,
-    owner: String,
-    pre_amount: u64,
-    post_amount: u64,
-    decimals: u8,
-}
-
-impl TokenAccount {
-    fn delta(&self) -> i64 {
-        self.post_amount as i64 - self.pre_amount as i64
-    }
-    fn to_ui(&self, raw: u64) -> f64 {
-        raw as f64 / 10f64.powi(self.decimals as i32)
-    }
 }
 
 /// All data captured for a single transaction.
@@ -149,7 +116,10 @@ async fn main() -> Result<()> {
         .await?;
 
     eprintln!("[ws] session_id: {}", session.session_id().unwrap_or("?"));
-    let rpc_endpoint = session.rpc_endpoint().context("no rpc_endpoint")?.to_string();
+    let rpc_endpoint = session
+        .rpc_endpoint()
+        .context("no rpc_endpoint")?
+        .to_string();
     let rpc_url = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
     eprintln!("[ws] rpc_endpoint: {rpc_url}");
 
@@ -182,8 +152,12 @@ async fn main() -> Result<()> {
     // ── 4. Build program injection (if --program-so supplied) ─────────────────
     let modifications = match &cli.program_so {
         Some(path) => {
-            let id = cli.program_id.as_deref().context("--program-so requires --program-id")?;
-            let elf = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+            let id = cli
+                .program_id
+                .as_deref()
+                .context("--program-so requires --program-id")?;
+            let elf = std::fs::read(path)
+                .with_context(|| format!("failed to read {}", path.display()))?;
             eprintln!("[inject] {} bytes from {}", elf.len(), path.display());
             session.modify_program(id, &elf).await?
         }
