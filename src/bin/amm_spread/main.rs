@@ -25,19 +25,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_api::DiscoveryFilter;
-use simulator_client::{BacktestClient, BacktestSession, CreateSession, DiscoveryStepResult};
+use simulator_client::{BacktestClient, BacktestSession, Continue, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
 const PROGRAM_ID: &str = "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi";
 
-const SOL_TO_USDC_TEMPLATE: &str =
-    "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
-const USDC_TO_SOL_TEMPLATE: &str =
-    "2RtLqCUeYBVhRppiJ2DFZoyVcwuJtPWprauRFfocynoiREYrGeJoqbpLM8bKsJkSoYpgr4oLnYEwCvrpDpiEZZV8";
-// "u6tf2YYLvDyG1HYfBUP9KqssUSZx3hebQMDJYh9Mug9CxDPKzTeNPgaoMZ92VPhwcCuByQqJeKqCTmo3fzgsohc";
-
+mod titan_template_v3 {
+    pub const SOL_TO_USDC: &str =
+        "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
+    pub const USDC_TO_SOL: &str =
+        "2RtLqCUeYBVhRppiJ2DFZoyVcwuJtPWprauRFfocynoiREYrGeJoqbpLM8bKsJkSoYpgr4oLnYEwCvrpDpiEZZV8";
+}
 
 #[derive(Parser)]
 #[command(about = "Pause before each discovered batch and inspect frozen chain state")]
@@ -51,11 +51,11 @@ struct Cli {
     api_key: String,
 
     /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 417_811_170)]
+    #[arg(long, default_value_t = 422_818_048)]
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 417_811_175)]
+    #[arg(long, default_value_t = 422_818_148)]
     end_slot: u64,
 
     /// CSV output file path.
@@ -113,8 +113,8 @@ fn write_output(filename: &str, records: &[SpreadResult]) -> Result<()> {
 }
 
 async fn get_template() -> Result<Template> {
-    let usdc_to_sol = get_titan_template_transaction(USDC_TO_SOL_TEMPLATE).await?;
-    let sol_to_usdc = get_titan_template_transaction(SOL_TO_USDC_TEMPLATE).await?;
+    let usdc_to_sol = get_titan_template_transaction(titan_template_v3::USDC_TO_SOL).await?;
+    let sol_to_usdc = get_titan_template_transaction(titan_template_v3::SOL_TO_USDC).await?;
     let quote_signer = extract_signer(&usdc_to_sol)?;
     let base_signer = extract_signer(&sol_to_usdc)?;
     let quote_ata = derive_ata(&quote_signer, USDC_MINT).context("derive quote ATA")?;
@@ -222,21 +222,15 @@ async fn simulate_roundtrip_swap(
     Ok(final_out)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .ok();
-
-    let cli = Cli::parse();
-    let program_addr: Address = cli.program_id.parse().context("invalid --program-id")?;
-
-    let client = BacktestClient::builder()
-        .url(format!("wss://{}/backtest", &cli.url))
-        .api_key(cli.api_key)
-        .build();
-
-    eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
+async fn run_discovery_session(
+    client: BacktestClient, 
+    program_addr: Address, 
+    cli: Cli,
+    template: &Template,
+) -> Result<Vec<SpreadResult>> {
+    let mut pause_count = 0u64;
+    let timeout = Some(Duration::from_secs(120));
+    let mut records: Vec<SpreadResult> = Vec::new();
 
     let mut session = client
         .create_session(
@@ -253,11 +247,6 @@ async fn main() -> Result<()> {
     eprintln!("[ws] session: {}", session.session_id().unwrap_or("?"));
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
     eprintln!("[ws] ready — scanning for {} batches", cli.program_id);
-
-    let timeout = Some(Duration::from_secs(120));
-    let mut pause_count = 0u64;
-    let mut records: Vec<SpreadResult> = Vec::new();
-    let template = get_template().await?;
 
     loop {
         match session.advance_to_discovery(timeout).await? {
@@ -278,9 +267,9 @@ async fn main() -> Result<()> {
                     })
                     .collect();
 
-                if !txs.iter().any(|tx| is_program_upgrade(&tx.transaction, &cli.program_id)) {
-                    continue;
-                }
+                // if !txs.iter().any(|tx| is_program_upgrade(&tx.transaction, &cli.program_id)) {
+                //     continue;
+                // }
 
                 let out_amount = simulate_roundtrip_swap(&session, cli.size, &template).await?;
 
@@ -305,9 +294,81 @@ async fn main() -> Result<()> {
         }
     }
 
-    write_output(&cli.output, &records)?;
-    eprintln!("[done] wrote {} rows to {}", records.len(), cli.output);
+    let _ = session.close(Some(Duration::from_secs(10))).await;
+
+    Ok(records)
+}
+
+async fn run_regular_session(client: BacktestClient, cli: Cli, template: &Template) -> Result<Vec<SpreadResult>> {
+    let mut records: Vec<SpreadResult> = Vec::new();
+    let timeout = Some(Duration::from_secs(120));
+
+    let mut session = client
+        .create_session(
+            CreateSession::builder()
+                .start_slot(cli.start_slot)
+                .end_slot(cli.end_slot)
+                .disconnect_timeout_secs(900u16)
+                .capacity_wait_timeout_secs(900u16)
+                .build(),
+        )
+        .await?;
+
+    session.ensure_ready(Some(Duration::from_secs(600))).await?;
+
+    loop {
+        let result = session
+            .advance(Continue::builder().advance_count(1).build(), timeout, |_| {})
+            .await?;
+
+        let slot = result.last_slot.unwrap_or(0);
+        let out_amount = simulate_roundtrip_swap(&session, cli.size, template).await?;
+
+        if out_amount > 0 {
+            records.push(SpreadResult {
+                slot,
+                quote_mint: template.quote_mint.to_string(),
+                base_mint: template.base_mint.to_string(),
+                input_amount: cli.size,
+                output_amount: out_amount,
+                spread_bps: (cli.size - out_amount) as f64 / cli.size as f64 * 10_000.0,
+            });
+        }
+
+        if result.completed {
+            break;
+        }
+    }
 
     let _ = session.close(Some(Duration::from_secs(10))).await;
+    Ok(records)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
+    let template = get_template().await?;
+    let cli = Cli::parse();
+    let client = BacktestClient::builder()
+        .url(format!("wss://{}/backtest", &cli.url))
+        .api_key(cli.api_key.clone())
+        .build();
+
+    eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
+
+    let output = cli.output.clone();
+    let program_addr = cli.program_id.parse::<Address>().ok();
+    let records = if let Some(program_addr) = program_addr {
+        run_discovery_session(client, program_addr, cli, &template).await?
+    } else {
+        run_regular_session(client, cli, &template).await?
+    };
+
+    write_output(&output, &records)?;
+    eprintln!("[done] wrote {} rows to {}", records.len(), output);
+    
     Ok(())
 }
