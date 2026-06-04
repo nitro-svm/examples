@@ -13,7 +13,7 @@
 //! After your inspection, the session jumps directly to the next matching batch.
 
 use backtest_example::utils::parse::{
-    USDC_MINT, WSOL_MINT, extract_signer,
+    USDC_MINT, WSOL_MINT, derive_ata, extract_signer,
     get_titan_template_transaction, parse_titan_sim_result,
     patch_titan_template_transaction,
 };
@@ -74,7 +74,7 @@ struct Cli {
 
     /// Size should be 0.1-15 of pool depth. 
     /// (Too big would measure price impact instead of spread)
-    #[arg(long, default_value_t = 5_000)]
+    #[arg(long, default_value_t = 5_000_000_000)]
     size: u64,
 }
 
@@ -84,7 +84,7 @@ struct SpreadResult {
     base_mint: String,
     input_amount: u64,
     output_amount: u64,
-    spread_bps: u64,
+    spread_bps: f64,
 }
 
 struct Template {
@@ -94,6 +94,8 @@ struct Template {
     base_mint: Address,
     quote_signer: Pubkey,
     base_signer: Pubkey,
+    quote_ata: Pubkey,
+    base_ata: Pubkey,
 }
 
 fn write_output(filename: &str, records: &[SpreadResult]) -> Result<()> {
@@ -115,6 +117,8 @@ async fn get_template() -> Result<Template> {
     let sol_to_usdc = get_titan_template_transaction(SOL_TO_USDC_TEMPLATE).await?;
     let quote_signer = extract_signer(&usdc_to_sol)?;
     let base_signer = extract_signer(&sol_to_usdc)?;
+    let quote_ata = derive_ata(&quote_signer, USDC_MINT).context("derive quote ATA")?;
+    let base_ata = derive_ata(&base_signer, WSOL_MINT).context("derive base ATA")?;
 
     Ok(Template {
         quote_to_base: usdc_to_sol,
@@ -123,7 +127,35 @@ async fn get_template() -> Result<Template> {
         base_mint: Address::from_str_const(WSOL_MINT),
         quote_signer,
         base_signer,
+        quote_ata,
+        base_ata,
     })
+}
+
+const BPF_UPGRADEABLE_LOADER: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
+
+fn is_program_upgrade(tx: &VersionedTransaction, program_id: &str) -> bool {
+    let keys = tx.message.static_account_keys();
+    let key_str: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+    let Some(loader_idx) = key_str.iter().position(|k| k == BPF_UPGRADEABLE_LOADER) else {
+        return false;
+    };
+    for ix in tx.message.instructions() {
+        if ix.program_id_index as usize != loader_idx {
+            continue;
+        }
+        // Upgrade discriminant = 3u32 LE
+        if ix.data.get(..4) != Some(&[3, 0, 0, 0]) {
+            continue;
+        }
+        // Account slot 1 in the Upgrade instruction is the program account
+        if let Some(&prog_idx) = ix.accounts.get(1) {
+            if key_str.get(prog_idx as usize).map(|s| s.as_str()) == Some(program_id) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 async fn simulate_single_swap(session: &BacktestSession, tx: &VersionedTransaction) -> Result<u64> {
@@ -163,10 +195,10 @@ async fn simulate_roundtrip_swap(
         &template.quote_signer,
         &quote_mint,
         size,
-        false,
+        true,
     )
     .await?;
-    let quote_to_base = patch_titan_template_transaction(&template.quote_to_base, template.quote_mint, size)?;
+    let quote_to_base = patch_titan_template_transaction(&template.quote_to_base, template.quote_ata, size)?;
     let intermediate_out = simulate_single_swap(session, &quote_to_base).await?;
 
     let original_base = set_account_balance(
@@ -177,7 +209,7 @@ async fn simulate_roundtrip_swap(
         true,
     )
     .await?;
-    let base_to_quote = patch_titan_template_transaction(&template.base_to_quote, template.base_mint, intermediate_out)?;
+    let base_to_quote = patch_titan_template_transaction(&template.base_to_quote, template.base_ata, intermediate_out)?;
     let final_out = simulate_single_swap(session, &base_to_quote).await?;
 
     let (r1, r2) = tokio::join!(
@@ -246,18 +278,24 @@ async fn main() -> Result<()> {
                     })
                     .collect();
 
-                for _ in &txs {
-                    let out_amount = simulate_roundtrip_swap(&session, cli.size, &template).await?;
-
-                    records.push(SpreadResult {
-                        slot,
-                        quote_mint: template.quote_mint.to_string(),
-                        base_mint: template.base_mint.to_string(),
-                        input_amount: cli.size,
-                        output_amount: out_amount,
-                        spread_bps: (cli.size - out_amount) / cli.size * 10_000,
-                    });
+                if !txs.iter().any(|tx| is_program_upgrade(&tx.transaction, &cli.program_id)) {
+                    continue;
                 }
+
+                let out_amount = simulate_roundtrip_swap(&session, cli.size, &template).await?;
+
+                if out_amount == 0 {
+                    continue;
+                }
+
+                records.push(SpreadResult {
+                    slot,
+                    quote_mint: template.quote_mint.to_string(),
+                    base_mint: template.base_mint.to_string(),
+                    input_amount: cli.size,
+                    output_amount: out_amount,
+                    spread_bps: (cli.size - out_amount) as f64 / cli.size as f64 * 10_000.0,
+                });
             }
 
             DiscoveryStepResult::Completed => {
