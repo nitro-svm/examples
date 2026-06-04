@@ -1,16 +1,31 @@
-//! Pause before each matching batch and inspect/simulate against frozen chain state.
+//! Measures the bid-ask spread of a DEX (default: BisonFi) by simulating a
+//! round-trip swap against frozen historical chain state.
 //!
-//! Creates a backtest session with a `ProgramExecuted` discovery filter for the
-//! Jupiter V6 aggregator (or any program of your choice).  For each matching
-//! batch the simulator pauses immediately before any of its transactions execute,
-//! giving you a window to:
+//! ## Methodology
 //!
-//! - Inspect account state via `session.rpc()` — reads reflect the chain up to
-//!   `batch_index - 1`, so the matched transactions have NOT yet run.
-//! - Call `session.rpc().simulate_transaction(&your_tx)` to test your routing
-//!   against exactly this chain state.  Nothing is committed on-chain.
+//! For each measurement point the session pauses execution and simulates two
+//! back-to-back Titan swaps against the same frozen state:
 //!
-//! After your inspection, the session jumps directly to the next matching batch.
+//! 1. **Buy** — swap `size` quote tokens (USDC) → base tokens (SOL).
+//! 2. **Sell** — swap the received base tokens back → quote tokens.
+//!
+//! The round-trip cost divided by the initial size gives the spread:
+//!
+//! ```text
+//! spread_bps = (size - final_out) / size * 10_000
+//! ```
+//!
+//! Both simulations run against identical pool state (no state is committed),
+//! so the result isolates the spread rather than blending it with price impact
+//! from sequential execution.
+//!
+//! ## Modes
+//!
+//! - **Discovery mode** (`--program-id` set): pauses only on batches where the
+//!   target program is upgraded (BPF Loader `Upgrade` instruction), measuring
+//!   spread immediately before each upgrade takes effect.
+//! - **Regular mode** (`--program-id` empty): pauses at every slot boundary
+//!   across the configured slot range.
 
 use backtest_example::utils::parse::{
     USDC_MINT, WSOL_MINT, derive_ata, extract_signer,
