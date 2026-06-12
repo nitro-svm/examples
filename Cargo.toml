@@ -1,16 +1,12 @@
 [package]
-name = "backtest-example"
+name = "backtest_example"
 version = "0.1.0"
 edition = "2024"
-description = "Backtest session example using simulator-client"
+description = "Backtest session examples using simulator-client"
 
 [[bin]]
 name = "backtest-example"
 path = "src/main.rs"
-
-[[bin]]
-name = "tx-pause"
-path = "src/bin/tx_pause/main.rs"
 
 [dependencies]
 anyhow = "1"
