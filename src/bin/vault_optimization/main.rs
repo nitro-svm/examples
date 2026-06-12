@@ -29,9 +29,10 @@ struct Cli {
 }
 
 // Formulas
-// Reserve exchange rate = total liquidity (available + borrowed − accumulated protocol fees) / cToken supply
-// Vault share price = (vault's idle tokens + Σ cToken balances × exchange rates) / vault shares outstanding
-// Realized yield = growth in share price over the simulated hour, annualized.
+// Reserve exchange rate = kToken supply / total liquidity (decreases as interest accrues)
+// 1 kToken is worth (1/exchange_rate) underlying; ratio r0/rt > 1 gives cumulative yield.
+// Vault share price compounds each period's weighted return: Π (Σ w_i/W * r_{t-1,i}/r_{t,i})
+// This keeps total_yield_pct == weighted_avg(market_yield_pct) every row.
 
 struct Portfolio {
     name: &'static str,
@@ -58,6 +59,14 @@ type MarketRates = HashMap<&'static str, HashMap<String, f64>>;
 
 const MARKET_NAMES: &[&str] = &["maple", "main", "prime", "jlp"];
 
+// Maps vault reserve pubkeys to MARKET_NAMES entries for baseline per-market APY columns.
+const RESERVE_TO_MARKET: &[(&str, &str)] = &[
+    (MAPLE_PYUSD_RESERVE, "maple"),
+    (MAIN_PYUSD_RESERVE,  "main"),
+    (PRIME_PYUSD_RESERVE, "prime"),
+    (JLP_PYUSD_RESERVE,   "jlp"),
+];
+
 struct SimRow {
     timestamp: String,
     share_price: f64,
@@ -66,8 +75,8 @@ struct SimRow {
     market_yields: Vec<f64>,
 }
 
-// share_price is normalized to 1.0 at t=0.
-// Weights are normalized to the sum of weights for markets that have data.
+// share_price compounds period-by-period: share_price *= Σ (w_i/W) * (r_{t-1,i} / r_{t,i})
+// This makes total_yield_pct == weighted_avg(market_yield_pct) exactly.
 fn simulate_portfolio(portfolio: &Portfolio, market_rates: &MarketRates) -> Vec<SimRow> {
     let weights: &[(&str, f64)] = &[
         ("maple", portfolio.maple),
@@ -95,25 +104,26 @@ fn simulate_portfolio(portfolio: &Portfolio, market_rates: &MarketRates) -> Vec<
     let t0 = &timestamps[0];
     let total_weight: f64 = active.iter().map(|(_, w)| w).sum();
 
-    let initial_rates: HashMap<&str, f64> = active.iter()
+    let mut share_price = 1.0_f64;
+    // Initialize prev rates to t=0 so first row yields 0%.
+    let mut prev_market_rates: HashMap<&str, f64> = active.iter()
         .filter_map(|(name, _)| market_rates[*name].get(t0).map(|r| (*name, *r)))
         .collect();
 
     let mut results = vec![];
-    let mut prev_price = 1.0_f64;
-    let mut prev_market_rates: HashMap<&str, f64> = initial_rates.clone();
 
     for ts in &timestamps {
-        // Vault share price: Σ (weight_i / total_weight) × (exchange_rate_i(t) / exchange_rate_i(t0))
-        let share_price: f64 = active.iter()
+        // period_return = Σ (w_i/W) * (r_{t-1,i} / r_{t,i})
+        let period_return: f64 = active.iter()
             .filter_map(|(name, weight)| {
-                let r0 = initial_rates.get(name)?;
-                let rt = market_rates[*name].get(ts)?;
-                Some((weight / total_weight) * (r0 / rt))
+                let prev = prev_market_rates.get(name)?;
+                let curr = market_rates[*name].get(ts)?;
+                Some((weight / total_weight) * (prev / curr))
             })
             .sum();
 
-        let annualized_yield = (share_price / prev_price - 1.0) * 8760.0;
+        share_price *= period_return;
+        let annualized_yield = (period_return - 1.0) * 8760.0;
 
         let market_yields: Vec<f64> = MARKET_NAMES.iter().map(|name| {
             let prev = prev_market_rates.get(name).copied().unwrap_or(f64::NAN);
@@ -121,14 +131,13 @@ fn simulate_portfolio(portfolio: &Portfolio, market_rates: &MarketRates) -> Vec<
             (prev / curr - 1.0) * 8760.0
         }).collect();
 
-        for name in &active {
-            if let Some(&rt) = market_rates[name.0].get(ts) {
-                prev_market_rates.insert(name.0, rt);
+        for (name, _) in &active {
+            if let Some(&rt) = market_rates[*name].get(ts) {
+                prev_market_rates.insert(name, rt);
             }
         }
 
         results.push(SimRow { timestamp: ts.clone(), share_price, annualized_yield, market_yields });
-        prev_price = share_price;
     }
 
     results
@@ -148,6 +157,15 @@ async fn get_historical_performance(
         .json::<Vec<VaultMetricsHistory>>()
         .await?;
     Ok(history)
+}
+
+fn csv_writer(path: &str) -> Result<BufWriter<std::fs::File>> {
+    let f = std::fs::File::create(path)?;
+    Ok(BufWriter::new(f))
+}
+
+fn output_prefix(output: &str) -> String {
+    output.strip_suffix(".csv").unwrap_or(output).to_string()
 }
 
 #[tokio::main]
@@ -192,30 +210,63 @@ async fn main() -> Result<()> {
         Portfolio { name: "portfolio_b", main: 0.50, maple: 0.40, prime: 0.15, jlp: 0.005 },
     ];
 
-    let f = std::fs::File::create(&cli.output)?;
-    let mut w = BufWriter::new(f);
     let vault_history = get_historical_performance(&kamino_client, SENTORA_PYUSD_VAULT, start_time, end_time).await?;
     eprintln!("[vault] sentora_pyusd {} snapshots", vault_history.len());
 
-    let market_headers = MARKET_NAMES.iter().map(|n| format!("{n}_yield_pct")).collect::<Vec<_>>().join(",");
-    writeln!(w, "portfolio,timestamp,share_price,total_yield_pct,{market_headers}")?;
+    let prefix = output_prefix(&cli.output);
+    let header = {
+        let market_headers = MARKET_NAMES.iter().map(|n| format!("{n}_yield_pct")).collect::<Vec<_>>().join(",");
+        format!("timestamp,share_price,total_yield_pct,{market_headers}")
+    };
 
-    // Baseline: actual vault performance
-    let mut prev_vault_price = vault_history.first().and_then(|r| r.share_price.parse::<f64>().ok()).unwrap_or(1.0);
-    for row in &vault_history {
-        let price: f64 = row.share_price.parse().unwrap_or(f64::NAN);
-        let ann_yield = (price / prev_vault_price - 1.0) * 8760.0 * 100.0;
-        writeln!(w, "sentora_baseline,{},{:.8},{:.6},{}", row.timestamp, price, ann_yield, ",".repeat(MARKET_NAMES.len() - 1))?;
-        prev_vault_price = price;
-    }
+    // Baseline: actual vault share price + per-reserve supply APYs from vault response.
+    {
+        let path = format!("{prefix}_baseline.csv");
+        let mut w = csv_writer(&path)?;
+        writeln!(w, "{header}")?;
 
-    for portfolio in &portfolios {
-        for row in simulate_portfolio(portfolio, &market_rates) {
-            let market_cols = row.market_yields.iter().map(|y| format!("{:.6}", y * 100.0)).collect::<Vec<_>>().join(",");
-            writeln!(w, "{},{},{:.8},{:.6},{market_cols}", portfolio.name, row.timestamp, row.share_price, row.annualized_yield * 100.0)?;
+        for row in &vault_history {
+            let price: f64 = row.share_price.parse().unwrap_or(f64::NAN);
+            let ann_yield: f64 = row.apy.parse().unwrap_or(f64::NAN) * 100.0;
+
+            // Map vault reserve pubkeys to per-market supply APY columns.
+            let reserve_apys: HashMap<&str, f64> = row.reserves.iter()
+                .filter_map(|r| {
+                    let market = RESERVE_TO_MARKET.iter()
+                        .find(|(pk, _)| *pk == r.pubkey)
+                        .map(|(_, name)| *name)?;
+                    let apy: f64 = r.supply_apy.parse().ok()?;
+                    Some((market, apy * 100.0))
+                })
+                .collect();
+
+            let market_cols = MARKET_NAMES.iter()
+                .map(|name| reserve_apys.get(name).map_or(String::new(), |v| format!("{v:.6}")))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            writeln!(w, "{},{:.8},{:.6},{market_cols}", row.timestamp, price, ann_yield)?;
         }
+
+        eprintln!("wrote {path}");
     }
 
-    eprintln!("wrote results to {}", cli.output);
+    // Portfolio simulations, one file each.
+    for portfolio in &portfolios {
+        let path = format!("{prefix}_{}.csv", portfolio.name);
+        let mut w = csv_writer(&path)?;
+        writeln!(w, "{header}")?;
+
+        for row in simulate_portfolio(portfolio, &market_rates) {
+            let market_cols = row.market_yields.iter()
+                .map(|y| format!("{:.6}", y * 100.0))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(w, "{},{:.8},{:.6},{market_cols}", row.timestamp, row.share_price, row.annualized_yield * 100.0)?;
+        }
+
+        eprintln!("wrote {path}");
+    }
+
     Ok(())
 }
