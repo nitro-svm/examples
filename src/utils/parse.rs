@@ -112,33 +112,50 @@ pub fn patch_titan_single_venue(
         })
         .context("no swap_route_v3 found")?;
 
-    swaps
+    let target_pos = swaps
         .iter()
-        .find(|s| s.venue_disc == venue_disc)
+        .position(|s| s.venue_disc == venue_disc)
         .with_context(|| format!("venue {venue_disc} not in swaps"))?;
+    let total_rem: usize = swaps.iter().map(|s| s.n_accounts as usize).sum();
+
+    let old_ix = &ixs[titan_ix_pos];
+    let old_data = &old_ix.data;
+
+    // TRUE single-venue strip: keep ONLY the target swap (num_swaps=1).
+    let target = &swaps[target_pos];
+    let n_before: usize = swaps[..target_pos].iter().map(|s| s.n_accounts as usize).sum();
+    let prefix = old_ix.accounts.len() - total_rem;
+    let venue_start = prefix + n_before;
+    let venue_end = venue_start + target.n_accounts as usize;
+    let mut new_accounts = old_ix.accounts[..prefix].to_vec();
+    new_accounts.extend_from_slice(&old_ix.accounts[venue_start..venue_end]);
+
+    // The last prefix slot (accounts[prefix-1]) holds the FIRST swap's market account
+    // (ZeroFi's, in our template). When the target isn't swap 0, that first venue is stripped
+    // and the slot becomes an orphan account. A native single-venue route puts the generic
+    // Titan `atlas` marker there instead — the same account at accounts[2]. Repoint to match.
+    // (If we're isolating the first venue itself, its market belongs there — leave it.)
+    if target_pos != 0 {
+        new_accounts[prefix - 1] = new_accounts[2];
+    }
+
+    // Data: header (slippage→100%, mesh_size→1), num_swaps=1, then only the target entry.
+    let mut new_data = old_data[..24].to_vec();
+    new_data[18..20].copy_from_slice(&10_000u16.to_le_bytes()); // slippage_threshold_bps
+    new_data[23] = 1; // mesh_size
+    new_data.extend_from_slice(&1u32.to_le_bytes()); // num_swaps = 1
+    let mut swap_bytes = old_data[target.data_start..target.data_end].to_vec();
+    let w_off = swap_bytes.len() - 5; // weight_nanos(4) + n_accounts(1) from end
+    swap_bytes[w_off..w_off + 4].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+    new_data.extend_from_slice(&swap_bytes);
 
     let mut new_tx = tx.clone();
     let new_ixs = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => &mut msg.instructions,
         VersionedMessage::V0(msg) => &mut msg.instructions,
     };
-    let data = &mut new_ixs[titan_ix_pos].data;
-
-    // Keep the full instruction structure intact (all swaps + all accounts) — only the
-    // header fields and per-swap weights change, so Anchor's account binding still works.
-    data[18..20].copy_from_slice(&10_000u16.to_le_bytes()); // slippage_threshold_bps → 100%
-    data[23] = 1; // mesh_size = 1 → allocator evaluates a single candidate (the weight vector)
-
-    // Force the weight vector to ~100% target: target gets the bulk, others get the min
-    // valid weight of 1 (Titan rejects weight_nanos == 0 with InvalidSwapInput). With
-    // mesh_size=1 the allocator should honor this split rather than searching for a better one.
-    let n_others = (swaps.len() - 1) as u32;
-    let target_weight = 1_000_000_000u32 - n_others;
-    for swap in &swaps {
-        let w_off = swap.data_end - 5; // weight_nanos(4) + n_accounts(1) at entry end
-        let weight = if swap.venue_disc == venue_disc { target_weight } else { 1 };
-        data[w_off..w_off + 4].copy_from_slice(&weight.to_le_bytes());
-    }
+    new_ixs[titan_ix_pos].data = new_data;
+    new_ixs[titan_ix_pos].accounts = new_accounts;
 
     Ok(new_tx)
 }

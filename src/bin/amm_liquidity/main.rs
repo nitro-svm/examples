@@ -22,7 +22,7 @@
 use backtest_example::utils::parse::{
     USDC_MINT, WSOL_MINT, derive_ata, extract_signer,
     get_titan_template_transaction, parse_titan_sim_result,
-    patch_titan_template_transaction,
+    patch_titan_single_venue, patch_titan_template_transaction,
 };
 use backtest_example::utils::{accounts::set_account_balance, types::TxWithMeta};
 
@@ -96,6 +96,11 @@ struct Cli {
     /// Stop the depth sweep once price impact exceeds this many bps.
     #[arg(long, default_value_t = 1000)]
     max_impact_bps: u64,
+
+    /// Titan Venue discriminant to isolate (55 = BisonFi, 13 = ZeroFi, 28 = HumidiFi,
+    /// 35 = GoonFi, 57 = GoonFiV2). See the Venue enum in the Titan IDL.
+    #[arg(long, default_value_t = TitanVenueDiscriminant::BisonFi as u8)]
+    venue_disc: u8,
 }
 
 // ── output records ───────────────────────────────────────────────────────────
@@ -162,7 +167,7 @@ struct Template {
     base_to_quote_single: Option<VersionedTransaction>,
 }
 
-async fn get_template(_venue_disc: u8) -> Result<Template> {
+async fn get_template(venue_disc: u8) -> Result<Template> {
     let usdc_to_sol = get_titan_template_transaction(titan_template_v3::USDC_TO_SOL).await?;
     let sol_to_usdc = get_titan_template_transaction(titan_template_v3::SOL_TO_USDC).await?;
     let quote_signer = extract_signer(&usdc_to_sol)?;
@@ -170,11 +175,14 @@ async fn get_template(_venue_disc: u8) -> Result<Template> {
     let quote_ata = derive_ata(&quote_signer, USDC_MINT).context("derive quote ATA")?;
     let base_ata = derive_ata(&base_signer, WSOL_MINT).context("derive base ATA")?;
 
-    // BASE CASE: single-venue patching isn't working yet, so measure spread/depth across
-    // the full multi-venue route (Titan's allocator picks the best venue per size). Swap
-    // back to patch_titan_single_venue(..) here once the strip patch is fixed.
-    let quote_to_base_single = Some(usdc_to_sol.clone());
-    let base_to_quote_single = Some(sol_to_usdc.clone());
+    let quote_to_base_single = match patch_titan_single_venue(&usdc_to_sol, venue_disc) {
+        Ok(tx) => { eprintln!("[template] single-venue quote->base patch OK (venue {venue_disc})"); Some(tx) }
+        Err(e) => { eprintln!("[template] single-venue quote->base patch failed: {e}"); None }
+    };
+    let base_to_quote_single = match patch_titan_single_venue(&sol_to_usdc, venue_disc) {
+        Ok(tx) => { eprintln!("[template] single-venue base->quote patch OK (venue {venue_disc})"); Some(tx) }
+        Err(e) => { eprintln!("[template] single-venue base->quote patch failed: {e}"); None }
+    };
 
     Ok(Template {
         quote_to_base: usdc_to_sol,
@@ -211,6 +219,15 @@ async fn simulate_single_swap(session: &BacktestSession, tx: &VersionedTransacti
         "    titan: out={} venues={:?} err={:?}",
         swap.out_amount, swap.venues, err
     );
+    if swap.out_amount == 0 {
+        static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("    [LOGDUMP] err={:?}", result.value.err);
+            for l in result.value.logs.as_deref().unwrap_or(&[]) {
+                eprintln!("    [LOGDUMP] {l}");
+            }
+        }
+    }
     Ok(swap.out_amount)
 }
 
@@ -277,6 +294,13 @@ async fn sweep_depth(
 
         if swap.out_amount == 0 {
             eprintln!("  [depth {direction}] size={size} → zero output, stopping");
+            static DUMPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if direction == "base_to_quote" && !DUMPED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("  [DEPTHDUMP] err={:?}", result.value.err);
+                for l in result.value.logs.as_deref().unwrap_or(&[]) {
+                    eprintln!("  [DEPTHDUMP] {l}");
+                }
+            }
             break;
         }
 
@@ -516,7 +540,7 @@ async fn main() -> Result<()> {
         .ok();
 
     let cli = Cli::parse();
-    let template = get_template(TitanVenueDiscriminant::BisonFi as u8).await?;
+    let template = get_template(cli.venue_disc).await?;
 
     let client = BacktestClient::builder()
         .url(format!("wss://{}/backtest", &cli.url))

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use simulator_api::{AccountData, AccountModifications, BinaryEncoding, EncodedBinary};
@@ -11,6 +12,30 @@ use super::parse::{TOKEN_PROGRAM, WSOL_MINT, derive_ata};
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const ATA_RENT_EXEMPT: u64 = 2_039_280;
 const FEE_BUFFER: u64 = 1_000_000;
+
+/// The staging simulator intermittently returns an empty HTTP body (EOF while
+/// decoding), which fails an otherwise-valid `modify_accounts`. Retry with backoff
+/// so a single blip doesn't drop a measurement; only give up if it keeps failing.
+async fn modify_with_retry(
+    session: &BacktestSession,
+    mods: &AccountModifications,
+    label: &'static str,
+) -> Result<()> {
+    const ATTEMPTS: u32 = 5;
+    let mut last: Option<anyhow::Error> = None;
+    for attempt in 1..=ATTEMPTS {
+        match session.modify_accounts(mods).await {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let e = anyhow::Error::new(e);
+                eprintln!("  [retry] {label} attempt {attempt}/{ATTEMPTS}: {e}");
+                last = Some(e);
+                tokio::time::sleep(Duration::from_millis(300 * attempt as u64)).await;
+            }
+        }
+    }
+    Err(last.unwrap()).with_context(|| format!("{label} failed after {ATTEMPTS} attempts"))
+}
 
 pub fn make_token_account(owner: &Address, mint: &str, amount: u64) -> Result<AccountData> {
     let mut data = [0u8; 165];
@@ -47,21 +72,19 @@ async fn set_native_balance(session: &BacktestSession, owner: &Pubkey, amount: u
         .map(|a| a.lamports)
         .unwrap_or(0);
 
-    session
-        .modify_accounts(&AccountModifications(BTreeMap::from([(
-            addr,
-            AccountData {
-                data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
-                executable: false,
-                lamports: amount
-                    .saturating_add(ATA_RENT_EXEMPT)
-                    .saturating_add(FEE_BUFFER),
-                owner: SYSTEM_PROGRAM.parse()?,
-                space: 0,
-            },
-        )])))
-        .await
-        .context("modify_accounts (native) failed")?;
+    let mods = AccountModifications(BTreeMap::from([(
+        addr,
+        AccountData {
+            data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
+            executable: false,
+            lamports: amount
+                .saturating_add(ATA_RENT_EXEMPT)
+                .saturating_add(FEE_BUFFER),
+            owner: SYSTEM_PROGRAM.parse()?,
+            space: 0,
+        },
+    )]));
+    modify_with_retry(session, &mods, "modify_accounts (native)").await?;
     Ok(original)
 }
 
@@ -96,13 +119,11 @@ pub async fn set_ata_balance(
         make_token_account(&owner_addr, mint, amount)?
     };
 
-    session
-        .modify_accounts(&AccountModifications(BTreeMap::from([(
-            ata.to_string().parse::<Address>()?,
-            account_data,
-        )])))
-        .await
-        .context("modify_accounts (ata) failed")?;
+    let mods = AccountModifications(BTreeMap::from([(
+        ata.to_string().parse::<Address>()?,
+        account_data,
+    )]));
+    modify_with_retry(session, &mods, "modify_accounts (ata)").await?;
 
     Ok(original)
 }
