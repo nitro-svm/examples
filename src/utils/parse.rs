@@ -20,6 +20,279 @@ pub const JUP_FEE_AUTHORITY: &str = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7H
 pub const TITAN_PROGRAM: &str = "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT";
 const TITAN_SPLIT_EVENT_DISCRIMINANT: [u8; 8] = [0xb7, 0x1c, 0x17, 0x87, 0xad, 0x7f, 0x7c, 0xea];
 
+// ── Titan v3 single-venue patching ──────────────────────────────────────────
+
+struct ParsedSwap {
+    data_start: usize,
+    data_end: usize,
+    n_accounts: u8,
+    venue_disc: u8,
+}
+
+/// Advance `pos` past the venue-specific fields that follow the 1-byte discriminant.
+/// SanctumDepositWithdraw (21) contains an Option<u32> so its size is data-dependent.
+fn skip_venue_extra(disc: u8, data: &[u8], pos: &mut usize) -> Result<()> {
+    let n: usize = match disc {
+        // 0 extra bytes
+        0 | 3 | 4 | 6 | 8 | 9 | 10 | 12 | 15 | 19 | 24 | 36 | 38 | 40 | 41 | 51 | 56 | 59 | 61
+        | 62 | 70 => 0,
+        // 1 extra byte (bool / u8 field)
+        1 | 2 | 5 | 7 | 11 | 14 | 16 | 17 | 18 | 20 | 22 | 23 | 25 | 27 | 30 | 31 | 32 | 37
+        | 39 | 43 | 44 | 45 | 49 | 52 | 54 | 55 | 57 | 58 | 60 | 63 | 64 | 65 | 68 | 69 | 71
+        | 72 => 1,
+        13 => 8,           // ZeroFi: expected_amount_out u64
+        26 | 35 | 42 => 2, // ExponentAmm / GoonFi / Hylo
+        28 => 9,           // HumidiFi: is_quote_to_base(1) + swap_id(8)
+        29 => 17,          // Bonkswap: x_to_y(1) + price_limit(u128)
+        33 => 121,         // HashFlow: txid(32)+from(8)+to(8)+expiry(8)+sig(64)+rec(1)
+        34 => 65,          // VaultUnstakepool: split_at(5)+lst_amounts(40)+seeds(20)
+        46 | 47 => 5,      // SanctumInf{Add,Remove}Liquidity
+        48 => 10,          // SanctumInfSwap
+        50 => 3,           // TitanLimitOrders: bumps [u8;3]
+        53 => 17,          // Scorch: id(u128) + disc(u8)
+        66 | 67 => 4,      // ExponentOB / ExponentClmm
+        21 => {
+            // SanctumDepositWithdraw: is_deposit(1) + Option<u32>(1 or 5) + split_at(1)
+            *pos += 1;
+            let tag = *data
+                .get(*pos)
+                .context("SanctumDepositWithdraw: truncated")?;
+            *pos += 1;
+            if tag != 0 {
+                *pos += 4;
+            }
+            *pos += 1;
+            return Ok(());
+        }
+        _ => anyhow::bail!("unknown venue discriminant {disc}"),
+    };
+    *pos += n;
+    Ok(())
+}
+
+fn parse_titan_v3_swaps(data: &[u8]) -> Result<Vec<ParsedSwap>> {
+    anyhow::ensure!(data.len() >= 28, "titan v3 data too short");
+    anyhow::ensure!(data[0] == 0x2a, "not swap_route_v3");
+    let num_swaps = u32::from_le_bytes(data[24..28].try_into().unwrap()) as usize;
+    let mut swaps = Vec::with_capacity(num_swaps);
+    let mut pos = 28;
+    for _ in 0..num_swaps {
+        let start = pos;
+        let disc = *data.get(pos).context("truncated: disc")?;
+        pos += 1;
+        skip_venue_extra(disc, data, &mut pos)?;
+        pos += 1 + 1 + 4; // from(u8) + to(u8) + weight_nanos(u32)
+        let n_accounts = *data.get(pos).context("truncated: n_accounts")?;
+        pos += 1;
+        swaps.push(ParsedSwap {
+            data_start: start,
+            data_end: pos,
+            n_accounts,
+            venue_disc: disc,
+        });
+    }
+    Ok(swaps)
+}
+
+/// Rewrite a swap_route_v3 transaction to route exclusively through `venue_disc`,
+/// dropping all other swap entries and their remaining accounts.
+/// Sets mesh_size=1 and weight_nanos=1_000_000_000 for the kept entry.
+pub fn patch_titan_single_venue(
+    tx: &VersionedTransaction,
+    venue_disc: u8,
+) -> Result<VersionedTransaction> {
+    let static_keys = tx.message.static_account_keys();
+    let titan_idx = static_keys
+        .iter()
+        .position(|k| k.to_string() == TITAN_PROGRAM)
+        .context("titan not in static keys")? as u8;
+
+    let ixs = tx.message.instructions();
+    let (titan_ix_pos, swaps) = ixs
+        .iter()
+        .enumerate()
+        .find_map(|(i, ix)| {
+            if ix.program_id_index != titan_idx {
+                return None;
+            }
+            parse_titan_v3_swaps(&ix.data).ok().map(|s| (i, s))
+        })
+        .context("no swap_route_v3 found")?;
+
+    let target_pos = swaps
+        .iter()
+        .position(|s| s.venue_disc == venue_disc)
+        .with_context(|| format!("venue {venue_disc} not in swaps"))?;
+    let total_rem: usize = swaps.iter().map(|s| s.n_accounts as usize).sum();
+
+    let old_ix = &ixs[titan_ix_pos];
+    let old_data = &old_ix.data;
+
+    // TRUE single-venue strip: keep ONLY the target swap (num_swaps=1).
+    let target = &swaps[target_pos];
+    let n_before: usize = swaps[..target_pos]
+        .iter()
+        .map(|s| s.n_accounts as usize)
+        .sum();
+    let prefix = old_ix.accounts.len() - total_rem;
+    let venue_start = prefix + n_before;
+    let venue_end = venue_start + target.n_accounts as usize;
+    let mut new_accounts = old_ix.accounts[..prefix].to_vec();
+    new_accounts.extend_from_slice(&old_ix.accounts[venue_start..venue_end]);
+
+    // The last prefix slot (accounts[prefix-1]) holds the FIRST swap's market account
+    // (ZeroFi's, in our template). When the target isn't swap 0, that first venue is stripped
+    // and the slot becomes an orphan account. A native single-venue route puts the generic
+    // Titan `atlas` marker there instead — the same account at accounts[2]. Repoint to match.
+    // (If we're isolating the first venue itself, its market belongs there — leave it.)
+    if target_pos != 0 {
+        new_accounts[prefix - 1] = new_accounts[2];
+    }
+
+    // Data: header (slippage→100%, mesh_size→1), num_swaps=1, then only the target entry.
+    let mut new_data = old_data[..24].to_vec();
+    new_data[18..20].copy_from_slice(&10_000u16.to_le_bytes()); // slippage_threshold_bps
+    new_data[23] = 1; // mesh_size
+    new_data.extend_from_slice(&1u32.to_le_bytes()); // num_swaps = 1
+    let mut swap_bytes = old_data[target.data_start..target.data_end].to_vec();
+    let w_off = swap_bytes.len() - 5; // weight_nanos(4) + n_accounts(1) from end
+    swap_bytes[w_off..w_off + 4].copy_from_slice(&1_000_000_000u32.to_le_bytes());
+    new_data.extend_from_slice(&swap_bytes);
+
+    let mut new_tx = tx.clone();
+    let new_ixs = match &mut new_tx.message {
+        VersionedMessage::Legacy(msg) => &mut msg.instructions,
+        VersionedMessage::V0(msg) => &mut msg.instructions,
+    };
+    new_ixs[titan_ix_pos].data = new_data;
+    new_ixs[titan_ix_pos].accounts = new_accounts;
+
+    Ok(new_tx)
+}
+
+/// DIAGNOSTIC: resolve the v0 ALTs and print, for the Titan swap instruction, the
+/// resolved pubkey at each account position, labeling named programs and the known
+/// venue programs. Used to locate venue-group boundaries in the account list.
+pub async fn debug_dump_venue_positions(tx: &VersionedTransaction) -> Result<()> {
+    let static_keys = tx.message.static_account_keys().to_vec();
+    let titan_idx = static_keys
+        .iter()
+        .position(|k| k.to_string() == TITAN_PROGRAM)
+        .context("titan not in static keys")? as u8;
+
+    // Resolve ALTs: loaded order is all-writable (across tables) then all-readonly.
+    let mut writable: Vec<Pubkey> = Vec::new();
+    let mut readonly: Vec<Pubkey> = Vec::new();
+    if let VersionedMessage::V0(msg) = &tx.message {
+        for lut in &msg.address_table_lookups {
+            let addrs = fetch_alt_addresses(&lut.account_key.to_string()).await?;
+            for &i in &lut.writable_indexes {
+                writable.push(*addrs.get(i as usize).context("alt writable idx oob")?);
+            }
+            for &i in &lut.readonly_indexes {
+                readonly.push(*addrs.get(i as usize).context("alt readonly idx oob")?);
+            }
+        }
+    }
+    let mut full = static_keys.clone();
+    full.extend(writable);
+    full.extend(readonly);
+
+    let ixs = tx.message.instructions();
+    let (_, swaps) = ixs
+        .iter()
+        .enumerate()
+        .find_map(|(i, ix)| {
+            if ix.program_id_index != titan_idx {
+                return None;
+            }
+            parse_titan_v3_swaps(&ix.data).ok().map(|s| (i, s))
+        })
+        .context("no swap_route_v3 found")?;
+    let titan_ix = ixs
+        .iter()
+        .find(|ix| ix.program_id_index == titan_idx)
+        .unwrap();
+
+    // venue group start positions (within the full instruction account list)
+    let total_rem: usize = swaps.iter().map(|s| s.n_accounts as usize).sum();
+    let prefix = titan_ix.accounts.len() - total_rem;
+    eprintln!(
+        "[venuedbg] ix.accounts.len()={} total_rem={} prefix={}",
+        titan_ix.accounts.len(),
+        total_rem,
+        prefix
+    );
+    // boundaries assuming venue accounts start right after `prefix`
+    let mut starts = Vec::new();
+    let mut acc = prefix;
+    for s in &swaps {
+        starts.push((acc, s.venue_disc, s.n_accounts));
+        acc += s.n_accounts as usize;
+    }
+
+    let label = |k: &str| -> &'static str {
+        match k {
+            "11111111111111111111111111111111" => " <system_program>",
+            "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT" => " <titan/None>",
+            "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp" => " <<< ZeroFi prog",
+            "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi" => " <<< BisonFi prog",
+            "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE" => " <<< GoonFiV2 prog",
+            _ => "",
+        }
+    };
+    for (pos, &idx) in titan_ix.accounts.iter().enumerate() {
+        let k = full
+            .get(idx as usize)
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "??".into());
+        let group = starts
+            .iter()
+            .rev()
+            .find(|(st, _, _)| pos >= *st)
+            .map(|(st, disc, n)| format!("venue@{st} disc={disc} n={n}"))
+            .filter(|_| pos >= prefix)
+            .unwrap_or_else(|| {
+                if pos < prefix {
+                    "PREFIX".into()
+                } else {
+                    String::new()
+                }
+            });
+        eprintln!(
+            "[venuedbg] pos={pos:>3} idx={idx:>3} {k}{}  [{group}]",
+            label(&k)
+        );
+    }
+    Ok(())
+}
+
+/// Fetch an Address Lookup Table account and return its stored addresses.
+/// ALT layout: 56-byte meta header (LOOKUP_TABLE_META_SIZE), then packed 32-byte pubkeys.
+async fn fetch_alt_addresses(alt_pubkey: &str) -> Result<Vec<Pubkey>> {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "getAccountInfo",
+        "params": [alt_pubkey, {"encoding": "base64"}]
+    });
+    let resp: serde_json::Value = reqwest::Client::new()
+        .post(SOLANA_RPC)
+        .json(&body)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let encoded = resp["result"]["value"]["data"][0]
+        .as_str()
+        .context("alt account data not found")?;
+    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
+    anyhow::ensure!(bytes.len() >= 56, "alt too short");
+    Ok(bytes[56..]
+        .chunks_exact(32)
+        .map(|c| Pubkey::try_from(c).unwrap())
+        .collect())
+}
+
 pub struct SwapData {
     pub in_amount: u64,
     pub out_amount: u64,
@@ -288,6 +561,8 @@ pub fn patch_titan_template_transaction(
     titan_ix.data[2..10].copy_from_slice(&in_amount.to_le_bytes());
     // zero expected_amount_out so simulation never fails on stale slippage
     titan_ix.data[10..18].copy_from_slice(&0u64.to_le_bytes());
+    // bump dynamic-allocation slippage threshold to 10,000 bps (100%) so resimulation doesn't error
+    titan_ix.data[18..20].copy_from_slice(&10_000u16.to_le_bytes());
 
     Ok(new_tx)
 }

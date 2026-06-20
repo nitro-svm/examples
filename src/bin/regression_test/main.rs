@@ -5,9 +5,6 @@
 //! by `simulator_client::BacktestClient`. RPC queries and log subscriptions
 //! use the `RpcClient` and `PubsubClient` exposed directly on the session.
 
-mod logs;
-mod utils;
-
 use std::{
     collections::{BTreeMap, HashMap},
     path::PathBuf,
@@ -19,8 +16,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_client::{BacktestClient, Continue, CreateSession};
 
-use backtest_example::fetch::{SolAccount, TokenAccount};
-use logs::subscribe_logs;
+use backtest_example::utils::fetch::{SolAccount, TokenAccount};
+
+mod logs;
+use crate::logs::subscribe_logs;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
