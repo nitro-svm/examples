@@ -34,27 +34,29 @@ struct ParsedSwap {
 fn skip_venue_extra(disc: u8, data: &[u8], pos: &mut usize) -> Result<()> {
     let n: usize = match disc {
         // 0 extra bytes
-        0 | 3 | 4 | 6 | 8 | 9 | 10 | 12 | 15 | 19 | 24 | 36 | 38 | 40 | 41
-        | 51 | 56 | 59 | 61 | 62 | 70 => 0,
+        0 | 3 | 4 | 6 | 8 | 9 | 10 | 12 | 15 | 19 | 24 | 36 | 38 | 40 | 41 | 51 | 56 | 59 | 61
+        | 62 | 70 => 0,
         // 1 extra byte (bool / u8 field)
-        1 | 2 | 5 | 7 | 11 | 14 | 16 | 17 | 18 | 20 | 22 | 23 | 25 | 27 | 30
-        | 31 | 32 | 37 | 39 | 43 | 44 | 45 | 49 | 52 | 54 | 55 | 57 | 58 | 60
-        | 63 | 64 | 65 | 68 | 69 | 71 | 72 => 1,
-        13 => 8,                 // ZeroFi: expected_amount_out u64
-        26 | 35 | 42 => 2,       // ExponentAmm / GoonFi / Hylo
-        28 => 9,                 // HumidiFi: is_quote_to_base(1) + swap_id(8)
-        29 => 17,                // Bonkswap: x_to_y(1) + price_limit(u128)
-        33 => 121,               // HashFlow: txid(32)+from(8)+to(8)+expiry(8)+sig(64)+rec(1)
-        34 => 65,                // VaultUnstakepool: split_at(5)+lst_amounts(40)+seeds(20)
-        46 | 47 => 5,            // SanctumInf{Add,Remove}Liquidity
-        48 => 10,                // SanctumInfSwap
-        50 => 3,                 // TitanLimitOrders: bumps [u8;3]
-        53 => 17,                // Scorch: id(u128) + disc(u8)
-        66 | 67 => 4,            // ExponentOB / ExponentClmm
+        1 | 2 | 5 | 7 | 11 | 14 | 16 | 17 | 18 | 20 | 22 | 23 | 25 | 27 | 30 | 31 | 32 | 37
+        | 39 | 43 | 44 | 45 | 49 | 52 | 54 | 55 | 57 | 58 | 60 | 63 | 64 | 65 | 68 | 69 | 71
+        | 72 => 1,
+        13 => 8,           // ZeroFi: expected_amount_out u64
+        26 | 35 | 42 => 2, // ExponentAmm / GoonFi / Hylo
+        28 => 9,           // HumidiFi: is_quote_to_base(1) + swap_id(8)
+        29 => 17,          // Bonkswap: x_to_y(1) + price_limit(u128)
+        33 => 121,         // HashFlow: txid(32)+from(8)+to(8)+expiry(8)+sig(64)+rec(1)
+        34 => 65,          // VaultUnstakepool: split_at(5)+lst_amounts(40)+seeds(20)
+        46 | 47 => 5,      // SanctumInf{Add,Remove}Liquidity
+        48 => 10,          // SanctumInfSwap
+        50 => 3,           // TitanLimitOrders: bumps [u8;3]
+        53 => 17,          // Scorch: id(u128) + disc(u8)
+        66 | 67 => 4,      // ExponentOB / ExponentClmm
         21 => {
             // SanctumDepositWithdraw: is_deposit(1) + Option<u32>(1 or 5) + split_at(1)
             *pos += 1;
-            let tag = *data.get(*pos).context("SanctumDepositWithdraw: truncated")?;
+            let tag = *data
+                .get(*pos)
+                .context("SanctumDepositWithdraw: truncated")?;
             *pos += 1;
             if tag != 0 {
                 *pos += 4;
@@ -82,7 +84,12 @@ fn parse_titan_v3_swaps(data: &[u8]) -> Result<Vec<ParsedSwap>> {
         pos += 1 + 1 + 4; // from(u8) + to(u8) + weight_nanos(u32)
         let n_accounts = *data.get(pos).context("truncated: n_accounts")?;
         pos += 1;
-        swaps.push(ParsedSwap { data_start: start, data_end: pos, n_accounts, venue_disc: disc });
+        swaps.push(ParsedSwap {
+            data_start: start,
+            data_end: pos,
+            n_accounts,
+            venue_disc: disc,
+        });
     }
     Ok(swaps)
 }
@@ -123,7 +130,10 @@ pub fn patch_titan_single_venue(
 
     // TRUE single-venue strip: keep ONLY the target swap (num_swaps=1).
     let target = &swaps[target_pos];
-    let n_before: usize = swaps[..target_pos].iter().map(|s| s.n_accounts as usize).sum();
+    let n_before: usize = swaps[..target_pos]
+        .iter()
+        .map(|s| s.n_accounts as usize)
+        .sum();
     let prefix = old_ix.accounts.len() - total_rem;
     let venue_start = prefix + n_before;
     let venue_end = venue_start + target.n_accounts as usize;
@@ -193,20 +203,33 @@ pub async fn debug_dump_venue_positions(tx: &VersionedTransaction) -> Result<()>
         .iter()
         .enumerate()
         .find_map(|(i, ix)| {
-            if ix.program_id_index != titan_idx { return None; }
+            if ix.program_id_index != titan_idx {
+                return None;
+            }
             parse_titan_v3_swaps(&ix.data).ok().map(|s| (i, s))
         })
         .context("no swap_route_v3 found")?;
-    let titan_ix = ixs.iter().find(|ix| ix.program_id_index == titan_idx).unwrap();
+    let titan_ix = ixs
+        .iter()
+        .find(|ix| ix.program_id_index == titan_idx)
+        .unwrap();
 
     // venue group start positions (within the full instruction account list)
     let total_rem: usize = swaps.iter().map(|s| s.n_accounts as usize).sum();
     let prefix = titan_ix.accounts.len() - total_rem;
-    eprintln!("[venuedbg] ix.accounts.len()={} total_rem={} prefix={}", titan_ix.accounts.len(), total_rem, prefix);
+    eprintln!(
+        "[venuedbg] ix.accounts.len()={} total_rem={} prefix={}",
+        titan_ix.accounts.len(),
+        total_rem,
+        prefix
+    );
     // boundaries assuming venue accounts start right after `prefix`
     let mut starts = Vec::new();
     let mut acc = prefix;
-    for s in &swaps { starts.push((acc, s.venue_disc, s.n_accounts)); acc += s.n_accounts as usize; }
+    for s in &swaps {
+        starts.push((acc, s.venue_disc, s.n_accounts));
+        acc += s.n_accounts as usize;
+    }
 
     let label = |k: &str| -> &'static str {
         match k {
@@ -219,12 +242,27 @@ pub async fn debug_dump_venue_positions(tx: &VersionedTransaction) -> Result<()>
         }
     };
     for (pos, &idx) in titan_ix.accounts.iter().enumerate() {
-        let k = full.get(idx as usize).map(|k| k.to_string()).unwrap_or_else(|| "??".into());
-        let group = starts.iter().rev().find(|(st, _, _)| pos >= *st)
+        let k = full
+            .get(idx as usize)
+            .map(|k| k.to_string())
+            .unwrap_or_else(|| "??".into());
+        let group = starts
+            .iter()
+            .rev()
+            .find(|(st, _, _)| pos >= *st)
             .map(|(st, disc, n)| format!("venue@{st} disc={disc} n={n}"))
             .filter(|_| pos >= prefix)
-            .unwrap_or_else(|| if pos < prefix { "PREFIX".into() } else { String::new() });
-        eprintln!("[venuedbg] pos={pos:>3} idx={idx:>3} {k}{}  [{group}]", label(&k));
+            .unwrap_or_else(|| {
+                if pos < prefix {
+                    "PREFIX".into()
+                } else {
+                    String::new()
+                }
+            });
+        eprintln!(
+            "[venuedbg] pos={pos:>3} idx={idx:>3} {k}{}  [{group}]",
+            label(&k)
+        );
     }
     Ok(())
 }
@@ -238,13 +276,21 @@ async fn fetch_alt_addresses(alt_pubkey: &str) -> Result<Vec<Pubkey>> {
         "params": [alt_pubkey, {"encoding": "base64"}]
     });
     let resp: serde_json::Value = reqwest::Client::new()
-        .post(SOLANA_RPC).json(&body).send().await?.json().await?;
+        .post(SOLANA_RPC)
+        .json(&body)
+        .send()
+        .await?
+        .json()
+        .await?;
     let encoded = resp["result"]["value"]["data"][0]
         .as_str()
         .context("alt account data not found")?;
     let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
     anyhow::ensure!(bytes.len() >= 56, "alt too short");
-    Ok(bytes[56..].chunks_exact(32).map(|c| Pubkey::try_from(c).unwrap()).collect())
+    Ok(bytes[56..]
+        .chunks_exact(32)
+        .map(|c| Pubkey::try_from(c).unwrap())
+        .collect())
 }
 
 pub struct SwapData {
@@ -515,7 +561,7 @@ pub fn patch_titan_template_transaction(
     titan_ix.data[2..10].copy_from_slice(&in_amount.to_le_bytes());
     // zero expected_amount_out so simulation never fails on stale slippage
     titan_ix.data[10..18].copy_from_slice(&0u64.to_le_bytes());
-    // bump dynamic-allocation slippage threshold to 10 000 bps (100%) so resimulation doesn't error
+    // bump dynamic-allocation slippage threshold to 10,000 bps (100%) so resimulation doesn't error
     titan_ix.data[18..20].copy_from_slice(&10_000u16.to_le_bytes());
 
     Ok(new_tx)

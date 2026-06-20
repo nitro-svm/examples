@@ -14,8 +14,9 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_commitment_config::CommitmentConfig;
 use tokio::{sync::watch, task::JoinHandle};
 
-use super::{Stats, Transaction};
-use backtest_example::fetch::fetch_balance_changes;
+use backtest_example::utils::fetch::fetch_balance_changes;
+
+use crate::{Stats, Transaction};
 
 // ── Log subscription ───────────────────────────────────────────────────────────
 

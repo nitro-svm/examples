@@ -3152,22 +3152,24 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simulator-api"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba2b94170b546dc837683442e2a6308d3a5ab066341ee313ae3b2d3bf599150d"
+checksum = "bc8881bce1ba53d572fc81eed9c920511e3ed5b58ae98aea1a615afbbb0414b3"
 dependencies = [
  "base64 0.22.1",
  "chrono",
  "serde",
+ "serde_json",
  "serde_with",
  "solana-address 1.1.0",
+ "zstd",
 ]
 
 [[package]]
 name = "simulator-client"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f12bf43ba40e7d2af9748e6b62bb1244ec3ab05caab27af85a5dee1076746fc9"
+checksum = "16a7f9d0ae05e3465d669a6f2e40df201083bdc0827c1c4c12aef77e13bb055e"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",

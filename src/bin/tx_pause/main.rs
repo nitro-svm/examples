@@ -13,27 +13,21 @@
 //! After your inspection, the session jumps directly to the next matching batch.
 
 use backtest_example::utils::parse::{
-    JUPITER_V6, TOKEN_PROGRAM, USDC_MINT, WSOL_MINT, derive_ata, extract_signer,
-    get_titan_template_transaction, parse_jupiter_swap_result, parse_titan_sim_result,
-    patch_titan_template_transaction,
+    JUPITER_V6, USDC_MINT, WSOL_MINT, derive_ata, extract_signer, get_titan_template_transaction,
+    parse_jupiter_swap_result, parse_titan_sim_result, patch_titan_template_transaction,
 };
 use backtest_example::utils::{accounts::set_account_balance, types::TxWithMeta};
 
-use std::collections::BTreeMap;
 use std::io::{BufWriter, Write as _};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use simulator_api::{
-    AccountData, AccountModifications, BinaryEncoding, DiscoveryFilter, EncodedBinary,
-};
-use simulator_client::{BacktestClient, BacktestSession, CreateSession, DiscoveryStepResult};
+use simulator_api::DiscoveryFilter;
+use simulator_client::{BacktestClient, CreateSession, DiscoveryStepResult};
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
-
-const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 
 const SOL_TO_USDC_TEMPLATE: &str =
     "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
