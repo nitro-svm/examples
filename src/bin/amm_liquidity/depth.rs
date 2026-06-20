@@ -102,7 +102,7 @@ pub(crate) async fn get_max_depth(
         // quote -> base
         sweep_liquidity_curve(
             session,
-            &template.quote_to_base_single,
+            &template.quote_to_base,
             template.quote_ata,
             &quote_mint,
             &template.quote_signer,
@@ -112,7 +112,7 @@ pub(crate) async fn get_max_depth(
         // base -> quote
         sweep_liquidity_curve(
             session,
-            &template.base_to_quote_single,
+            &template.base_to_quote,
             template.base_ata,
             &base_mint,
             &template.base_signer,

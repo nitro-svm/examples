@@ -133,7 +133,6 @@ struct Cli {
 // ── template ─────────────────────────────────────────────────────────────────
 
 struct Template {
-    // Full multi-venue templates (used for spread round-trip)
     quote_to_base: VersionedTransaction,
     base_to_quote: VersionedTransaction,
     quote_mint: Address,
@@ -142,10 +141,6 @@ struct Template {
     base_signer: Pubkey,
     quote_ata: Pubkey,
     base_ata: Pubkey,
-    // Single-venue templates (used for depth sweep); None if venue not found in template
-    // TODO: combine with multi-venue
-    quote_to_base_single: VersionedTransaction,
-    base_to_quote_single: VersionedTransaction,
 }
 
 async fn get_template(venue_disc: u8) -> Result<Template> {
@@ -156,20 +151,18 @@ async fn get_template(venue_disc: u8) -> Result<Template> {
     let quote_ata = derive_ata(&quote_signer, USDC_MINT).context("derive quote ATA")?;
     let base_ata = derive_ata(&base_signer, WSOL_MINT).context("derive base ATA")?;
 
-    let quote_to_base_single = patch_titan_single_venue(&usdc_to_sol, venue_disc)?;
-    let base_to_quote_single = patch_titan_single_venue(&sol_to_usdc, venue_disc)?;
+    let quote_to_base = patch_titan_single_venue(&usdc_to_sol, venue_disc)?;
+    let base_to_quote = patch_titan_single_venue(&sol_to_usdc, venue_disc)?;
 
     Ok(Template {
-        quote_to_base: usdc_to_sol,
-        base_to_quote: sol_to_usdc,
+        quote_to_base,
+        base_to_quote,
         quote_mint: Address::from_str_const(USDC_MINT),
         base_mint: Address::from_str_const(WSOL_MINT),
         quote_signer,
         base_signer,
         quote_ata,
         base_ata,
-        quote_to_base_single,
-        base_to_quote_single,
     })
 }
 
@@ -227,17 +220,17 @@ async fn run_measurements(
     };
 
     // Depth
-    // let depth = match get_max_depth(session, template, cli.depth_min, cli.max_impact_bps).await {
-    //     Ok((quote_to_base, base_to_quote)) => Some(DepthRecord {
-    //         slot,
-    //         quote_to_base,
-    //         base_to_quote,
-    //     }),
-    //     Err(e) => {
-    //         eprint!("Failed to measure depth: {e}");
-    //         None
-    //     }
-    // };
+    let depth = match get_max_depth(session, template, cli.depth_min, cli.max_impact_bps).await {
+        Ok((quote_to_base, base_to_quote)) => Some(DepthRecord {
+            slot,
+            quote_to_base,
+            base_to_quote,
+        }),
+        Err(e) => {
+            eprint!("Failed to measure depth: {e}");
+            None
+        }
+    };
 
     Ok(Measurement { spread, depth: None })
 }
