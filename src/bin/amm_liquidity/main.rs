@@ -232,7 +232,7 @@ async fn run_measurements(
         }
     };
 
-    Ok(Measurement { spread, depth: None })
+    Ok(Measurement { spread, depth })
 }
 
 async fn run_discovery_session(
