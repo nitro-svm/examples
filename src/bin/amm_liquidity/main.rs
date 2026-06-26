@@ -22,17 +22,13 @@ use backtest_example::utils::parse::{
     USDC_MINT, WSOL_MINT, derive_ata, extract_signer, get_titan_template_transaction,
     patch_titan_single_venue,
 };
-use backtest_example::utils::types::TxWithMeta;
 
-use std::collections::BTreeMap;
-use std::str::FromStr;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use simulator_api::DiscoveryFilter;
-use simulator_client::{BacktestClient, Continue, CreateSession, DiscoveryStepResult};
+use simulator_client::{BacktestClient, Continue, CreateSession};
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
@@ -41,13 +37,9 @@ mod action;
 mod depth;
 mod spread;
 
-use action::subscribe_action_results;
-use depth::{DepthRecord, write_depth_output};
-use spread::{SpreadRecord, write_spread_output};
-
-use crate::action::Label;
-use crate::depth::get_depth_actions;
-use crate::spread::get_spread_action;
+use action::{ActionProcessor, subscribe_action_results};
+use depth::DepthStore;
+use spread::SpreadStore;
 
 #[repr(u8)]
 enum TitanVenueDiscriminant {
@@ -70,14 +62,16 @@ impl TitanVenueDiscriminant {
         }
     }
 
-    fn get_program_id(self) -> &'static str {
-        match self {
+    fn get_program_id(self) -> Address {
+        let program_id = match self {
             Self::ZeroFi => "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",
             Self::HumidiFi => "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp",
             Self::GoonFi => "goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdBUL17BnS5j",
             Self::BisonFi => "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi",
             Self::GoonFiV2 => "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",
-        }
+        };
+
+        Address::from_str_const(program_id)
     }
 }
 
@@ -110,7 +104,7 @@ struct Cli {
     depth_output: String,
 
     #[arg(long, default_value_t = false)]
-    pause_on_upgrade: bool,
+    enable_intra_block_inspection: bool,
 
     #[arg(long, default_value = USDC_MINT)]
     quote_mint: String,
@@ -180,12 +174,14 @@ async fn get_template(venue_disc: u8) -> Result<Template> {
 
 // ── BPF upgrade detection ─────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 static BPF_UPGRADEABLE_LOADER: LazyLock<Pubkey> = LazyLock::new(|| {
     "BPFLoaderUpgradeab1e11111111111111111111111"
         .parse()
         .expect("valid BPF upgradeable loader pubkey")
 });
 
+#[allow(dead_code)]
 fn is_program_upgrade(tx: &VersionedTransaction, program_id: &Pubkey) -> bool {
     let keys = tx.message.static_account_keys();
     let Some(loader_idx) = keys.iter().position(|k| k == &*BPF_UPGRADEABLE_LOADER) else {
@@ -217,107 +213,20 @@ fn resolve_url(base: &str, endpoint: &str) -> String {
     format!("{base}/{}", endpoint.trim_start_matches('/'))
 }
 
-async fn run_discovery_session(
+async fn run_session(
     client: BacktestClient,
-    program_addr: Address,
     cli: &Cli,
     template: &Template,
-) -> Result<(Vec<SpreadRecord>, Vec<DepthRecord>)> {
-    let mut spread_records = Vec::new();
-    let mut depth_records = Vec::new();
-    let mut pause_count = 0u64;
+    program_id: Option<Address>,
+) -> Result<(SpreadStore, DepthStore)> {
     let timeout = Some(Duration::from_secs(120));
-
-    let mut actions = vec![get_spread_action(template, cli.spread_size)?];
-    actions.extend(get_depth_actions(template, cli.depth_min)?);
-
-    let mut session = client
-        .create_session(
-            CreateSession::builder()
-                .start_slot(cli.start_slot)
-                .end_slot(cli.end_slot)
-                .disconnect_timeout_secs(900u16)
-                .capacity_wait_timeout_secs(900u16)
-                .discoveries(vec![DiscoveryFilter::ProgramExecuted(program_addr)])
-                .actions(actions)
-                .build(),
-        )
-        .await?;
-
-    eprintln!("[ws] session: {}", session.session_id().unwrap_or("?"));
-    session.ensure_ready(Some(Duration::from_secs(600))).await?;
-    eprintln!("[ws] ready — scanning for {program_addr} batches");
-
-    // Stream scheduled-action results while we scan for upgrade batches. Discovery
-    // correlates results with the upgrade slots it finds, so it buffers the events
-    // and processes them after the scan (once `upgrade_slots` is complete).
-    let (sub, mut rx) = subscribe_action_results(&session, &cli.url).await?;
-    // Slots where the program was upgraded; use to filter action results below.
-    let mut upgrade_slots: Vec<u64> = Vec::new();
-
-    loop {
-        match session.advance_to_discovery(timeout).await? {
-            DiscoveryStepResult::Paused(pause) => {
-                pause_count += 1;
-                let slot = pause.paused.slot;
-                let batch = pause.paused.batch_index.unwrap_or(0);
-                eprintln!("[pause #{pause_count}] slot={slot} batch={batch}");
-
-                let txs: Vec<TxWithMeta> = pause
-                    .discovery
-                    .transactions
-                    .iter()
-                    .filter_map(|bin| {
-                        let bytes = bin.decode().ok()?;
-                        bincode::deserialize(&bytes).ok()
-                    })
-                    .collect();
-                if !txs
-                    .iter()
-                    .any(|t| is_program_upgrade(&t.transaction, &program_addr))
-                {
-                    continue;
-                }
-
-                upgrade_slots.push(slot);
-            }
-            DiscoveryStepResult::Completed => {
-                eprintln!("[done] session completed; total pauses: {pause_count}");
-                break;
-            }
-        }
-    }
-
-    // Stop the subscription and drain the buffered results (the dropped sender
-    // closes the channel, ending the loop).
-    sub.stop.send(true).ok();
-    sub.join_handle.await.ok();
-    let mut notifications = Vec::new();
-    while let Some(n) = rx.recv().await {
-        notifications.push(n);
-    }
-    let _ = session.close(Some(Duration::from_secs(10))).await;
-    eprintln!(
-        "[actions] collected {} action results across {} upgrade slots",
-        notifications.len(),
-        upgrade_slots.len()
+    let action_processor = ActionProcessor::new(
+        cli.spread_size,
+        cli.depth_min,
+        cli.max_impact_bps,
+        program_id,
     );
 
-    // TODO(@ygao): process `notifications` (filtered to `upgrade_slots`) into records.
-    let _ = (&mut spread_records, &mut depth_records);
-    Ok((spread_records, depth_records))
-}
-
-async fn run_regular_session(
-    client: BacktestClient,
-    cli: &Cli,
-    template: &Template,
-) -> Result<(Vec<SpreadRecord>, Vec<DepthRecord>)> {
-    let timeout = Some(Duration::from_secs(120));
-
-    let mut actions = vec![get_spread_action(template, cli.spread_size)?];
-    actions.extend(get_depth_actions(template, cli.depth_min)?);
-
     let mut session = client
         .create_session(
             CreateSession::builder()
@@ -325,7 +234,7 @@ async fn run_regular_session(
                 .end_slot(cli.end_slot)
                 .disconnect_timeout_secs(900u16)
                 .capacity_wait_timeout_secs(900u16)
-                .actions(actions)
+                .actions(action_processor.get_actions(template)?)
                 .build(),
         )
         .await?;
@@ -335,39 +244,7 @@ async fn run_regular_session(
     // Subscribe before advancing, then process action results as they stream in,
     // concurrently with the advance loop.
     let (sub, rx) = subscribe_action_results(&session, &cli.url).await?;
-    let spread_size = cli.spread_size;
-    let max_impact_bps = cli.max_impact_bps;
-    let processor = tokio::spawn(async move {
-        let mut rx = rx;
-        let mut spread_records: Vec<SpreadRecord> = Vec::new();
-        let mut depth_records: BTreeMap<u64, DepthRecord> = BTreeMap::new();
-        while let Some(notification) = rx.recv().await {
-            let slot = notification.slot;
-            let Some((label, size)) = notification.label.as_deref().and_then(Label::parse) else {
-                continue;
-            };
-
-            match label {
-                Label::Spread => {
-                    if let Some(spread) = SpreadRecord::new(&notification, spread_size) {
-                        spread_records.push(spread);
-                    } else {
-                        eprintln!("Unable to parse spread notification for slot {slot}");
-                    }
-                }
-                Label::Depth(_direction) => {
-                    // TODO(@ygao): accumulate depth sweep points per slot/direction
-                    // and reduce each sweep to its deepest point within
-                    // `max_impact_bps`, inserting into `depth_records`.
-                    let _ = (size, max_impact_bps);
-                }
-            }
-        }
-        (
-            spread_records,
-            depth_records.into_values().collect::<Vec<_>>(),
-        )
-    });
+    let handle = tokio::spawn(action_processor.parse_events(rx));
 
     loop {
         let result = session
@@ -389,8 +266,9 @@ async fn run_regular_session(
     // the processor's `recv()` loop after it drains the tail results.
     sub.stop.send(true).ok();
     sub.join_handle.await.ok();
-    let (spread_records, depth_records) = processor.await.context("action processor panicked")?;
+    let (spread_records, depth_records) = handle.await.context("action processor panicked")?;
     let _ = session.close(Some(Duration::from_secs(10))).await;
+
     Ok((spread_records, depth_records))
 }
 
@@ -415,29 +293,16 @@ async fn main() -> Result<()> {
     let spread_file = cli.spread_output.clone();
     let depth_file = cli.depth_output.clone();
 
-    let (spread_records, depth_records) = if cli.pause_on_upgrade {
-        let program_addr = TitanVenueDiscriminant::from_u8(cli.venue_disciminant)?.get_program_id();
-        run_discovery_session(client, Pubkey::from_str(program_addr)?, &cli, &template).await?
+    let program_id = if cli.enable_intra_block_inspection {
+        Some(TitanVenueDiscriminant::from_u8(cli.venue_disciminant)?.get_program_id())
     } else {
-        run_regular_session(client, &cli, &template).await?
+        None
     };
 
-    write_spread_output(
-        &spread_file,
-        &spread_records,
-        &cli.quote_mint,
-        &cli.base_mint,
-    )?;
-    eprintln!(
-        "[done] wrote {} spread rows to {spread_file}",
-        spread_records.len()
-    );
+    let (spread_records, depth_records) = run_session(client, &cli, &template, program_id).await?;
+    spread_records.write_output(&spread_file, &cli.quote_mint, &cli.base_mint)?;
 
-    write_depth_output(&depth_file, &depth_records, &cli.quote_mint, &cli.base_mint)?;
-    eprintln!(
-        "[done] wrote {} depth rows to {depth_file}",
-        depth_records.len()
-    );
+    depth_records.write_output(&depth_file, &cli.quote_mint, &cli.base_mint)?;
 
     Ok(())
 }

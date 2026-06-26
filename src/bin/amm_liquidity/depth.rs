@@ -4,8 +4,10 @@ use std::io::{BufWriter, Write as _};
 use anyhow::Result;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use simulator_api::{AccountModifications, ActionAnchor, ActionKind, ScheduledAction};
-use simulator_client::ActionResultNotification;
+use simulator_api::{
+    AccountModifications, ActionAnchor, ActionKind, DiscoveryFilter, ScheduledAction,
+};
+use solana_address::Address;
 
 use backtest_example::utils::accounts::{make_native_account, make_token_account};
 use backtest_example::utils::parse::patch_titan_template_transaction;
@@ -26,25 +28,57 @@ pub(crate) struct Depth {
 struct DepthKey {
     slot: u64,
     direction: DepthDirection,
+    action_index: Option<u32>,
 }
 
-pub(crate) struct DepthRecords {
+pub(crate) struct DepthStore {
     max_impact_bps: u64,
     max_depth: BTreeMap<DepthKey, Depth>,
     all_depth: BTreeMap<DepthKey, Vec<Depth>>,
+    intra_block_inspection_enabled: bool,
 }
 
-impl DepthRecords {
-    fn new(max_impact_bps: u64) -> Self {
+impl Depth {
+    pub(crate) fn new(accounts: &[Option<serde_json::Value>], size: u64) -> Option<Self> {
+        let out_amount = accounts.first()?.as_ref().and_then(token_amount)?;
+
+        Some(Self {
+            size,
+            out_amount,
+            price_impact_bps: 0.0,
+        })
+    }
+}
+
+impl DepthStore {
+    pub(crate) fn new(max_impact_bps: u64, intra_block_inspection_enabled: bool) -> Self {
         Self {
             max_impact_bps,
             max_depth: BTreeMap::new(),
             all_depth: BTreeMap::new(),
+            intra_block_inspection_enabled,
         }
     }
 
-    fn add(&mut self, slot: u64, direction: DepthDirection, depth: Depth) {
-        let key = DepthKey { slot, direction };
+    pub(crate) fn add(
+        &mut self,
+        slot: u64,
+        direction: DepthDirection,
+        action_index: u32,
+        depth: Depth,
+    ) {
+        let action_index = if self.intra_block_inspection_enabled {
+            Some(action_index)
+        } else {
+            None
+        };
+
+        let key = DepthKey {
+            slot,
+            direction,
+            action_index,
+        };
+
         let depths = self.all_depth.entry(key).or_default();
         depths.push(depth);
 
@@ -81,17 +115,30 @@ impl DepthRecords {
             self.max_depth.insert(key, best);
         }
     }
-}
 
-impl Depth {
-    pub(crate) fn new(n: &ActionResultNotification, size: u64) -> Option<Self> {
-        let out_amount = n.accounts.first()?.as_ref().and_then(token_amount)?;
+    pub(crate) fn write_output(&self, filename: &str, quote: &str, base: &str) -> Result<()> {
+        let f = std::fs::File::create(filename)?;
+        let mut w = BufWriter::new(f);
+        writeln!(w, "slot,in_mint,size,out_mint,out_amount,price_impact_bps")?;
+        // `max_depth` is ordered by `DepthKey` (slot ascending, then direction), so
+        // rows come out grouped per slot with quote→base before base→quote.
+        for (key, depth) in &self.max_depth {
+            let (in_mint, out_mint) = match key.direction {
+                DepthDirection::QuoteToBase => (quote, base),
+                DepthDirection::BaseToQuote => (base, quote),
+            };
+            writeln!(
+                w,
+                "{},{},{},{},{},{:.2}",
+                key.slot, in_mint, depth.size, out_mint, depth.out_amount, depth.price_impact_bps,
+            )?;
+        }
 
-        Some(Self {
-            size,
-            out_amount,
-            price_impact_bps: 0.0,
-        })
+        eprintln!(
+            "[done] wrote {} depth rows to {filename}",
+            self.max_depth.len(),
+        );
+        Ok(())
     }
 }
 
@@ -101,6 +148,7 @@ impl Depth {
 pub(crate) fn get_depth_actions(
     template: &Template,
     start_size: u64,
+    program_id: Option<Address>,
 ) -> Result<Vec<ScheduledAction>> {
     let Template {
         quote_to_base,
@@ -112,6 +160,14 @@ pub(crate) fn get_depth_actions(
         quote_mint,
         ..
     } = template;
+
+    let anchor = if let Some(program_id) = program_id {
+        ActionAnchor::AfterMatch {
+            filter: DiscoveryFilter::ProgramExecuted(program_id),
+        }
+    } else {
+        ActionAnchor::AfterSlot
+    };
 
     // Pre-fund enough to cover all `ITERATIONS` doublings of start_size
     let max_size = start_size.saturating_mul(1 << ITERATIONS);
@@ -139,7 +195,7 @@ pub(crate) fn get_depth_actions(
         )?)?);
 
         actions.push(ScheduledAction {
-            anchor: ActionAnchor::AfterSlot,
+            anchor: anchor.clone(),
             kind: ActionKind::Simulate,
             transactions: vec![q2b_tx],
             account_overrides: overrides.clone(),
@@ -148,7 +204,7 @@ pub(crate) fn get_depth_actions(
         });
 
         actions.push(ScheduledAction {
-            anchor: ActionAnchor::AfterSlot,
+            anchor: anchor.clone(),
             kind: ActionKind::Simulate,
             transactions: vec![b2q_tx],
             account_overrides: overrides.clone(),
@@ -160,29 +216,4 @@ pub(crate) fn get_depth_actions(
     }
 
     Ok(actions)
-}
-
-pub(crate) fn write_depth_output(
-    filename: &str,
-    records: &DepthRecords,
-    quote: &str,
-    base: &str,
-) -> Result<()> {
-    let f = std::fs::File::create(filename)?;
-    let mut w = BufWriter::new(f);
-    writeln!(w, "slot,in_mint,size,out_mint,out_amount,price_impact_bps")?;
-    // `max_depth` is ordered by `DepthKey` (slot ascending, then direction), so
-    // rows come out grouped per slot with quote→base before base→quote.
-    for (key, depth) in &records.max_depth {
-        let (in_mint, out_mint) = match key.direction {
-            DepthDirection::QuoteToBase => (quote, base),
-            DepthDirection::BaseToQuote => (base, quote),
-        };
-        writeln!(
-            w,
-            "{},{},{},{},{},{:.2}",
-            key.slot, in_mint, depth.size, out_mint, depth.out_amount, depth.price_impact_bps,
-        )?;
-    }
-    Ok(())
 }

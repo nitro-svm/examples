@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use simulator_api::ScheduledAction;
 use simulator_client::{
     ActionResultNotification, ActionSubscriptionHandle, BacktestSession, subscribe_actions,
 };
 use solana_account_decoder::UiAccount;
+use solana_address::Address;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::Template;
+use crate::depth::{Depth, DepthStore, get_depth_actions};
 use crate::resolve_url;
+use crate::spread::{Spread, SpreadStore, get_spread_action};
 
 /// Read the SPL token `amount` from a returned `UiAccount` JSON value — one entry of
 /// [`ActionResultNotification::accounts`]. Deserializes the account envelope and
@@ -88,4 +93,97 @@ pub(crate) async fn subscribe_action_results(
     .await?;
 
     Ok((handle, rx))
+}
+
+pub(crate) struct ActionProcessor {
+    spread_size: u64,
+    depth_min: u64,
+    program_id: Option<Address>,
+    spread_records: SpreadStore,
+    depth_records: DepthStore,
+}
+
+impl ActionProcessor {
+    pub(crate) fn new(
+        spread_size: u64,
+        depth_min: u64,
+        max_impact_bps: u64,
+        program_id: Option<Address>,
+    ) -> Self {
+        let intra_block_inspection_enabled = program_id.is_some();
+
+        Self {
+            spread_size,
+            depth_min,
+            program_id,
+            spread_records: SpreadStore::new(),
+            depth_records: DepthStore::new(max_impact_bps, intra_block_inspection_enabled),
+        }
+    }
+
+    /// Build the spread + depth scheduled actions for this run, borrowing the
+    /// template (the server runs them automatically; no ownership needed here).
+    pub(crate) fn get_actions(&self, template: &Template) -> Result<Vec<ScheduledAction>> {
+        let mut actions = vec![get_spread_action(
+            template,
+            self.spread_size,
+            self.program_id,
+        )?];
+        actions.extend(get_depth_actions(
+            template,
+            self.depth_min,
+            self.program_id,
+        )?);
+        Ok(actions)
+    }
+
+    /// Consume scheduled-action results from the subscription channel until it closes,
+    /// parsing each into spread/depth records. Runs concurrently with the advance loop;
+    /// returns once the subscription's sender is dropped and the channel drains.
+    pub(crate) async fn parse_events(
+        mut self,
+        mut rx: UnboundedReceiver<ActionResultNotification>,
+    ) -> (SpreadStore, DepthStore) {
+        while let Some(notification) = rx.recv().await {
+            let ActionResultNotification {
+                slot,
+                accounts,
+                label,
+                transaction_outcomes,
+                action_index,
+                ..
+            } = notification;
+
+            if transaction_outcomes
+                .first()
+                .is_some_and(|o| o.err.is_some())
+            {
+                eprintln!("Unable to parse action result for slot {slot}");
+                continue;
+            }
+
+            let Some((label, depth_size)) = label.as_deref().and_then(Label::parse) else {
+                continue;
+            };
+
+            match label {
+                Label::Spread => {
+                    if let Some(spread) = Spread::new(slot, &accounts, self.spread_size) {
+                        self.spread_records.push(spread);
+                    } else {
+                        eprintln!("Unable to parse spread notification for slot {slot}");
+                    }
+                }
+                Label::Depth(direction) => {
+                    if let Some(depth) = Depth::new(&accounts, depth_size) {
+                        self.depth_records.add(slot, direction, action_index, depth);
+                    } else {
+                        eprintln!("Unable to parse depth notification for slot {slot}");
+                    }
+                }
+            }
+        }
+
+        (self.spread_records, self.depth_records)
+    }
 }
