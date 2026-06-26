@@ -9,19 +9,17 @@ mod logs;
 mod utils;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    str::FromStr,
     time::Duration,
 };
 
 use anyhow::{Context, Result};
-use solana_pubkey::Pubkey;
-use std::str::FromStr;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::Parser;
 use simulator_client::{BacktestClient, Continue, CreateSession};
-
-use logs::subscribe_logs;
+use solana_pubkey::Pubkey;
 
 // ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -29,7 +27,7 @@ use logs::subscribe_logs;
 #[command(about = "Backtest session example")]
 struct Cli {
     /// Base URL for the backtest endpoint (no scheme).
-    #[arg(long, default_value = "localhost:8900")]
+    #[arg(long, default_value = "staging.simulator.termina.technology")]
     url: String,
 
     /// API key sent as the X-API-Key header on the control WebSocket.
@@ -37,11 +35,11 @@ struct Cli {
     api_key: String,
 
     /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 399_834_992)]
+    #[arg(long, default_value_t = 428_824_220)]
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 399_834_997)]
+    #[arg(long, default_value_t = 428_824_225)]
     end_slot: u64,
 
     /// File to write transaction logs to.
@@ -51,6 +49,10 @@ struct Cli {
     /// Program ID to filter logs on.
     #[arg(long)]
     program_id: Option<String>,
+
+    // /// Account to subscribe to for state-diff notifications.
+    // #[arg(long)]
+    // account: Option<String>,
 
     /// Path to a compiled .so to deploy as PROGRAM_ID before the first slot.
     /// Build with: `solana program dump addr... program.so --url mainnet-beta`
@@ -67,6 +69,53 @@ fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
     }
     let path = endpoint.trim_start_matches('/');
     Ok(format!("{base}/{path}"))
+}
+
+// ── Clock sysvar decoding ────────────────────────────────────────────────────────
+
+/// Decoded fields of the Clock sysvar (40 bytes, all little-endian).
+struct Clock {
+    slot: u64,
+    epoch_start_timestamp: i64,
+    epoch: u64,
+    leader_schedule_epoch: u64,
+    unix_timestamp: i64,
+}
+
+impl std::fmt::Display for Clock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "slot={} epoch={} leader_sched_epoch={} unix_ts={} epoch_start_ts={}",
+            self.slot,
+            self.epoch,
+            self.leader_schedule_epoch,
+            self.unix_timestamp,
+            self.epoch_start_timestamp,
+        )
+    }
+}
+
+/// Decode a Clock from its 40-byte account data.
+fn clock_from_bytes(bytes: &[u8]) -> Option<Clock> {
+    if bytes.len() < 40 {
+        return None;
+    }
+    let at = |o: usize| -> [u8; 8] { bytes[o..o + 8].try_into().unwrap() };
+    Some(Clock {
+        slot: u64::from_le_bytes(at(0)),
+        epoch_start_timestamp: i64::from_le_bytes(at(8)),
+        epoch: u64::from_le_bytes(at(16)),
+        leader_schedule_epoch: u64::from_le_bytes(at(24)),
+        unix_timestamp: i64::from_le_bytes(at(32)),
+    })
+}
+
+/// Decode a Clock out of a `UiAccount` JSON value whose `data` is `[base64, "base64"]`.
+fn clock_from_ui_account(account: &serde_json::Value) -> Option<Clock> {
+    let b64 = account.get("data")?.get(0)?.as_str()?;
+    let bytes = STANDARD.decode(b64).ok()?;
+    clock_from_bytes(&bytes)
 }
 
 // ── Balance change types ───────────────────────────────────────────────────────
@@ -166,71 +215,67 @@ async fn main() -> Result<()> {
     let blockhash = session.rpc().get_latest_blockhash().await?;
     println!("latest blockhash: {blockhash}");
 
-    // ── 3. Subscribe to program logs (if --program-id supplied) ─────────
-    // let stats = Arc::new(Mutex::new(Stats::default()));
-    // let log_task = if let Some(program_id) = &cli.program_id {
-    //     let (handle, stop_tx) = subscribe_logs(
-    //         &rpc_url,
-    //         program_id,
-    //         cli.log_file.clone(),
-    //         Arc::clone(&stats),
-    //     )
-    //     .await?;
-    //     Some((handle, stop_tx))
-    // } else {
-    //     None
-    // };
+    // ── 3. Subscribe to account diffs (if --account supplied) ─────────────────
+    let clock = Pubkey::from_str("SysvarC1ock11111111111111111111111111111111").unwrap();
+    eprintln!("[sub] subscribing to account diffs for {clock}");
+    let handle = session
+        .subscribe_account_diffs(&clock.to_string(), |n| async move {
+            println!(
+                "[diff] context.slot={} account={:?} sig={:?} tx_index={:?} block_time={:?}",
+                n.context.slot, n.account, n.signature, n.tx_index, n.block_time,
+            );
+            if let Some(pre) = &n.pre {
+                match clock_from_ui_account(pre) {
+                    Some(c) => println!("       pre  clock {c}"),
+                    None => println!("       pre={pre}"),
+                }
+            }
+            if let Some(post) = &n.post {
+                match clock_from_ui_account(post) {
+                    Some(c) => println!("       post clock {c}"),
+                    None => println!("       post={post}"),
+                }
+            }
+            println!();
+        })
+        .await?;
 
-    // ── 4. Build program injection (if --program-so supplied) ─────────────────
-    let modifications = match &cli.program_so {
-        Some(path) => {
-            let id = cli.program_id.as_deref().context("--program-so requires --program-id")?;
-            let elf = std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-            eprintln!("[inject] {} bytes from {}", elf.len(), path.display());
-            session.modify_program(id, &elf).await?
+    // tokio::time::sleep(Duration::from_secs(15)).await;
+
+    // ── 5. Advance one slot at a time, dumping the Clock sysvar each step ──────
+    // Stepping one slot per Continue lets us compare the RPC context slot
+    // (get_slot) against the slot embedded in the decoded Clock sysvar, and
+    // line both up against the context.slot on the account-diff notifications.
+    for step in 0..(cli.end_slot - cli.start_slot) {
+        // Inject the program ELF (if any) only on the first step.
+        session
+            .advance(
+                Continue::builder()
+                    .advance_count(1)
+                    .build(),
+                None,
+                |_| {},
+            )
+            .await?;
+
+        let context_slot = session.rpc().get_slot().await?;
+        let acc = session.rpc().get_account(&clock).await;
+        match acc.as_ref().ok().and_then(|a| clock_from_bytes(&a.data)) {
+            Some(c) => println!("[step {step}] get_slot={context_slot} | {c}"),
+            None => println!("[step {step}] get_slot={context_slot} clock_account={acc:?}"),
         }
-        None => BTreeMap::new(),
-    };
-
-    tokio::time::sleep(Duration::from_secs(15)).await;
-
-    // ── 5. Advance through all blocks ─────────────────────────────────────────
-    let addr = Pubkey::from_str("Sett1erwx2eqT5A8uvu8GBxDFT2W5TNnhirL7hLmb8m").unwrap();
-    let acc = session.rpc().get_account(&addr).await;
-    println!("{acc:?}");
-
-    // eprintln!("advancing slots {}..={}", cli.start_slot, cli.end_slot);
-    // session
-    //     .advance(
-    //         Continue::builder()
-    //             .advance_count(cli.end_slot - cli.start_slot + 1)
-    //             .modify_accounts(modifications)
-    //             .build(),
-    //         None,
-    //         |_| {},
-    //     )
-    //     .await?;
-    // eprintln!("all blocks processed");
+        println!();
+    }
+    eprintln!("all blocks processed");
 
     // ── 6. Tear down ──────────────────────────────────────────────────────────
-    // Signal the log task to drain remaining buffered notifications and exit.
-    // Wait for it to finish (all getTransaction calls complete) BEFORE
-    // closing the session, since closing destroys all RPC state.
-    // if let Some((handle, stop_tx)) = log_task {
-    //     stop_tx.send(true).ok();
-    //     eprintln!("[sub] waiting for log task to drain...");
-
-    //     // Keep the control WS alive while waiting by draining any incoming
-    //     // messages. next_event times out after 30s, keeping the loop active.
-    //     let mut handle = handle;
-    //     loop {
-    //         tokio::select! {
-    //             _ = &mut handle => break,
-    //             _ = session.next_event(Some(Duration::from_secs(30))) => {}
-    //         }
-    //     }
-    // }
-    session.close(Some(Duration::from_secs(10))).await?;
+    // Signal the account-diff subscription to drain remaining buffered
+    // notifications, then wait for it to finish BEFORE closing the session,
+    // since closing destroys all RPC state.
+    handle.stop.send(true).ok();
+    eprintln!("[sub] waiting for account-diff task to drain...");
+    handle.join_handle.await.ok();
+    session.close(Some(Duration::from_secs(30))).await?;
 
     // ── 7. Summary ────────────────────────────────────────────────────────────
     // let s = stats.lock().unwrap();
