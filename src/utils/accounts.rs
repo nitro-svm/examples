@@ -57,9 +57,21 @@ pub fn make_token_account(owner: &Address, mint: &str, amount: u64) -> Result<Ac
         data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
         executable: false,
         lamports,
-        owner: TOKEN_PROGRAM.parse()?,
+        owner: TOKEN_PROGRAM.parse().expect("Should parse token program"),
         space: 165,
     })
+}
+
+pub fn make_native_account(amount: u64) -> AccountData {
+    AccountData {
+        data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
+        executable: false,
+        lamports: amount
+            .saturating_add(ATA_RENT_EXEMPT)
+            .saturating_add(FEE_BUFFER),
+        owner: SYSTEM_PROGRAM.parse().expect("Should parse system program"),
+        space: 0,
+    }
 }
 
 async fn set_native_balance(session: &BacktestSession, owner: &Pubkey, amount: u64) -> Result<u64> {
@@ -72,18 +84,7 @@ async fn set_native_balance(session: &BacktestSession, owner: &Pubkey, amount: u
         .map(|a| a.lamports)
         .unwrap_or(0);
 
-    let mods = AccountModifications(BTreeMap::from([(
-        addr,
-        AccountData {
-            data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
-            executable: false,
-            lamports: amount
-                .saturating_add(ATA_RENT_EXEMPT)
-                .saturating_add(FEE_BUFFER),
-            owner: SYSTEM_PROGRAM.parse()?,
-            space: 0,
-        },
-    )]));
+    let mods = AccountModifications(BTreeMap::from([(addr, make_native_account(amount))]));
     modify_with_retry(session, &mods, "modify_accounts (native)").await?;
     Ok(original)
 }
