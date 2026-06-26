@@ -13,12 +13,9 @@ use crate::depth::{Depth, DepthStore, get_depth_actions};
 use crate::resolve_url;
 use crate::spread::{Spread, SpreadStore, get_spread_action};
 
-/// Read the SPL token `amount` from a returned `UiAccount` JSON value — one entry of
-/// [`ActionResultNotification::accounts`]. Deserializes the account envelope and
-/// decodes its data (base64/base58/zstd handled by [`UiAccount`]), then reads the
-/// token `amount` as the little-endian `u64` at the SPL token account's `[64..72]`
-/// byte range. Returns `None` for non-binary encodings (e.g. `jsonParsed`) or a
-/// too-short account.
+/// Read the SPL token `amount` from a returned `UiAccount` JSON value.
+/// Deserializes the account envelope and decodes its data, then reads the
+/// token `amount` at the SPL token account's `[64..72]` byte range.
 pub(crate) fn token_amount(account: &serde_json::Value) -> Option<u64> {
     let data = UiAccount::deserialize(account).ok()?.data.decode()?;
     let amount = data.get(64..72)?;
@@ -27,9 +24,8 @@ pub(crate) fn token_amount(account: &serde_json::Value) -> Option<u64> {
 
 /// Label tagged on the spread [`ScheduledAction`](simulator_api::ScheduledAction).
 pub(crate) const SPREAD_LABEL: &str = "spread";
-/// Prefix for quote→base depth action labels; followed by the sweep size.
+/// Prefixs for depth action labels; followed by the sweep size.
 pub(crate) const DEPTH_Q2B_PREFIX: &str = "depth-q2b-";
-/// Prefix for base→quote depth action labels; followed by the sweep size.
 pub(crate) const DEPTH_B2Q_PREFIX: &str = "depth-b2q-";
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -82,6 +78,7 @@ pub(crate) async fn subscribe_action_results(
         .rpc_endpoint()
         .context("session has no rpc endpoint")?;
     let rpc_url = resolve_url(&format!("https://{}", url), rpc_endpoint);
+    eprintln!("[dbg] rpc_endpoint={rpc_endpoint:?} -> rpc_url={rpc_url}");
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let handle = subscribe_actions(&rpc_url, move |result| {
@@ -124,11 +121,12 @@ impl ActionProcessor {
     /// Build the spread + depth scheduled actions for this run, borrowing the
     /// template (the server runs them automatically; no ownership needed here).
     pub(crate) fn get_actions(&self, template: &Template) -> Result<Vec<ScheduledAction>> {
-        let mut actions = vec![get_spread_action(
-            template,
-            self.spread_size,
-            self.program_id,
-        )?];
+        // let mut actions = vec![get_spread_action(
+        //     template,
+        //     self.spread_size,
+        //     self.program_id,
+        // )?];
+        let mut actions = vec![];
         actions.extend(get_depth_actions(
             template,
             self.depth_min,
@@ -143,8 +141,19 @@ impl ActionProcessor {
     pub(crate) async fn parse_events(
         mut self,
         mut rx: UnboundedReceiver<ActionResultNotification>,
-    ) -> (SpreadStore, DepthStore) {
+    ) -> Self {
+        let mut n_received = 0u64;
         while let Some(notification) = rx.recv().await {
+            n_received += 1;
+            if n_received <= 3 {
+                eprintln!(
+                    "[dbg] notif #{n_received}: slot={} label={:?} accounts={} outcomes={}",
+                    notification.slot,
+                    notification.label,
+                    notification.accounts.len(),
+                    notification.transaction_outcomes.len(),
+                );
+            }
             let ActionResultNotification {
                 slot,
                 accounts,
@@ -168,11 +177,11 @@ impl ActionProcessor {
 
             match label {
                 Label::Spread => {
-                    if let Some(spread) = Spread::new(slot, &accounts, self.spread_size) {
-                        self.spread_records.push(spread);
-                    } else {
-                        eprintln!("Unable to parse spread notification for slot {slot}");
-                    }
+                    // if let Some(spread) = Spread::new(slot, &accounts, self.spread_size) {
+                    //     self.spread_records.push(spread);
+                    // } else {
+                    //     eprintln!("Unable to parse spread notification for slot {slot}");
+                    // }
                 }
                 Label::Depth(direction) => {
                     if let Some(depth) = Depth::new(&accounts, depth_size) {
@@ -184,6 +193,22 @@ impl ActionProcessor {
             }
         }
 
-        (self.spread_records, self.depth_records)
+        eprintln!("[dbg] total notifications received: {n_received}");
+        self
+    }
+
+    pub(crate) fn write_output(
+        &self,
+        spread_file: &str,
+        depth_file: &str,
+        quote_mint: &str,
+        base_mint: &str,
+    ) -> Result<()> {
+        self.spread_records
+            .write_output(spread_file, quote_mint, base_mint)?;
+        self.depth_records
+            .write_output(depth_file, quote_mint, base_mint)?;
+
+        Ok(())
     }
 }

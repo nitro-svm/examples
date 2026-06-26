@@ -38,8 +38,6 @@ mod depth;
 mod spread;
 
 use action::{ActionProcessor, subscribe_action_results};
-use depth::DepthStore;
-use spread::SpreadStore;
 
 #[repr(u8)]
 enum TitanVenueDiscriminant {
@@ -85,7 +83,7 @@ mod titan_template_v3 {
 #[derive(Parser)]
 #[command(about = "Measure spread and depth for a single prop AMM venue across blocks")]
 struct Cli {
-    #[arg(long, default_value = "staging.simulator.termina.technology")]
+    #[arg(long, default_value = "simulator.termina.technology")]
     url: String,
 
     #[arg(long, env = "SIMULATOR_API_KEY")]
@@ -218,13 +216,20 @@ async fn run_session(
     cli: &Cli,
     template: &Template,
     program_id: Option<Address>,
-) -> Result<(SpreadStore, DepthStore)> {
+) -> Result<ActionProcessor> {
     let timeout = Some(Duration::from_secs(120));
     let action_processor = ActionProcessor::new(
         cli.spread_size,
         cli.depth_min,
         cli.max_impact_bps,
         program_id,
+    );
+
+    let actions = action_processor.get_actions(template)?;
+    eprintln!(
+        "[dbg] registering {} actions; first label={:?}",
+        actions.len(),
+        actions.first().and_then(|a| a.label.clone())
     );
 
     let mut session = client
@@ -234,15 +239,19 @@ async fn run_session(
                 .end_slot(cli.end_slot)
                 .disconnect_timeout_secs(900u16)
                 .capacity_wait_timeout_secs(900u16)
-                .actions(action_processor.get_actions(template)?)
+                .actions(actions)
                 .build(),
         )
         .await?;
 
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
 
-    // Subscribe before advancing, then process action results as they stream in,
-    // concurrently with the advance loop.
+    // Subscribe only after the session is ready, but before advancing any slot.
+    // The one-shot `subscribe_actions` has no reconnect, so subscribing before the
+    // data plane is up gets an immediate `subscriptionComplete` and zero results.
+    // sim-cli avoids this by attaching subscriptions to an already-registered
+    // session route; here we wait for `ensure_ready` first. The subscription is
+    // still live before the advance loop, so no action results are missed.
     let (sub, rx) = subscribe_action_results(&session, &cli.url).await?;
     let handle = tokio::spawn(action_processor.parse_events(rx));
 
@@ -266,10 +275,10 @@ async fn run_session(
     // the processor's `recv()` loop after it drains the tail results.
     sub.stop.send(true).ok();
     sub.join_handle.await.ok();
-    let (spread_records, depth_records) = handle.await.context("action processor panicked")?;
+    let action_processor = handle.await.context("action processor panicked")?;
     let _ = session.close(Some(Duration::from_secs(10))).await;
 
-    Ok((spread_records, depth_records))
+    Ok(action_processor)
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -299,10 +308,8 @@ async fn main() -> Result<()> {
         None
     };
 
-    let (spread_records, depth_records) = run_session(client, &cli, &template, program_id).await?;
-    spread_records.write_output(&spread_file, &cli.quote_mint, &cli.base_mint)?;
-
-    depth_records.write_output(&depth_file, &cli.quote_mint, &cli.base_mint)?;
+    let action_processor = run_session(client, &cli, &template, program_id).await?;
+    action_processor.write_output(&spread_file, &depth_file, &cli.quote_mint, &cli.base_mint)?;
 
     Ok(())
 }

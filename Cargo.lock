@@ -3153,6 +3153,7 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 [[package]]
 name = "simulator-api"
 version = "0.11.0"
+source = "git+https://github.com/nitro-svm/nitro-stream?rev=5f1012da5007148520c32bc0f6fd845465c06620#5f1012da5007148520c32bc0f6fd845465c06620"
 dependencies = [
  "base64 0.22.1",
  "bon",
@@ -3168,6 +3169,7 @@ dependencies = [
 [[package]]
 name = "simulator-client"
 version = "0.11.0"
+source = "git+https://github.com/nitro-svm/nitro-stream?rev=5f1012da5007148520c32bc0f6fd845465c06620#5f1012da5007148520c32bc0f6fd845465c06620"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",
