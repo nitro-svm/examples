@@ -8,6 +8,8 @@ use solana_account_decoder::UiAccount;
 use solana_address::Address;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use backtest_example::utils::accounts::native_seed_lamports;
+
 use crate::Template;
 use crate::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
 use crate::resolve_url;
@@ -114,12 +116,11 @@ impl ActionProcessor {
     /// Build the spread + depth scheduled actions for this run, borrowing the
     /// template (the server runs them automatically; no ownership needed here).
     pub(crate) fn get_actions(&self, template: &Template) -> Result<Vec<ScheduledAction>> {
-        // let mut actions = vec![get_spread_action(
-        //     template,
-        //     self.spread_size,
-        //     self.program_id,
-        // )?];
-        let mut actions = vec![];
+        let mut actions = vec![get_spread_action(
+            template,
+            self.spread_size,
+            self.program_id,
+        )?];
         actions.extend(get_depth_actions(
             template,
             self.depth_min,
@@ -156,21 +157,27 @@ impl ActionProcessor {
 
             match label {
                 Label::Spread => {
+                    // Round-trip SOL→USDC→SOL: the final SOL output is unwrapped
+                    // to native lamports on quote_signer, read as a delta over the
+                    // full seeded balance (DEPTH_SIGNER_LAMPORTS + the helper's
+                    // rent/fee padding), so the reading is the SOL out net of fees.
                     let out_amount = accounts
                         .first()
                         .and_then(|a| a.as_ref())
-                        .and_then(token_amount)
+                        .and_then(native_lamports)
+                        .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
                         .unwrap_or(0);
                     let spread = Spread::new(slot, self.spread_size, out_amount);
                     self.spread_records.push(spread);
                 }
-                Label::Depth(direction) => {                    
+                Label::Depth(direction) => {
                     let out_account = accounts.first().and_then(|a| a.as_ref());
                     let out_amount = match direction {
-                        // q2b's SOL output is unwrapped to native SOL and needs to subtract the baseline lamports.
+                        // q2b's SOL output is unwrapped to native SOL; subtract the
+                        // full seeded balance (amount + rent/fee padding), not just the amount.
                         DepthDirection::QuoteToBase => out_account
                             .and_then(native_lamports)
-                            .map(|l| l.saturating_sub(DEPTH_SIGNER_LAMPORTS))
+                            .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
                             .unwrap_or(0),
                         // b2q's USDC output is in a receiver ATA with no baseline balance.
                         DepthDirection::BaseToQuote => {

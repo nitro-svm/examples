@@ -116,8 +116,8 @@ struct Cli {
     #[arg(long, default_value_t = false)]
     measure_depth: bool,
 
-    /// Spread measurement size in quote-mint native units.
-    #[arg(long, default_value_t = 5_000_000_000)]
+    /// Spread measurement size in base native units.
+    #[arg(long, default_value_t = 50_000_000_000)]
     spread_size: u64,
 
     /// Smallest size for the depth sweep (quote-mint native units).

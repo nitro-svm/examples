@@ -18,7 +18,7 @@ use crate::action::{DEPTH_B2Q_PREFIX, DEPTH_Q2B_PREFIX, DepthDirection};
 const ITERATIONS: usize = 15;
 
 /// 1 SOL of headroom seeded into each signer for every depth action.
-/// (Output is `post_lamports - DEPTH_SIGNER_LAMPORTS`). 
+/// (Output is `post_lamports - DEPTH_SIGNER_LAMPORTS`).
 pub(crate) const DEPTH_SIGNER_LAMPORTS: u64 = 1_000_000_000;
 
 #[derive(Clone, Copy)]
@@ -97,7 +97,7 @@ impl DepthStore {
         depths.sort_by_key(|d| d.size);
 
         // Spot rate from the slope between the two smallest fills, not out[0]/size[0].
-        // The SOL leg's carries a constant offset due to rent, and a slope cancels this out. 
+        // The SOL leg's carries a constant offset due to rent, and a slope cancels this out.
         // On a clean leg it equals out[0]/size[0], so this matches the canonical spot there.
         let spot = match (depths.first(), depths.get(1)) {
             (Some(a), Some(b)) if b.size > a.size => {

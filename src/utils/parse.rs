@@ -567,6 +567,97 @@ pub fn patch_titan_template_transaction(
     Ok(new_tx)
 }
 
+/// Overwrite the *static* account key referenced at `position` of the Titan swap
+/// instruction (account ordering: 0=payer, 1=user, 3=input_token_account,
+/// 4=output_token_account, 9=token_ledger, …). Only valid when that position
+/// resolves to a static key used **solely** at that position; the caller must
+/// ensure no aliasing, since overwriting the slot moves every other reference too.
+pub fn repoint_titan_static_account(
+    tx: &VersionedTransaction,
+    position: usize,
+    new_key: Pubkey,
+) -> Result<VersionedTransaction> {
+    let static_keys = tx.message.static_account_keys();
+    let titan_idx = static_keys
+        .iter()
+        .position(|k| k.to_string() == TITAN_PROGRAM)
+        .context("titan program not in static keys")? as u8;
+    let key_idx = match &tx.message {
+        VersionedMessage::Legacy(msg) => ix_acct(&msg.instructions, titan_idx, position),
+        VersionedMessage::V0(msg) => ix_acct(&msg.instructions, titan_idx, position),
+    }
+    .with_context(|| format!("titan ix has no account at position {position}"))?
+        as usize;
+    anyhow::ensure!(
+        key_idx < static_keys.len(),
+        "position {position} resolves to an ALT key (idx {key_idx}); not statically repointable"
+    );
+
+    let mut new_tx = tx.clone();
+    let keys = match &mut new_tx.message {
+        VersionedMessage::Legacy(msg) => &mut msg.account_keys,
+        VersionedMessage::V0(msg) => &mut msg.account_keys,
+    };
+    *keys.get_mut(key_idx).context("key idx out of range")? = new_key;
+    Ok(new_tx)
+}
+
+/// Append `ledger` as a read-only static key and point the Titan swap's
+/// `token_ledger` slot (account position 9) at it, so the swap reads its input
+/// amount from the ledger (`input = balance(tracked) - ledger.amount`) instead
+/// of the `amount` arg.
+///
+/// In our templates that slot shares a key index with the positive-slippage fee
+/// receiver, so it can't be overwritten in place. Instead we push a fresh key at
+/// the end of the static-key region (the read-only non-signer group) and bump
+/// every instruction's ALT-key reference up by one, since the new static key
+/// shifts the resolved ALT indices.
+pub fn add_token_ledger(tx: &VersionedTransaction, ledger: Pubkey) -> Result<VersionedTransaction> {
+    const TOKEN_LEDGER_POSITION: usize = 9;
+    let static_keys = tx.message.static_account_keys();
+    let titan_idx = static_keys
+        .iter()
+        .position(|k| k.to_string() == TITAN_PROGRAM)
+        .context("titan program not in static keys")? as u8;
+    let old_static_len = static_keys.len() as u8;
+
+    let mut new_tx = tx.clone();
+    match &mut new_tx.message {
+        VersionedMessage::V0(msg) => {
+            for ix in &mut msg.instructions {
+                if ix.program_id_index >= old_static_len {
+                    ix.program_id_index += 1;
+                }
+                for a in &mut ix.accounts {
+                    if *a >= old_static_len {
+                        *a += 1;
+                    }
+                }
+            }
+            msg.account_keys.push(ledger);
+            msg.header.num_readonly_unsigned_accounts += 1;
+        }
+        VersionedMessage::Legacy(msg) => {
+            msg.account_keys.push(ledger);
+            msg.header.num_readonly_unsigned_accounts += 1;
+        }
+    }
+
+    let ixs = match &mut new_tx.message {
+        VersionedMessage::Legacy(msg) => &mut msg.instructions,
+        VersionedMessage::V0(msg) => &mut msg.instructions,
+    };
+    let titan_ix = ixs
+        .iter_mut()
+        .find(|ix| ix.program_id_index == titan_idx)
+        .context("titan ix not found")?;
+    *titan_ix
+        .accounts
+        .get_mut(TOKEN_LEDGER_POSITION)
+        .context("titan ix has no token_ledger position")? = old_static_len;
+    Ok(new_tx)
+}
+
 // SwapRouteV3Details event layout (after 8-byte discriminator):
 //   [8..16]  input_amount  (u64 LE)
 //   [16..24] output_amount (u64 LE)
