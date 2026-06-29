@@ -9,7 +9,7 @@ use solana_address::Address;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::Template;
-use crate::depth::{Depth, DepthStore, get_depth_actions};
+use crate::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
 use crate::resolve_url;
 use crate::spread::{Spread, SpreadStore, get_spread_action};
 
@@ -20,6 +20,13 @@ pub(crate) fn token_amount(account: &serde_json::Value) -> Option<u64> {
     let data = UiAccount::deserialize(account).ok()?.data.decode()?;
     let amount = data.get(64..72)?;
     Some(u64::from_le_bytes(amount.try_into().ok()?))
+}
+
+/// Read the native lamport balance from a returned `UiAccount` JSON value. Used
+/// for the SOL output leg: Titan unwraps the WSOL output to native lamports, so
+/// the output lands in the signer's lamports, not an SPL token account.
+pub(crate) fn native_lamports(account: &serde_json::Value) -> Option<u64> {
+    Some(UiAccount::deserialize(account).ok()?.lamports)
 }
 
 /// Label tagged on the spread [`ScheduledAction`](simulator_api::ScheduledAction).
@@ -142,18 +149,7 @@ impl ActionProcessor {
         mut self,
         mut rx: UnboundedReceiver<ActionResultNotification>,
     ) -> Self {
-        let mut n_received = 0u64;
         while let Some(notification) = rx.recv().await {
-            n_received += 1;
-            if n_received <= 3 {
-                eprintln!(
-                    "[dbg] notif #{n_received}: slot={} label={:?} accounts={} outcomes={}",
-                    notification.slot,
-                    notification.label,
-                    notification.accounts.len(),
-                    notification.transaction_outcomes.len(),
-                );
-            }
             let ActionResultNotification {
                 slot,
                 accounts,
@@ -163,11 +159,8 @@ impl ActionProcessor {
                 ..
             } = notification;
 
-            if transaction_outcomes
-                .first()
-                .is_some_and(|o| o.err.is_some())
-            {
-                eprintln!("Unable to parse action result for slot {slot}");
+            if let Some(err) = transaction_outcomes.first().and_then(|o| o.err.as_ref()) {
+                eprintln!("Action transaction failed for slot {slot} (label={label:?}): {err}");
                 continue;
             }
 
@@ -177,23 +170,30 @@ impl ActionProcessor {
 
             match label {
                 Label::Spread => {
-                    // if let Some(spread) = Spread::new(slot, &accounts, self.spread_size) {
-                    //     self.spread_records.push(spread);
-                    // } else {
-                    //     eprintln!("Unable to parse spread notification for slot {slot}");
-                    // }
+                    // let spread = Spread::new(slot, &accounts, self.spread_size);
+                    // self.spread_records.push(spread);
                 }
                 Label::Depth(direction) => {
-                    if let Some(depth) = Depth::new(&accounts, depth_size) {
-                        self.depth_records.add(slot, direction, action_index, depth);
-                    } else {
-                        eprintln!("Unable to parse depth notification for slot {slot}");
-                    }
+                    // The output is returned positionally at index 0. q2b's SOL
+                    // output is unwrapped to native lamports, so read quote_signer's
+                    // lamport delta over the seeded baseline; b2q's USDC output is a
+                    // token balance in the pre-zeroed receiver ATA.
+                    let out_account = accounts.first().and_then(|a| a.as_ref());
+                    let out_amount = match direction {
+                        DepthDirection::QuoteToBase => out_account
+                            .and_then(native_lamports)
+                            .map(|l| l.saturating_sub(DEPTH_SIGNER_LAMPORTS))
+                            .unwrap_or(0),
+                        DepthDirection::BaseToQuote => {
+                            out_account.and_then(token_amount).unwrap_or(0)
+                        }
+                    };
+                    let depth = Depth::new(depth_size, out_amount);
+                    self.depth_records.add(slot, direction, action_index, depth);
                 }
             }
         }
 
-        eprintln!("[dbg] total notifications received: {n_received}");
         self
     }
 

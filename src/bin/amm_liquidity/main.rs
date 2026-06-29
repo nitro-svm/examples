@@ -83,7 +83,7 @@ mod titan_template_v3 {
 #[derive(Parser)]
 #[command(about = "Measure spread and depth for a single prop AMM venue across blocks")]
 struct Cli {
-    #[arg(long, default_value = "simulator.termina.technology")]
+    #[arg(long, default_value = "staging.simulator.termina.technology")]
     url: String,
 
     #[arg(long, env = "SIMULATOR_API_KEY")]
@@ -143,8 +143,8 @@ struct Template {
     base_mint: Address,
     quote_signer: Pubkey,
     base_signer: Pubkey,
-    quote_ata: Pubkey,
-    base_ata: Pubkey,
+    quote_receiver: Pubkey,
+    base_receiver: Pubkey,
 }
 
 async fn get_template(venue_disc: u8) -> Result<Template> {
@@ -152,8 +152,9 @@ async fn get_template(venue_disc: u8) -> Result<Template> {
     let sol_to_usdc = get_titan_template_transaction(titan_template_v3::SOL_TO_USDC).await?;
     let quote_signer = extract_signer(&usdc_to_sol)?;
     let base_signer = extract_signer(&sol_to_usdc)?;
-    let quote_ata = derive_ata(&quote_signer, USDC_MINT).context("derive quote ATA")?;
-    let base_ata = derive_ata(&base_signer, WSOL_MINT).context("derive base ATA")?;
+    let quote_receiver =
+        derive_ata(&quote_signer, WSOL_MINT).context("derive q2b WSOL receiver")?;
+    let base_receiver = derive_ata(&base_signer, USDC_MINT).context("derive b2q USDC receiver")?;
 
     let quote_to_base = patch_titan_single_venue(&usdc_to_sol, venue_disc)?;
     let base_to_quote = patch_titan_single_venue(&sol_to_usdc, venue_disc)?;
@@ -165,8 +166,8 @@ async fn get_template(venue_disc: u8) -> Result<Template> {
         base_mint: Address::from_str_const(WSOL_MINT),
         quote_signer,
         base_signer,
-        quote_ata,
-        base_ata,
+        quote_receiver,
+        base_receiver,
     })
 }
 
@@ -226,11 +227,7 @@ async fn run_session(
     );
 
     let actions = action_processor.get_actions(template)?;
-    eprintln!(
-        "[dbg] registering {} actions; first label={:?}",
-        actions.len(),
-        actions.first().and_then(|a| a.label.clone())
-    );
+    eprintln!("[dbg] registering {} actions", actions.len(),);
 
     let mut session = client
         .create_session(
