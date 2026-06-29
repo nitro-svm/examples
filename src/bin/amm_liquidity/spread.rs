@@ -24,17 +24,7 @@ pub(crate) struct Spread {
 
 impl Spread {
     /// Build a [`Spread`] from a spread action result.
-    pub(crate) fn new(slot: u64, accounts: &[Option<serde_json::Value>], input: u64) -> Self {
-        let output = if let Some(amount) = accounts
-            .first()
-            .and_then(|a| a.as_ref())
-            .and_then(token_amount)
-        {
-            amount
-        } else {
-            0
-        };
-
+    pub(crate) fn new(slot: u64, input: u64, output: u64) -> Self {
         Self {
             slot,
             input_amount: input,

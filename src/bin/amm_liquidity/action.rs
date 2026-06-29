@@ -22,9 +22,7 @@ pub(crate) fn token_amount(account: &serde_json::Value) -> Option<u64> {
     Some(u64::from_le_bytes(amount.try_into().ok()?))
 }
 
-/// Read the native lamport balance from a returned `UiAccount` JSON value. Used
-/// for the SOL output leg: Titan unwraps the WSOL output to native lamports, so
-/// the output lands in the signer's lamports, not an SPL token account.
+/// Read the native lamport balance from a returned `UiAccount` JSON value.
 pub(crate) fn native_lamports(account: &serde_json::Value) -> Option<u64> {
     Some(UiAccount::deserialize(account).ok()?.lamports)
 }
@@ -47,10 +45,6 @@ pub(crate) enum Label {
 }
 
 impl Label {
-    /// Parse an action label. Spread actions are labelled [`SPREAD_LABEL`]; depth
-    /// actions `{DEPTH_Q2B_PREFIX}{size}` / `{DEPTH_B2Q_PREFIX}{size}`, where
-    /// `{size}` is the sweep size. Returns `None` for unknown labels or an
-    /// unparseable size.
     pub(crate) fn parse(name: &str) -> Option<(Self, u64)> {
         if name == SPREAD_LABEL {
             return Some((Self::Spread, 0));
@@ -66,14 +60,6 @@ impl Label {
     }
 }
 
-/// Subscribe to the session's scheduled-action results before advancing.
-///
-/// The server runs the registered actions automatically each slot and streams
-/// the results over `actionSubscribe`; the background task forwards each one over
-/// the returned channel, in arrival order, so the caller can process events as
-/// they stream in. After driving the session, call `handle.stop.send(true)` and
-/// await `handle.join_handle`; that drains in-flight results and drops the sender,
-/// which closes the channel and ends the consumer's `recv()` loop.
 pub(crate) async fn subscribe_action_results(
     session: &BacktestSession,
     url: &str,
@@ -170,20 +156,23 @@ impl ActionProcessor {
 
             match label {
                 Label::Spread => {
-                    // let spread = Spread::new(slot, &accounts, self.spread_size);
-                    // self.spread_records.push(spread);
+                    let out_amount = accounts
+                        .first()
+                        .and_then(|a| a.as_ref())
+                        .and_then(token_amount)
+                        .unwrap_or(0);
+                    let spread = Spread::new(slot, self.spread_size, out_amount);
+                    self.spread_records.push(spread);
                 }
-                Label::Depth(direction) => {
-                    // The output is returned positionally at index 0. q2b's SOL
-                    // output is unwrapped to native lamports, so read quote_signer's
-                    // lamport delta over the seeded baseline; b2q's USDC output is a
-                    // token balance in the pre-zeroed receiver ATA.
+                Label::Depth(direction) => {                    
                     let out_account = accounts.first().and_then(|a| a.as_ref());
                     let out_amount = match direction {
+                        // q2b's SOL output is unwrapped to native SOL and needs to subtract the baseline lamports.
                         DepthDirection::QuoteToBase => out_account
                             .and_then(native_lamports)
                             .map(|l| l.saturating_sub(DEPTH_SIGNER_LAMPORTS))
                             .unwrap_or(0),
+                        // b2q's USDC output is in a receiver ATA with no baseline balance.
                         DepthDirection::BaseToQuote => {
                             out_account.and_then(token_amount).unwrap_or(0)
                         }

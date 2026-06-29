@@ -15,11 +15,10 @@ use backtest_example::utils::parse::{derive_ata, patch_titan_template_transactio
 use crate::Template;
 use crate::action::{DEPTH_B2Q_PREFIX, DEPTH_Q2B_PREFIX, DepthDirection};
 
-const ITERATIONS: usize = 10; // 20;
+const ITERATIONS: usize = 15;
 
-/// Lamports seeded into each signer for every depth action — covers fees/rent
-/// and, for q2b, is the baseline the SOL output lands on top of (the output is
-/// `post_lamports - DEPTH_SIGNER_LAMPORTS`). 1 SOL of headroom.
+/// 1 SOL of headroom seeded into each signer for every depth action.
+/// (Output is `post_lamports - DEPTH_SIGNER_LAMPORTS`). 
 pub(crate) const DEPTH_SIGNER_LAMPORTS: u64 = 1_000_000_000;
 
 #[derive(Clone, Copy)]
@@ -44,10 +43,6 @@ pub(crate) struct DepthStore {
 }
 
 impl Depth {
-    /// Build a depth point from a swap's `size` and decoded `out_amount`. The
-    /// caller decodes the output from the action's return account per direction
-    /// (token balance for the USDC leg, native-lamport delta for the SOL leg),
-    /// since the AMM unwraps WSOL to native lamports on the SOL side.
     pub(crate) fn new(size: u64, out_amount: u64) -> Self {
         Self {
             size,
@@ -101,12 +96,9 @@ impl DepthStore {
         depths.retain(|d| d.out_amount > 0);
         depths.sort_by_key(|d| d.size);
 
-        // Spot rate from the slope between the two smallest fills, not
-        // out[0]/size[0]. The SOL leg's output is read as a native-lamport delta
-        // (it unwraps from WSOL, so it can't be read as a token) and carries a
-        // constant, size-independent offset from swap-internal rent flows. A
-        // slope cancels any such additive offset; on a clean leg it equals
-        // out[0]/size[0], so this matches the canonical spot there.
+        // Spot rate from the slope between the two smallest fills, not out[0]/size[0].
+        // The SOL leg's carries a constant offset due to rent, and a slope cancels this out. 
+        // On a clean leg it equals out[0]/size[0], so this matches the canonical spot there.
         let spot = match (depths.first(), depths.get(1)) {
             (Some(a), Some(b)) if b.size > a.size => {
                 (b.out_amount as f64 - a.out_amount as f64) / (b.size as f64 - a.size as f64)
@@ -195,15 +187,10 @@ pub(crate) fn get_depth_actions(
     let base_mint = &base_mint.to_string();
 
     // Inputs are each signer's ATA for the mint it spends (derived here).
-    //   q2b (USDC→SOL): spend USDC from q2b_input. Titan unwraps the SOL output
-    //     to native lamports (the receiver WSOL ATA reads 0), so the output is
-    //     quote_signer's lamport delta over the seeded baseline — we return
-    //     quote_signer. The reading carries a constant size-independent offset
-    //     from swap-internal rent flows, which the slope-based spot in `flush`
-    //     cancels.
-    //   b2q (SOL→USDC): spend WSOL from b2q_input, receive USDC into
-    //     base_receiver (zeroed first, so its post-balance is the swap output).
+    //   q2b (USDC->SOL): swap USDC from q2b_input to native SOL in q2b_output. (original SOL was `DEPTH_SIGNER_LAMPORTS`)
+    //   b2q (SOL->USDC): swap WSOL from b2q_input ATA to USDC in b2q_output ATA. (original USDC was 0)
     let q2b_input = derive_ata(quote_signer, quote_mint).context("derive q2b USDC input")?;
+    let q2b_output = quote_signer;
     let b2q_input = derive_ata(base_signer, base_mint).context("derive b2q WSOL input")?;
     let b2q_output = base_receiver;
 
@@ -213,7 +200,7 @@ pub(crate) fn get_depth_actions(
             q2b_input,
             make_token_account(quote_signer, quote_mint, max_size)?,
         ),
-        (*quote_signer, make_native_account(DEPTH_SIGNER_LAMPORTS)),
+        (*q2b_output, make_native_account(DEPTH_SIGNER_LAMPORTS)),
     ]));
     let b2q_overrides = AccountModifications(BTreeMap::from([
         (
@@ -221,7 +208,6 @@ pub(crate) fn get_depth_actions(
             make_token_account(base_signer, base_mint, max_size)?,
         ),
         (*b2q_output, make_token_account(base_signer, quote_mint, 0)?),
-        (*base_signer, make_native_account(DEPTH_SIGNER_LAMPORTS)),
     ]));
 
     let mut size = start_size;
@@ -243,7 +229,7 @@ pub(crate) fn get_depth_actions(
             kind: ActionKind::Simulate,
             transactions: vec![q2b_tx],
             account_overrides: q2b_overrides.clone(),
-            return_accounts: vec![*quote_signer],
+            return_accounts: vec![*q2b_output],
             label: Some(format!("{DEPTH_Q2B_PREFIX}{size}")),
         });
 
