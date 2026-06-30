@@ -605,10 +605,12 @@ pub fn repoint_titan_static_account(
 /// so the swap reads its input amount from the ledger (`input = balance(tracked) - ledger.amount`)
 /// instead of the `amount` arg.
 ///
-/// In our template txs, that slot shares a key index with the positive-slippage fee receiver,
-/// so it can't be overwritten in place. Instead we push a fresh key at the end of the static-key region
-/// (the read-only non-signer group) and bump every instruction's ALT-key reference up by one,
-/// since the new static key shifts the resolved ALT indices.
+/// In our template txs, the `token_ledger` slot (and the `positive_slippage_fee_receiver` slot)
+/// are omitted optional accounts, which Anchor encodes by pointing them at the program id.
+/// That placeholder index is the same one the instruction uses as its `program_id_index`,
+/// so it can't be overwritten in place — doing so would also redirect the program reference.
+/// Instead we push a fresh key at the end of the static-key region and bump every instruction's
+/// ALT-key reference up by one, since the new static key shifts the resolved ALT indices.
 pub fn add_token_ledger(tx: &VersionedTransaction, ledger: Pubkey) -> Result<VersionedTransaction> {
     const TOKEN_LEDGER_POSITION: usize = 9;
     let static_keys = tx.message.static_account_keys();
