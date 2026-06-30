@@ -567,11 +567,10 @@ pub fn patch_titan_template_transaction(
     Ok(new_tx)
 }
 
-/// Overwrite the *static* account key referenced at `position` of the Titan swap
-/// instruction (account ordering: 0=payer, 1=user, 3=input_token_account,
-/// 4=output_token_account, 9=token_ledger, …). Only valid when that position
-/// resolves to a static key used **solely** at that position; the caller must
-/// ensure no aliasing, since overwriting the slot moves every other reference too.
+/// Overwrite the *static* account key referenced at `position` of the Titan swap ix.
+/// (account ordering: 0=payer, 1=user, 3=input_token_account, 4=output_token_account, 9=token_ledger, …).
+/// Only valid when that position resolves to a static key used **solely** at that position;
+/// the caller must ensure no aliasing, since overwriting the slot moves every other reference too.
 pub fn repoint_titan_static_account(
     tx: &VersionedTransaction,
     position: usize,
@@ -602,16 +601,14 @@ pub fn repoint_titan_static_account(
     Ok(new_tx)
 }
 
-/// Append `ledger` as a read-only static key and point the Titan swap's
-/// `token_ledger` slot (account position 9) at it, so the swap reads its input
-/// amount from the ledger (`input = balance(tracked) - ledger.amount`) instead
-/// of the `amount` arg.
+/// Append `ledger` as a read-only static key and point the Titan swap's`token_ledger` slot at it,
+/// so the swap reads its input amount from the ledger (`input = balance(tracked) - ledger.amount`)
+/// instead of the `amount` arg.
 ///
-/// In our templates that slot shares a key index with the positive-slippage fee
-/// receiver, so it can't be overwritten in place. Instead we push a fresh key at
-/// the end of the static-key region (the read-only non-signer group) and bump
-/// every instruction's ALT-key reference up by one, since the new static key
-/// shifts the resolved ALT indices.
+/// In our template txs, that slot shares a key index with the positive-slippage fee receiver,
+/// so it can't be overwritten in place. Instead we push a fresh key at the end of the static-key region
+/// (the read-only non-signer group) and bump every instruction's ALT-key reference up by one,
+/// since the new static key shifts the resolved ALT indices.
 pub fn add_token_ledger(tx: &VersionedTransaction, ledger: Pubkey) -> Result<VersionedTransaction> {
     const TOKEN_LEDGER_POSITION: usize = 9;
     let static_keys = tx.message.static_account_keys();

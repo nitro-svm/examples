@@ -82,12 +82,11 @@ impl SpreadStore {
     }
 }
 
-/// Build a round-trip spread action: SOL → USDC → SOL through one venue, in two
-/// threaded transactions. `size` is the SOL input (lamports). Putting USDC in the
-/// middle keeps the intermediate as a real token account (the SOL leg would
-/// otherwise unwrap to native), so a Titan token ledger can carry the dynamic
-/// intermediate amount from hop1 into hop2 — letting hop2's input be exactly
-/// hop1's output without knowing it at registration time.
+/// Build a round-trip action: SOL -> USDC -> SOL through one venue in two txs.
+///
+/// Use SOL -> USDC -> SOL instead of USDC -> SOL -> USDC so that the intermediate
+/// asset is an ATA and can leverage the Titan token ledger.
+/// This allows leg 1's intermediate amount to be used by leg 2 dynamically.
 ///
 ///   hop1 (SOL→USDC): spend `size` WSOL, deposit USDC into `intermediate`.
 ///   hop2 (USDC→SOL): read input = `balance(intermediate) − ledger.amount` (= X)
@@ -101,12 +100,12 @@ pub(crate) fn get_spread_action(
     program_id: Option<Address>,
 ) -> Result<ScheduledAction> {
     let Template {
-        quote_to_base, // USDC→SOL  (hop2)
-        base_to_quote, // SOL→USDC  (hop1)
+        quote_to_base, // (hop2)
+        base_to_quote, // (hop1)
         quote_signer,
         base_signer,
-        quote_mint, // USDC
-        base_mint,  // WSOL
+        quote_mint,
+        base_mint,
         ..
     } = template;
 
@@ -118,26 +117,27 @@ pub(crate) fn get_spread_action(
         ActionAnchor::AfterSlot
     };
 
-    let usdc = &quote_mint.to_string();
-    let wsol = &base_mint.to_string();
+    let quote = &quote_mint.to_string();
+    let base = &base_mint.to_string();
+    let output = quote_signer;
 
     // Intermediate USDC account, shared across hops (hop1 deposits, hop2 spends):
     // quote_signer's USDC ATA, which is already hop2's input account.
-    let intermediate = derive_ata(quote_signer, usdc).context("derive intermediate USDC")?;
+    let intermediate = derive_ata(quote_signer, quote).context("derive intermediate USDC")?;
     // hop1's WSOL input, funded with the swept `size`.
-    let hop1_input = derive_ata(base_signer, wsol).context("derive hop1 WSOL input")?;
+    let input = derive_ata(base_signer, base).context("derive hop1 WSOL input")?;
     // Ledger snapshotting `intermediate` at 0, so hop2's input = what hop1 deposits.
     let titan: Pubkey = TITAN_PROGRAM.parse().context("parse titan program")?;
     let (ledger, _) = Pubkey::find_program_address(&[b"spread-ledger"], &titan);
 
-    // hop1: SOL→USDC, output repointed from base_signer's USDC ATA to `intermediate`.
+    // hop1: SOL -> USDC, output repointed from base_signer's USDC ATA to `intermediate`.
     let hop1 = repoint_titan_static_account(
-        &patch_titan_template_transaction(base_to_quote, hop1_input, size)?,
+        &patch_titan_template_transaction(base_to_quote, input, size)?,
         4, // output_token_account
         intermediate,
     )?;
-    // hop2: USDC→SOL, input = `intermediate`, amount read from the ledger (the 0
-    // here is ignored once a real ledger is supplied).
+    // hop2: USDC→SOL, input read from `intermediate` ledger account
+    // (the 0 here is ignored once a real ledger is supplied).
     let hop2 = add_token_ledger(
         &patch_titan_template_transaction(quote_to_base, intermediate, 0)?,
         ledger,
@@ -149,8 +149,8 @@ pub(crate) fn get_spread_action(
     ];
 
     let account_overrides = AccountModifications(BTreeMap::from([
-        (hop1_input, make_token_account(base_signer, wsol, size)?),
-        (intermediate, make_token_account(quote_signer, usdc, 0)?),
+        (input, make_token_account(base_signer, base, size)?),
+        (intermediate, make_token_account(quote_signer, quote, 0)?),
         (ledger, make_token_ledger_account(&intermediate, 0)),
         (*quote_signer, make_native_account(DEPTH_SIGNER_LAMPORTS)),
     ]));
@@ -160,7 +160,7 @@ pub(crate) fn get_spread_action(
         kind: ActionKind::Simulate,
         transactions,
         account_overrides,
-        return_accounts: vec![*quote_signer],
+        return_accounts: vec![*output],
         label: Some(SPREAD_LABEL.to_string()),
     };
 

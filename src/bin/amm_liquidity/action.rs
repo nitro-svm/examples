@@ -157,10 +157,8 @@ impl ActionProcessor {
 
             match label {
                 Label::Spread => {
-                    // Round-trip SOL→USDC→SOL: the final SOL output is unwrapped
-                    // to native lamports on quote_signer, read as a delta over the
-                    // full seeded balance (DEPTH_SIGNER_LAMPORTS + the helper's
-                    // rent/fee padding), so the reading is the SOL out net of fees.
+                    // Round-trip SOL->USDC->SOL: the final output is unwrapped to native SOL
+                    // (subtract the full seeded balance).
                     let out_amount = accounts
                         .first()
                         .and_then(|a| a.as_ref())
@@ -173,8 +171,8 @@ impl ActionProcessor {
                 Label::Depth(direction) => {
                     let out_account = accounts.first().and_then(|a| a.as_ref());
                     let out_amount = match direction {
-                        // q2b's SOL output is unwrapped to native SOL; subtract the
-                        // full seeded balance (amount + rent/fee padding), not just the amount.
+                        // q2b's SOL output is unwrapped to native SOL
+                        // (subtract the full seeded balance).
                         DepthDirection::QuoteToBase => out_account
                             .and_then(native_lamports)
                             .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
