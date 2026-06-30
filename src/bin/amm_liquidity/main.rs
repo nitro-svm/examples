@@ -22,26 +22,22 @@ use backtest_example::utils::parse::{
     USDC_MINT, WSOL_MINT, derive_ata, extract_signer, get_titan_template_transaction,
     patch_titan_single_venue,
 };
-use backtest_example::utils::types::TxWithMeta;
 
-use std::str::FromStr;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use simulator_api::DiscoveryFilter;
-use simulator_client::{
-    BacktestClient, BacktestSession, Continue, CreateSession, DiscoveryStepResult,
-};
+use simulator_client::{BacktestClient, Continue, CreateSession};
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
+mod action;
 mod depth;
 mod spread;
 
-use depth::{DepthRecord, get_max_depth, write_depth_output};
-use spread::{SpreadRecord, simulate_roundtrip_swap, write_spread_output};
+use action::{ActionProcessor, subscribe_action_results};
 
 #[repr(u8)]
 enum TitanVenueDiscriminant {
@@ -64,14 +60,16 @@ impl TitanVenueDiscriminant {
         }
     }
 
-    fn get_program_id(self) -> &'static str {
-        match self {
+    fn get_program_id(self) -> Address {
+        let program_id = match self {
             Self::ZeroFi => "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",
             Self::HumidiFi => "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp",
             Self::GoonFi => "goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdBUL17BnS5j",
             Self::BisonFi => "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi",
             Self::GoonFiV2 => "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",
-        }
+        };
+
+        Address::from_str_const(program_id)
     }
 }
 
@@ -104,7 +102,7 @@ struct Cli {
     depth_output: String,
 
     #[arg(long, default_value_t = false)]
-    pause_on_upgrade: bool,
+    enable_intra_block_inspection: bool,
 
     #[arg(long, default_value = USDC_MINT)]
     quote_mint: String,
@@ -112,8 +110,14 @@ struct Cli {
     #[arg(long, default_value = WSOL_MINT)]
     base_mint: String,
 
-    /// Spread measurement size in quote-mint native units.
-    #[arg(long, default_value_t = 5_000_000_000)]
+    #[arg(long, default_value_t = false)]
+    measure_spread: bool,
+
+    #[arg(long, default_value_t = false)]
+    measure_depth: bool,
+
+    /// Spread measurement size in base native units.
+    #[arg(long, default_value_t = 50_000_000_000)]
     spread_size: u64,
 
     /// Smallest size for the depth sweep (quote-mint native units).
@@ -139,8 +143,8 @@ struct Template {
     base_mint: Address,
     quote_signer: Pubkey,
     base_signer: Pubkey,
-    quote_ata: Pubkey,
-    base_ata: Pubkey,
+    quote_receiver: Pubkey,
+    base_receiver: Pubkey,
 }
 
 async fn get_template(venue_disc: u8) -> Result<Template> {
@@ -148,8 +152,9 @@ async fn get_template(venue_disc: u8) -> Result<Template> {
     let sol_to_usdc = get_titan_template_transaction(titan_template_v3::SOL_TO_USDC).await?;
     let quote_signer = extract_signer(&usdc_to_sol)?;
     let base_signer = extract_signer(&sol_to_usdc)?;
-    let quote_ata = derive_ata(&quote_signer, USDC_MINT).context("derive quote ATA")?;
-    let base_ata = derive_ata(&base_signer, WSOL_MINT).context("derive base ATA")?;
+    let quote_receiver =
+        derive_ata(&quote_signer, WSOL_MINT).context("derive q2b WSOL receiver")?;
+    let base_receiver = derive_ata(&base_signer, USDC_MINT).context("derive b2q USDC receiver")?;
 
     let quote_to_base = patch_titan_single_venue(&usdc_to_sol, venue_disc)?;
     let base_to_quote = patch_titan_single_venue(&sol_to_usdc, venue_disc)?;
@@ -161,19 +166,24 @@ async fn get_template(venue_disc: u8) -> Result<Template> {
         base_mint: Address::from_str_const(WSOL_MINT),
         quote_signer,
         base_signer,
-        quote_ata,
-        base_ata,
+        quote_receiver,
+        base_receiver,
     })
 }
 
 // ── BPF upgrade detection ─────────────────────────────────────────────────────
 
-const BPF_UPGRADEABLE_LOADER: &str = "BPFLoaderUpgradeab1e11111111111111111111111";
+#[allow(dead_code)]
+static BPF_UPGRADEABLE_LOADER: LazyLock<Pubkey> = LazyLock::new(|| {
+    "BPFLoaderUpgradeab1e11111111111111111111111"
+        .parse()
+        .expect("valid BPF upgradeable loader pubkey")
+});
 
-fn is_program_upgrade(tx: &VersionedTransaction, program_id: &str) -> bool {
+#[allow(dead_code)]
+fn is_program_upgrade(tx: &VersionedTransaction, program_id: &Pubkey) -> bool {
     let keys = tx.message.static_account_keys();
-    let key_str: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
-    let Some(loader_idx) = key_str.iter().position(|k| k == BPF_UPGRADEABLE_LOADER) else {
+    let Some(loader_idx) = keys.iter().position(|k| k == &*BPF_UPGRADEABLE_LOADER) else {
         return false;
     };
     for ix in tx.message.instructions() {
@@ -184,7 +194,7 @@ fn is_program_upgrade(tx: &VersionedTransaction, program_id: &str) -> bool {
             continue;
         }
         if let Some(&prog_idx) = ix.accounts.get(1)
-            && key_str.get(prog_idx as usize).map(|s| s.as_str()) == Some(program_id)
+            && keys.get(prog_idx as usize) == Some(program_id)
         {
             return true;
         }
@@ -194,125 +204,30 @@ fn is_program_upgrade(tx: &VersionedTransaction, program_id: &str) -> bool {
 
 // ── session runners ───────────────────────────────────────────────────────────
 
-struct Measurement {
-    spread: Option<SpreadRecord>,
-    depth: Option<DepthRecord>,
-}
-
-async fn run_measurements(
-    session: &BacktestSession,
-    slot: u64,
-    cli: &Cli,
-    template: &Template,
-) -> Result<Measurement> {
-    // Spread
-    let spread = match simulate_roundtrip_swap(session, cli.spread_size, template).await {
-        Ok(out_amount) => (out_amount > 0).then(|| SpreadRecord {
-            slot,
-            input_amount: cli.spread_size,
-            output_amount: out_amount,
-            spread_bps: (cli.spread_size - out_amount) as f64 / cli.spread_size as f64 * 10_000.0,
-        }),
-        Err(e) => {
-            eprint!("Failed to measure spread: {e}");
-            None
-        }
-    };
-
-    // Depth
-    let depth = match get_max_depth(session, template, cli.depth_min, cli.max_impact_bps).await {
-        Ok((quote_to_base, base_to_quote)) => Some(DepthRecord {
-            slot,
-            quote_to_base,
-            base_to_quote,
-        }),
-        Err(e) => {
-            eprint!("Failed to measure depth: {e}");
-            None
-        }
-    };
-
-    Ok(Measurement { spread, depth })
-}
-
-async fn run_discovery_session(
-    client: BacktestClient,
-    program_addr: Address,
-    cli: &Cli,
-    template: &Template,
-) -> Result<(Vec<SpreadRecord>, Vec<DepthRecord>)> {
-    let mut spread_records = Vec::new();
-    let mut depth_records = Vec::new();
-    let mut pause_count = 0u64;
-    let timeout = Some(Duration::from_secs(120));
-
-    let mut session = client
-        .create_session(
-            CreateSession::builder()
-                .start_slot(cli.start_slot)
-                .end_slot(cli.end_slot)
-                .disconnect_timeout_secs(900u16)
-                .capacity_wait_timeout_secs(900u16)
-                .discoveries(vec![DiscoveryFilter::ProgramExecuted(program_addr)])
-                .build(),
-        )
-        .await?;
-
-    eprintln!("[ws] session: {}", session.session_id().unwrap_or("?"));
-    session.ensure_ready(Some(Duration::from_secs(600))).await?;
-    eprintln!("[ws] ready — scanning for {program_addr} batches");
-
-    loop {
-        match session.advance_to_discovery(timeout).await? {
-            DiscoveryStepResult::Paused(pause) => {
-                pause_count += 1;
-                let slot = pause.paused.slot;
-                let batch = pause.paused.batch_index.unwrap_or(0);
-                eprintln!("[pause #{pause_count}] slot={slot} batch={batch}");
-
-                let txs: Vec<TxWithMeta> = pause
-                    .discovery
-                    .transactions
-                    .iter()
-                    .filter_map(|bin| {
-                        let bytes = bin.decode().ok()?;
-                        bincode::deserialize(&bytes).ok()
-                    })
-                    .collect();
-                if !txs
-                    .iter()
-                    .any(|t| is_program_upgrade(&t.transaction, &program_addr.to_string()))
-                {
-                    continue;
-                }
-
-                match run_measurements(&session, slot, cli, template).await {
-                    Ok(m) => {
-                        spread_records.extend(m.spread);
-                        depth_records.extend(m.depth);
-                    }
-                    Err(e) => eprintln!("[error] slot {slot}: {e:#}"),
-                }
-            }
-            DiscoveryStepResult::Completed => {
-                eprintln!("[done] session completed; total pauses: {pause_count}");
-                break;
-            }
-        }
+/// Resolve a possibly-relative session endpoint against the base HTTP URL.
+fn resolve_url(base: &str, endpoint: &str) -> String {
+    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+        return endpoint.to_string();
     }
-
-    let _ = session.close(Some(Duration::from_secs(10))).await;
-    Ok((spread_records, depth_records))
+    format!("{base}/{}", endpoint.trim_start_matches('/'))
 }
 
-async fn run_regular_session(
+async fn run_session(
     client: BacktestClient,
     cli: &Cli,
     template: &Template,
-) -> Result<(Vec<SpreadRecord>, Vec<DepthRecord>)> {
-    let mut spread_records = Vec::new();
-    let mut depth_records = Vec::new();
+    program_id: Option<Address>,
+) -> Result<ActionProcessor> {
     let timeout = Some(Duration::from_secs(120));
+    let action_processor = ActionProcessor::new(
+        cli.spread_size,
+        cli.depth_min,
+        cli.max_impact_bps,
+        program_id,
+    );
+
+    let actions = action_processor.get_actions(template)?;
+    eprintln!("[dbg] registering {} actions", actions.len(),);
 
     let mut session = client
         .create_session(
@@ -321,37 +236,46 @@ async fn run_regular_session(
                 .end_slot(cli.end_slot)
                 .disconnect_timeout_secs(900u16)
                 .capacity_wait_timeout_secs(900u16)
+                .actions(actions)
                 .build(),
         )
         .await?;
 
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
+
+    // Subscribe only after the session is ready, but before advancing any slot.
+    // The one-shot `subscribe_actions` has no reconnect, so subscribing before the
+    // data plane is up gets an immediate `subscriptionComplete` and zero results.
+    // sim-cli avoids this by attaching subscriptions to an already-registered
+    // session route; here we wait for `ensure_ready` first. The subscription is
+    // still live before the advance loop, so no action results are missed.
+    let (sub, rx) = subscribe_action_results(&session, &cli.url).await?;
+    let handle = tokio::spawn(action_processor.parse_events(rx));
 
     loop {
         let result = session
             .advance(
-                Continue::builder().advance_count(1).build(),
+                Continue::builder()
+                    .advance_count(cli.end_slot - cli.start_slot)
+                    .build(),
                 timeout,
                 |_| {},
             )
             .await?;
-
-        let slot = result.last_slot.unwrap_or(0);
-        match run_measurements(&session, slot, cli, template).await {
-            Ok(m) => {
-                spread_records.extend(m.spread);
-                depth_records.extend(m.depth);
-            }
-            Err(e) => eprintln!("[error] slot {slot}: {e:#}"),
-        }
 
         if result.completed {
             break;
         }
     }
 
+    // Stop the subscription; dropping its sender closes the channel, which ends
+    // the processor's `recv()` loop after it drains the tail results.
+    sub.stop.send(true).ok();
+    sub.join_handle.await.ok();
+    let action_processor = handle.await.context("action processor panicked")?;
     let _ = session.close(Some(Duration::from_secs(10))).await;
-    Ok((spread_records, depth_records))
+
+    Ok(action_processor)
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -375,29 +299,14 @@ async fn main() -> Result<()> {
     let spread_file = cli.spread_output.clone();
     let depth_file = cli.depth_output.clone();
 
-    let (spread_records, depth_records) = if cli.pause_on_upgrade {
-        let program_addr = TitanVenueDiscriminant::from_u8(cli.venue_disciminant)?.get_program_id();
-        run_discovery_session(client, Pubkey::from_str(program_addr)?, &cli, &template).await?
+    let program_id = if cli.enable_intra_block_inspection {
+        Some(TitanVenueDiscriminant::from_u8(cli.venue_disciminant)?.get_program_id())
     } else {
-        run_regular_session(client, &cli, &template).await?
+        None
     };
 
-    write_spread_output(
-        &spread_file,
-        &spread_records,
-        &cli.quote_mint,
-        &cli.base_mint,
-    )?;
-    eprintln!(
-        "[done] wrote {} spread rows to {spread_file}",
-        spread_records.len()
-    );
-
-    write_depth_output(&depth_file, &depth_records, &cli.quote_mint, &cli.base_mint)?;
-    eprintln!(
-        "[done] wrote {} depth rows to {depth_file}",
-        depth_records.len()
-    );
+    let action_processor = run_session(client, &cli, &template, program_id).await?;
+    action_processor.write_output(&spread_file, &depth_file, &cli.quote_mint, &cli.base_mint)?;
 
     Ok(())
 }

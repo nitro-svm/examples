@@ -7,11 +7,35 @@ use simulator_client::BacktestSession;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use super::parse::{TOKEN_PROGRAM, WSOL_MINT, derive_ata};
+use super::parse::{TITAN_PROGRAM, TOKEN_PROGRAM, WSOL_MINT, derive_ata};
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const ATA_RENT_EXEMPT: u64 = 2_039_280;
 const FEE_BUFFER: u64 = 1_000_000;
+
+/// Anchor discriminator of Titan's `TokenLedger` account (sha256("account:TokenLedger")[..8]).
+const TOKEN_LEDGER_DISCRIMINATOR: [u8; 8] = [156, 247, 9, 188, 54, 108, 85, 77];
+/// Rent-exempt minimum for the 48-byte ledger account: (48 + 128) * 6960.
+const LEDGER_RENT_EXEMPT: u64 = 1_224_960;
+
+/// Build a Titan `TokenLedger` account that snapshots `tracked` at `amount`.
+/// Layout: 8-byte discriminator + 32-byte tracked token account + 8-byte u64 amount.
+/// A `swap_route_v3` given this account computes `input = balance(tracked) - amount`,
+/// so pre-seeding `amount = 0` (with `tracked` starting empty) makes the next swap
+/// consume exactly what the previous swap deposited — no runtime amount needed.
+pub fn make_token_ledger_account(tracked: &Address, amount: u64) -> AccountData {
+    let mut data = [0u8; 48];
+    data[0..8].copy_from_slice(&TOKEN_LEDGER_DISCRIMINATOR);
+    data[8..40].copy_from_slice(tracked.as_ref());
+    data[40..48].copy_from_slice(&amount.to_le_bytes());
+    AccountData {
+        data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
+        executable: false,
+        lamports: LEDGER_RENT_EXEMPT,
+        owner: TITAN_PROGRAM.parse().expect("Should parse titan program"),
+        space: 48,
+    }
+}
 
 /// The staging simulator intermittently returns an empty HTTP body (EOF while
 /// decoding), which fails an otherwise-valid `modify_accounts`. Retry with backoff
@@ -57,9 +81,29 @@ pub fn make_token_account(owner: &Address, mint: &str, amount: u64) -> Result<Ac
         data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
         executable: false,
         lamports,
-        owner: TOKEN_PROGRAM.parse()?,
+        owner: TOKEN_PROGRAM.parse().expect("Should parse token program"),
         space: 165,
     })
+}
+
+/// Lamports a [`make_native_account`] seeds for `amount`: the requested amount
+/// plus the rent-exempt minimum and a fee buffer. Reading a native account's
+/// balance back as a swap output must subtract *this*, not just `amount`, or the
+/// padding leaks into the reading as a constant offset.
+pub fn native_seed_lamports(amount: u64) -> u64 {
+    amount
+        .saturating_add(ATA_RENT_EXEMPT)
+        .saturating_add(FEE_BUFFER)
+}
+
+pub fn make_native_account(amount: u64) -> AccountData {
+    AccountData {
+        data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
+        executable: false,
+        lamports: native_seed_lamports(amount),
+        owner: SYSTEM_PROGRAM.parse().expect("Should parse system program"),
+        space: 0,
+    }
 }
 
 async fn set_native_balance(session: &BacktestSession, owner: &Pubkey, amount: u64) -> Result<u64> {
@@ -72,18 +116,7 @@ async fn set_native_balance(session: &BacktestSession, owner: &Pubkey, amount: u
         .map(|a| a.lamports)
         .unwrap_or(0);
 
-    let mods = AccountModifications(BTreeMap::from([(
-        addr,
-        AccountData {
-            data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
-            executable: false,
-            lamports: amount
-                .saturating_add(ATA_RENT_EXEMPT)
-                .saturating_add(FEE_BUFFER),
-            owner: SYSTEM_PROGRAM.parse()?,
-            space: 0,
-        },
-    )]));
+    let mods = AccountModifications(BTreeMap::from([(addr, make_native_account(amount))]));
     modify_with_retry(session, &mods, "modify_accounts (native)").await?;
     Ok(original)
 }
