@@ -1,28 +1,15 @@
 # Regression Tests
 
-Devnet has no liquidity, MEV bots, or account state that programs actually meet, so tests on the
-network have little signal about what an upgrade does to real users.
+Devnet isn't an accurate picture of reality since it lacks the liquidity, MEV bots, or account state that are present on mainnet, so tests on the network don't provide much signal about what logic changes do to real users.
 
-This binary runs an honest test against historical mainnet slots with a custom program
-swapped in for the deployed program. Diff the two runs to compare metrics like transaction success rates and token balance deltas.
+This example can run a baseline as well as an experimental test with custom programs and accounts against the same historical time range. It can copmare the two runs to determine how the changed states affected metrics like transaction success rate and token balances.
 
 ## Output
 
-The output prints success or failure, the error, full logs (to `--log-file`), and token balance deltas for each transaction. 
-It also includes totals, successes, failures, and net token P&L per account, sorted by magnitude.
+The output prints success or failure, the error, full logs (to `--log-file`), and token balance deltas for each transaction.
+It also includes total transactions, successes, failures, and net token P&L per account, sorted by magnitude.
 
 ## Usage
-
-Check which slot ranges are available first.
-```sh
-curl https://staging.simulator.termina.technology/available-ranges | jq
-```
-or
-```sh
-sim ranges
-```
-
-Then run the same slots with the baseline and new build.
 ```sh
 export SIMULATOR_API_KEY=<key>
 cargo run --bin regression_test -- --start-slot 123 --end-slot 456 --log-file baseline.txt

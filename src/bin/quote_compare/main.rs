@@ -185,7 +185,7 @@ async fn main() -> Result<()> {
     let template_txs = get_template_transactions().await?;
 
     loop {
-        match session.advance_to_discovery(timeout).await? {
+        match session.advance_to_discovery(None, timeout).await? {
             DiscoveryStepResult::Paused(pause) => {
                 pause_count += 1;
 
