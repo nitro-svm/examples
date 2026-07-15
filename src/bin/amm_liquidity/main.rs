@@ -110,12 +110,6 @@ struct Cli {
     #[arg(long, default_value = WSOL_MINT)]
     base_mint: String,
 
-    #[arg(long, default_value_t = false)]
-    measure_spread: bool,
-
-    #[arg(long, default_value_t = false)]
-    measure_depth: bool,
-
     /// Spread measurement size in base native units.
     #[arg(long, default_value_t = 50_000_000_000)]
     spread_size: u64,

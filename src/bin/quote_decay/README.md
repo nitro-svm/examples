@@ -1,52 +1,32 @@
 # Measuring Quote Decay
 
-A quote is only good for as long as the state it was priced against stays put. Between the
-moment an aggregator hands you a route and the moment your transaction actually lands, other
-people trade, pools move, and the output you were promised quietly shrinks. That gap is why
-slippage tolerances exist — but "how much slippage should I allow?" is usually answered with
-a guess, because nobody can rerun the same swap against a later block to see what it would
-have paid out.
+A quote is only good for as long as the state it was priced against holds. Between the block a
+quote is calculated and the block it lands in, others trade and the output shrinks. Slippage tolerances
+absorb that gap, but they're usually set by guesswork — a live RPC can't rerun a swap against a
+later block to show what it would really have paid.
 
-That is exactly what this example does. It takes real Jupiter swaps, freezes them, and replays
-each one unchanged against the next 50 slots of chain state. The input amount, the route, the
-signer, everything is held constant — the only thing that varies is *when* the swap lands. The
-resulting curve of output-vs-slot is your quote decay: an empirical, per-pair answer to how
-fast a quote goes stale.
+Real Jupiter swaps are replayed unchanged against the next 50 slots; route, size, and
+signer are held constant, only the landing slot varies. The resulting output-vs-slot curve shows how fast a quote becomes stale for a given pair.
 
-Use it to set slippage tolerances from data rather than folklore, to decide whether a slower
-(cheaper) landing strategy actually costs you anything, or to compare how quickly different
-pairs and route shapes rot.
+## Methodology
 
-## How it works
+**Phase 1 (at `--start-slot`)** — use a `ProgramExecuted` filter on Jupiter V6 to captures the first 5 swaps in the slot: transaction, signer, and the real onchain output.
 
-**Phase 1 — collect (at `--start-slot`).** Open a session with a `ProgramExecuted` discovery
-filter on Jupiter V6 and capture the first 5 swaps in the slot: the transaction itself, its
-signer, and the input/output amounts that really happened on-chain. Those on-chain amounts are
-the baseline every later simulation is compared against.
+**Phase 2 (`start_slot ..= +50`)** — step through the chain slot-by-slot and simulate each captured swap against that slot's historical state. This can be compared against the original baseline.
 
-**Phase 2 — replay (`start_slot ..= start_slot + 50`).** Step forward one slot at a time and,
-at each slot, re-simulate every captured swap against that slot's frozen state, recording the
-output amount. Both sessions are created concurrently so phase 2 is warm the moment phase 1
-finishes.
+Three details keep the replay honest:
 
-A few things the example has to do to make the replay honest, which are worth stealing if you
-write your own:
+- The signer's input balance is set before each simulation and restored after, so swaps always have enough funds and won't cause subsequent transactions to diverge.
+- `min_out` is patched to zero, otherwise the original slippage guard aborts the decayed
+  swaps under measurement.
+- `wSOL` is special-cased in the implementation since the swap can wrap and unwrap to SOL.
 
-- The signer's input balance is set before each simulation and restored afterwards, so a swap
-  never runs short of funds and never contaminates the next one.
-- The transaction's `min_out` is patched to zero. Otherwise the original slippage guard would
-  abort exactly the decayed swaps you're trying to measure.
-- WSOL is handled specially. If the swap wraps its own SOL, native lamports are set and the
-  transaction creates its own ATA; on the output side, `CloseAccount` may not run under
-  simulation, so the code reads the wSOL ATA when the native gain comes back as zero.
-
-## Run it
+## Usage
 
 ```bash
-export SIMULATOR_API_KEY=your-key
+export SIMULATOR_API_KEY=<key>
 cargo run --bin quote_decay -- --start-slot 422818048
 ```
 
-Results go to `results.csv` (`--output`), one row per (swap, slot) with the original on-chain
-output alongside the simulated one, so decay is a subtraction away. Point `--program-id` at a
-different aggregator to measure it instead.
+`results.csv` (`--output`) contains one row per swap + slot, with the original onchain output next to the simulated result.
+Use `--program-id` to test a different aggregator.

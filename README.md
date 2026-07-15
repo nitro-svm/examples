@@ -2,21 +2,20 @@
 
 This repo contains starter code for various use cases of the simulation API.
 
-Every example rests on the same primitive: a backtest session replays historical Solana slots
-and lets you *freeze* the chain at any point, then simulate whatever transactions you like
-against that frozen state. Nothing is committed and nothing costs money, so questions that are
-prohibitively expensive or simply unanswerable on mainnet — what would this AMM have quoted at
-10x the size? would my router have won that trade? does my new bytecode break real traffic? —
-become things you can just measure.
+Every example rests on the same primitive: a backtest session replays historical Solana slots and
+lets you freeze the chain at any point — including partway through a block — then simulate against
+that state with balances and bytecode of your choosing. A live RPC gives you none of those three:
+it only holds current state, has no state-override, and never exposes mid-block. So: what would
+this AMM have quoted at 10x the size? Would my router have won that trade? Does my new bytecode
+break real traffic?
 
 The protocols used are just examples and aren't necessarily reflective of actual integrations.
 
-## [Reconstructing Prop AMM Liquidity Curves](./src/bin/amm_liquidity)
+## [Measuring Prop AMM Spread and Depth](./src/bin/amm_liquidity)
 
-Prop AMMs don't publish an order book or a quote endpoint, so their real spread and depth are
-invisible from the outside. This example sweeps trade sizes through a single venue against
-frozen state — doubling the size each step, in both directions — and reconstructs the venue's
-spread and depth curve slot by slot, without moving the market or spending anything.
+Prop AMMs price dynamically rather than resting orders on a book, so spread and depth have to be
+measured by quoting the venue at a range of sizes. This example sweeps sizes through a single venue
+against frozen state, in both directions, and reports its spread and depth curve slot by slot.
 
 ## [Comparing Aggregator Quotes](./src/bin/quote_compare)
 
