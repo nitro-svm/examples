@@ -108,7 +108,7 @@ async fn collect_swaps(cli: &Cli) -> Result<Vec<OriginalSwap>> {
         if captured.len() >= MAX_SWAPS {
             break;
         }
-        match session.advance_to_discovery(timeout).await? {
+        match session.advance_to_discovery(None, timeout).await? {
             DiscoveryStepResult::Paused(event) => {
                 if event.paused.slot != cli.start_slot {
                     break;

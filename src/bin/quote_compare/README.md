@@ -1,39 +1,23 @@
 # Comparing Aggregator Quotes
 
-Comparing a router's quote today against a Jupiter fill from last week proves nothing. The pools
-moved in between, so the difference is mostly drift. A fair comparison prices both routers against
-the same state: the state immediately before the Jupiter swap executed. It has to be *before*,
-because the swap moves the pools it touches, which would penalize whichever router quotes second.
-No RPC serves that state.
+Comparing a router's quote today against a fill from last week isn't a fair benchmark. An apples-to-apples comparison prices both routers against the same state to measure the output, slippage, and venue splits.
 
-This example pauses the chain there instead. It replays historical slots with a discovery filter on
-Jupiter V6. When a batch containing a Jupiter swap comes up, the simulator stops before any of its
-transactions execute, so reads reflect the chain up to `batch_index - 1`. It then prices a Titan
-transaction for the same pair and input amount, records what each router paid out, and jumps to the
-next matching batch.
+
+## Methodology
+The example replays historical slots with a discovery filter for the specified router's program (by default, this is Jupiter). When a transaction batch containing one of the router's swap occurs, the simulator stops before any of its transactions execute. It then prices a different router's transaction (by default, this is Titan) for the same pair and input amount and records what each router paid out. The simulator then jumps to the next matching batch and repeats.
 
 ## Output
 
-One CSV row per Jupiter swap. Each row records both routers' output and their venue splits, so a gap
-in output can be traced back to the venues where the routes diverged.
-
-`slot, tx_sig, input_mint, output_mint, input_amount, jup_out, jup_quote, jup_venues, titan_out, titan_venues`
-
-## Generalizing the Pause
-
-Quote comparison is one use of the pause. While the simulator is stopped, the chain is frozen.
-`session.rpc()` reads the same account state the pending transactions will see, and
-`session.rpc().simulate_transaction(&tx)` prices any transaction against it — a competing route, a
-backrun, a liquidation. Change the discovery filter's program ID to apply this to another protocol.
+The output is structured as CSV file. Each row records both routers' output and their venue splits, so a gap in output can be traced back to the venues where the routes diverged.
 
 ## Usage
-
-```bash
+```sh
 export SIMULATOR_API_KEY=<key>
 cargo run --bin quote_compare -- --start-slot 417811170 --end-slot 417811175
 ```
 
-Results go to `results.csv` (`--output`); `--program-id` picks the program to pause on (default
-Jupiter V6). Note the Titan side is built by patching a template transaction's input amount, and the
-signer's balance is topped up before each simulation and restored after, so comparisons can't bleed
-into each other.
+Additional Flags:
+- `--output` directs results to the specified file
+- `--program-id` picks the program to pause on (default is Jupiter)
+
+Note the Titan side is built by patching a template transaction's input amount, and the signer's balance is topped up before each simulation and restored after, so comparisons don't affect each other.
