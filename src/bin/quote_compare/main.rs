@@ -1,9 +1,10 @@
-//! Pause before each matching batch and inspect/simulate against frozen chain state.
+//! Compare aggregator quotes head-to-head against identical frozen chain state.
 //!
 //! Creates a backtest session with a `ProgramExecuted` discovery filter for the
 //! Jupiter V6 aggregator (or any program of your choice).  For each matching
 //! batch the simulator pauses immediately before any of its transactions execute,
-//! giving you a window to:
+//! so a competing route can be priced against the exact state the original swap
+//! saw.  The pause gives you a window to:
 //!
 //! - Inspect account state via `session.rpc()` — reads reflect the chain up to
 //!   `batch_index - 1`, so the matched transactions have NOT yet run.
@@ -36,7 +37,7 @@ const USDC_TO_SOL_TEMPLATE: &str =
 // "u6tf2YYLvDyG1HYfBUP9KqssUSZx3hebQMDJYh9Mug9CxDPKzTeNPgaoMZ92VPhwcCuByQqJeKqCTmo3fzgsohc";
 
 #[derive(Parser)]
-#[command(about = "Pause before each discovered batch and inspect frozen chain state")]
+#[command(about = "Compare aggregator quotes against identical frozen chain state")]
 struct Cli {
     /// Simulator base URL (no scheme), e.g. `staging.simulator.example.com`.
     #[arg(long, default_value = "staging.simulator.termina.technology")]
