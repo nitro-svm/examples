@@ -14,8 +14,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 serde_json = "1"
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
-simulator-api = "0.13.0"
-simulator-client = "0.13.1"
+simulator-api = { git = "https://github.com/nitro-svm/nitro-stream", rev = "b7e9480e23deb3ce1145dfa61b30cf139a640a12" }
+simulator-client = { git = "https://github.com/nitro-svm/nitro-stream", rev = "b7e9480e23deb3ce1145dfa61b30cf139a640a12" }
 solana-account-decoder = "4.1.0"
 solana-address = "2.6.0"
 solana-client = "4.1.0"
