@@ -646,8 +646,8 @@ pub fn add_token_ledger(tx: &VersionedTransaction, ledger: Pubkey) -> Result<Ver
             msg.account_keys.push(ledger);
             msg.header.num_readonly_unsigned_accounts += 1;
         }
-        // V1 (SIMD-0385) has no address-table lookups, so the index-bumping this
-        // helper performs does not apply; it also never appears in replayed history.
+        // V1 (SIMD-0385) has no address-table lookups, 
+        // so the index-bumping doesn't apply and wouldn't appear in history.
         VersionedMessage::V1(_) => anyhow::bail!("add_token_ledger: v1 messages unsupported"),
     }
 

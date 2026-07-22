@@ -124,7 +124,10 @@ async fn main() -> Result<()> {
 
     eprintln!("[ws] session: {}", session.session_id().unwrap_or("?"));
 
-    let rpc_endpoint = session.rpc_endpoint().context("no rpc_endpoint")?.to_string();
+    let rpc_endpoint = session
+        .rpc_endpoint()
+        .context("no rpc_endpoint")?
+        .to_string();
     let rpc_url = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
     eprintln!("[ws] rpc_endpoint: {rpc_url}");
 
@@ -192,7 +195,10 @@ async fn main() -> Result<()> {
     })
     .await
     .context("subscribe to reroutes")?;
-    eprintln!("[sub] listening for rerouted swaps touching {}", cli.program_id);
+    eprintln!(
+        "[sub] listening for rerouted swaps touching {}",
+        cli.program_id
+    );
 
     let timeout = Some(Duration::from_secs(120));
     let mut pause_count = 0u64;
@@ -240,7 +246,9 @@ async fn main() -> Result<()> {
                             .context("send tx failed")?;
 
                         applied.store(true, Ordering::Relaxed);
-                        eprintln!("  [applied] parameter change is now live for the rest of the replay");
+                        eprintln!(
+                            "  [applied] parameter change is now live for the rest of the replay"
+                        );
                         break;
                     }
                 }

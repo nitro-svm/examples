@@ -52,6 +52,16 @@ impl Depth {
     }
 }
 
+// `AfterSlot` pairs each transaction 1:1 with a slot; fan the single encoded
+// tx out to one copy per slot so the action fires at all of them.
+fn repeat_per_slot(tx: String) -> Vec<String> {
+    if program_id.is_some() {
+        vec![tx]
+    } else {
+        vec![tx; all_slots.len()]
+    }
+}
+
 impl DepthStore {
     pub(crate) fn new(max_impact_bps: u64, intra_block_inspection_enabled: bool) -> Self {
         Self {
@@ -175,8 +185,8 @@ pub(crate) fn get_depth_actions(
         ..
     } = template;
 
-    // For an `AfterSlot` anchor, `transactions[i]` fires at `slots[i]`, so
-    // reproducing "fire every slot in the replay range" means listing every
+    // For an `AfterSlot` anchor, `transactions[i]` fires at `slots[i]`,
+    // so "fire every slot in the replay range" means listing every
     // slot explicitly, paired with a repeat of the same transaction.
     let all_slots: Vec<u64> = (start_slot..=end_slot).collect();
     let anchor = if let Some(program_id) = program_id {
@@ -217,16 +227,6 @@ pub(crate) fn get_depth_actions(
         ),
         (*b2q_output, make_token_account(base_signer, quote_mint, 0)?),
     ]));
-
-    // `AfterSlot` pairs each transaction 1:1 with a slot; fan the single encoded
-    // tx out to one copy per slot so the action fires at all of them.
-    let repeat_per_slot = |tx: String| -> Vec<String> {
-        if program_id.is_some() {
-            vec![tx]
-        } else {
-            vec![tx; all_slots.len()]
-        }
-    };
 
     let mut size = start_size;
     let mut actions = vec![];

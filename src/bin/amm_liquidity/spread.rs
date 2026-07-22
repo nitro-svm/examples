@@ -113,8 +113,6 @@ pub(crate) fn get_spread_action(
 
     // For an `AfterSlot` anchor, `transactions[i]` fires at `slots[i]`, and a
     // slot repeated across entries collects them, in order, into one sequence.
-    // Repeating each slot once per hop keeps hop1+hop2 firing together, at
-    // every slot in the replay range.
     let anchor = if let Some(program_id) = program_id {
         ActionAnchor::AfterMatch {
             filter: DiscoveryFilter::ProgramExecuted(program_id),
