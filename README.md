@@ -13,7 +13,7 @@ These examples address real use cases and feature requests, but the protocols us
 
 ## [Counterfactual Flow](./src/bin/counterfactual_flow)
 
-Patching and re-simulating a single swap only shows how a change affects transactions already under a venue's control—it says nothing about flow the venue doesn't currently win. This example pauses at a discovered batch to apply a quoting-parameter change against frozen chain state, then measures its effect: every historical taker swap is re-quoted through Metis and simulated in place of the original, so legs touching the venue show whether the change would capture fills that actually went elsewhere.
+When developing a quoting strategy, it's difficult to determine a taker's theoretical size and response to a parameter change. This example reroutes all historical order flow through Jupiter Metis to determine the realized fills that a venue would've captured under various parameter choices, like fees, spread, and oracle bounds.
 
 ## [Measuring Spread and Depth](./src/bin/amm_liquidity)
 
@@ -22,8 +22,7 @@ This example sweeps sizes for the specified pair slot-by-slot and reports the de
 
 ## [Comparing Quotes](./src/bin/quote_compare)
 
-Benchmarking a live quote against a historical fill isn't an apples-to-apples comparison since pools and prices have moved in between. This example pauses the chain immediately before each real Jupiter swap 
-and prices a competing route against the same state, recording what each one would have paid out and the venues that were used.
+Benchmarking a live quote against a historical fill isn't an apples-to-apples comparison since pools and prices have moved in between. This example pauses the chain immediately before each real Jupiter swap and prices a competing route against the same state, recording what each one would have paid out and the venues that were used.
 This is useful for applications evaluating which router to integrate and also allows routing teams to benchmark directly against others or their own past quotes.
 
 ## [Measuring Quote Decay](./src/bin/quote_decay)
