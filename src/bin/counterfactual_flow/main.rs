@@ -9,7 +9,7 @@ use backtest_example::utils::types::TxWithMeta;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -18,13 +18,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_api::DiscoveryFilter;
 use simulator_client::{
-    BacktestClient, CreateSession, DiscoveryStepResult, RerouteLegNotification,
-    RerouteNotification, subscribe_reroutes,
+    BacktestClient, CreateSession, DiscoveryStepResult, RerouteNotification, subscribe_reroutes,
 };
 use solana_address::Address;
 use solana_transaction::versioned::VersionedTransaction;
 
-use crate::discovery::is_program_upgrade;
+use crate::discovery::{contains_venue, is_program_upgrade, resolve_venue_label};
 
 #[derive(Parser)]
 #[command(
@@ -44,22 +43,16 @@ struct Cli {
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 433838453)]
+    #[arg(long, default_value_t = 433838553)]
     end_slot: u64,
 
     /// The venue under test: batches invoking this program pause for inspection
-    /// (to apply the parameter change), and rerouted legs are tailored to fills
-    /// that touch it.
+    /// (to apply the parameter change). Its Jupiter/Metis route label is resolved
+    /// automatically via `program-id-to-label` and used to match rerouted legs,
+    /// since `route_plan`/`route_summary` carry pool addresses and display labels,
+    /// never program ids.
     #[arg(long)]
     program_id: Address,
-}
-
-fn contains_venue(leg: &RerouteLegNotification, program_id: &Address) -> bool {
-    let needle = program_id.to_string();
-    leg.route_plan
-        .as_deref()
-        .is_some_and(|plan| plan.contains(&needle))
-        || leg.route_summary.contains(&needle)
 }
 
 fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
@@ -70,21 +63,24 @@ fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
     Ok(format!("{base}/{path}"))
 }
 
-/// Rerouted-leg counts for one side of the parameter change.
+/// Rerouted-leg counts for the run.
 #[derive(Default)]
-struct Tally {
+struct Summary {
+    // Number of transactions that Metis rerouted to the specified venue.
     txs: AtomicU64,
+    // Number of legs (multiple legs per transactions) rerouted to venue.
     legs: AtomicU64,
-    wins: AtomicU64,
+    // Number of legs where new output > original output.
+    improvements: AtomicU64,
 }
 
-impl Tally {
+impl Summary {
     fn report(&self, label: &str) {
         eprintln!(
             "{label}: transactions={} legs={} legs where metis quoted higher={}",
             self.txs.load(Ordering::Relaxed),
             self.legs.load(Ordering::Relaxed),
-            self.wins.load(Ordering::Relaxed),
+            self.improvements.load(Ordering::Relaxed),
         );
     }
 }
@@ -95,6 +91,9 @@ async fn main() -> Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
+
+    let venue_label = resolve_venue_label(&cli.program_id).await?;
+    eprintln!("[jup] resolved venue label: {venue_label:?}");
 
     let client = BacktestClient::builder()
         .url(format!("wss://{}/backtest", &cli.url))
@@ -125,24 +124,20 @@ async fn main() -> Result<()> {
     let rpc_url = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
     eprintln!("[ws] rpc_endpoint: {rpc_url}");
 
-    session.ensure_ready(Some(Duration::from_secs(120))).await?;
-    eprintln!("[ws] ready — venue={}", cli.program_id);
+    // No `ensure_ready()` here: it would consume the server's one-time `ReadyForContinue`
+    // without replying to it, and `advance_to_discovery` below only sends the `Continue`
+    // that kicks off execution in reaction to seeing that message — leaving the session
+    // stuck waiting on a signal that already came and went.
+    eprintln!("[ws] venue={} venue_label={venue_label:?}", cli.program_id);
 
-    // Set once the parameter change has been applied; every reroute notification
-    // received after that point is tallied separately from the baseline.
-    let applied = Arc::new(AtomicBool::new(false));
-    let before = Arc::new(Tally::default());
-    let after = Arc::new(Tally::default());
+    let summary = Arc::new(Summary::default());
 
-    let applied_cb = applied.clone();
-    let before_cb = before.clone();
-    let after_cb = after.clone();
-    let program_id = cli.program_id;
+    let summary_cb = summary.clone();
+    let venue_label_cb = venue_label.clone();
 
     let sub = subscribe_reroutes(&rpc_url, move |notification| {
-        let applied = applied_cb.clone();
-        let before = before_cb.clone();
-        let after = after_cb.clone();
+        let summary = summary_cb.clone();
+        let venue_label = venue_label_cb.clone();
         async move {
             let RerouteNotification {
                 slot,
@@ -154,18 +149,13 @@ async fn main() -> Result<()> {
 
             let legs: Vec<_> = legs
                 .iter()
-                .filter(|leg| contains_venue(leg, &program_id))
+                .filter(|leg| contains_venue(leg, &venue_label))
                 .collect();
             if legs.is_empty() {
                 return;
             }
 
-            let tally = if applied.load(Ordering::Relaxed) {
-                &after
-            } else {
-                &before
-            };
-            tally.txs.fetch_add(1, Ordering::Relaxed);
+            summary.txs.fetch_add(1, Ordering::Relaxed);
 
             if let Some(err) = &err {
                 eprintln!("[reroute] slot={slot} sig={original_signature} simulation failed: {err}");
@@ -173,12 +163,12 @@ async fn main() -> Result<()> {
             }
 
             for leg in &legs {
-                tally.legs.fetch_add(1, Ordering::Relaxed);
+                summary.legs.fetch_add(1, Ordering::Relaxed);
                 let improvement_bps = (leg.metis_quoted_out as f64 - leg.original_quoted_out as f64)
                     / leg.original_quoted_out as f64
                     * 10_000.0;
                 if leg.metis_quoted_out > leg.original_quoted_out {
-                    tally.wins.fetch_add(1, Ordering::Relaxed);
+                    summary.improvements.fetch_add(1, Ordering::Relaxed);
                 }
                 eprintln!(
                     "[reroute] slot={slot} sig={original_signature} {}->{} amount={} original_out={} metis_out={} ({improvement_bps:+.2} bps) via {}",
@@ -189,10 +179,7 @@ async fn main() -> Result<()> {
     })
     .await
     .context("subscribe to reroutes")?;
-    eprintln!(
-        "[sub] listening for rerouted swaps touching {}",
-        cli.program_id
-    );
+    eprintln!("[sub] listening for rerouted swaps touching \"{venue_label}\"");
 
     let timeout = Some(Duration::from_secs(120));
     let mut pause_count = 0u64;
@@ -206,10 +193,6 @@ async fn main() -> Result<()> {
                 let slot = pause.paused.slot;
                 let batch = pause.paused.batch_index.unwrap_or(0);
                 eprintln!("[pause #{pause_count}] slot={slot} batch={batch}");
-
-                if applied.load(Ordering::Relaxed) {
-                    continue;
-                }
 
                 let txs: Vec<TxWithMeta> = pause
                     .discovery
@@ -239,12 +222,6 @@ async fn main() -> Result<()> {
                             .send_transaction(&custom_upgrade)
                             .await
                             .context("send tx failed")?;
-
-                        applied.store(true, Ordering::Relaxed);
-                        eprintln!(
-                            "  [applied] parameter change is now live for the rest of the replay"
-                        );
-                        break;
                     }
                 }
             }
@@ -270,9 +247,8 @@ async fn main() -> Result<()> {
     let _ = session.close(Some(Duration::from_secs(10))).await;
 
     eprintln!("=== Counterfactual summary (venue={}) ===", cli.program_id);
-    before.report("before parameter change");
-    after.report("after parameter change");
-    // Bare post-change transaction count to stdout so it can be captured/piped.
-    println!("{}", after.txs.load(Ordering::Relaxed));
+    summary.report("rerouted");
+    // Bare transaction count to stdout so it can be captured/piped.
+    println!("{}", summary.txs.load(Ordering::Relaxed));
     Ok(())
 }
