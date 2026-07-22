@@ -2752,9 +2752,9 @@ dependencies = [
 
 [[package]]
 name = "rand"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2e8e8bcc7961af1fdac401278c6a831614941f6164ee3bf4ce61b7edb162207"
+checksum = "c7f5fa3a058cd35567ef9bfa5e75732bee0f9e4c55fa90477bef2dfcdbc4be80"
 dependencies = [
  "chacha20",
  "getrandom 0.4.2",
@@ -3353,8 +3353,9 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simulator-api"
-version = "0.13.0"
-source = "git+https://github.com/nitro-svm/nitro-stream?rev=b7e9480e23deb3ce1145dfa61b30cf139a640a12#b7e9480e23deb3ce1145dfa61b30cf139a640a12"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a997179afb172bba336d6f90461524f284bff37a613dcccb6b929016a897c964"
 dependencies = [
  "base64 0.22.1",
  "bon",
@@ -3369,15 +3370,16 @@ dependencies = [
 
 [[package]]
 name = "simulator-client"
-version = "0.13.0"
-source = "git+https://github.com/nitro-svm/nitro-stream?rev=b7e9480e23deb3ce1145dfa61b30cf139a640a12#b7e9480e23deb3ce1145dfa61b30cf139a640a12"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de017c6f7c119c6d29a56f0676cf98bcea92347128b131404fe0d4b9adbdad41"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",
  "bon",
  "chrono",
  "futures",
- "rand 0.9.5",
+ "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
@@ -5541,7 +5543,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a129d95275ebf4c493ec53bf0f8cd95f5ac161bc4f381700809a54f595d4470"
 dependencies = [
  "pin-project-lite",
- "rand 0.10.1",
+ "rand 0.10.2",
  "tokio",
 ]
 

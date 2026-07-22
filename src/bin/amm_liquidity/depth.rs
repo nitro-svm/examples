@@ -161,6 +161,8 @@ pub(crate) fn get_depth_actions(
     template: &Template,
     start_size: u64,
     program_id: Option<Address>,
+    start_slot: u64,
+    end_slot: u64,
 ) -> Result<Vec<ScheduledAction>> {
     let Template {
         quote_to_base,
@@ -173,12 +175,18 @@ pub(crate) fn get_depth_actions(
         ..
     } = template;
 
+    // For an `AfterSlot` anchor, `transactions[i]` fires at `slots[i]`, so
+    // reproducing "fire every slot in the replay range" means listing every
+    // slot explicitly, paired with a repeat of the same transaction.
+    let all_slots: Vec<u64> = (start_slot..=end_slot).collect();
     let anchor = if let Some(program_id) = program_id {
         ActionAnchor::AfterMatch {
             filter: DiscoveryFilter::ProgramExecuted(program_id),
         }
     } else {
-        ActionAnchor::AfterSlot
+        ActionAnchor::AfterSlot {
+            slots: all_slots.clone(),
+        }
     };
 
     // Pre-fund enough to cover all `ITERATIONS` doublings of start_size
@@ -210,6 +218,16 @@ pub(crate) fn get_depth_actions(
         (*b2q_output, make_token_account(base_signer, quote_mint, 0)?),
     ]));
 
+    // `AfterSlot` pairs each transaction 1:1 with a slot; fan the single encoded
+    // tx out to one copy per slot so the action fires at all of them.
+    let repeat_per_slot = |tx: String| -> Vec<String> {
+        if program_id.is_some() {
+            vec![tx]
+        } else {
+            vec![tx; all_slots.len()]
+        }
+    };
+
     let mut size = start_size;
     let mut actions = vec![];
     for _ in 0..ITERATIONS {
@@ -227,7 +245,7 @@ pub(crate) fn get_depth_actions(
         actions.push(ScheduledAction {
             anchor: anchor.clone(),
             kind: ActionKind::Simulate,
-            transactions: vec![q2b_tx],
+            transactions: repeat_per_slot(q2b_tx),
             account_overrides: q2b_overrides.clone(),
             return_accounts: vec![*q2b_output],
             label: Some(format!("{DEPTH_Q2B_PREFIX}{size}")),
@@ -236,7 +254,7 @@ pub(crate) fn get_depth_actions(
         actions.push(ScheduledAction {
             anchor: anchor.clone(),
             kind: ActionKind::Simulate,
-            transactions: vec![b2q_tx],
+            transactions: repeat_per_slot(b2q_tx),
             account_overrides: b2q_overrides.clone(),
             return_accounts: vec![*b2q_output],
             label: Some(format!("{DEPTH_B2Q_PREFIX}{size}")),

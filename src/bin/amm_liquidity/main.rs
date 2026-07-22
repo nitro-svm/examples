@@ -220,7 +220,7 @@ async fn run_session(
         program_id,
     );
 
-    let actions = action_processor.get_actions(template)?;
+    let actions = action_processor.get_actions(template, cli.start_slot, cli.end_slot)?;
     eprintln!("[dbg] registering {} actions", actions.len(),);
 
     let mut session = client
