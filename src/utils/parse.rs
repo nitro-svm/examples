@@ -163,7 +163,7 @@ pub fn patch_titan_single_venue(
     let new_ixs = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => &mut msg.instructions,
         VersionedMessage::V0(msg) => &mut msg.instructions,
-        VersionedMessage::V1(_) => anyhow::bail!("V1 messages are not supported"),
+        VersionedMessage::V1(msg) => &mut msg.instructions,
     };
     new_ixs[titan_ix_pos].data = new_data;
     new_ixs[titan_ix_pos].accounts = new_accounts;
@@ -390,7 +390,7 @@ pub fn patch_jup_min_out(tx: &VersionedTransaction) -> VersionedTransaction {
     let ixs = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => &mut msg.instructions,
         VersionedMessage::V0(msg) => &mut msg.instructions,
-        VersionedMessage::V1(_) => unreachable!("V1 messages are not supported"),
+        VersionedMessage::V1(msg) => &mut msg.instructions,
     };
 
     for ix in ixs.iter_mut().filter(|ix| ix.program_id_index == jup_idx) {
@@ -537,7 +537,7 @@ pub fn patch_titan_template_transaction(
     let in_ata_key_idx = match &tx.message {
         VersionedMessage::Legacy(msg) => ix_acct(&msg.instructions, titan_idx, 3),
         VersionedMessage::V0(msg) => ix_acct(&msg.instructions, titan_idx, 3),
-        VersionedMessage::V1(_) => anyhow::bail!("V1 messages are not supported"),
+        VersionedMessage::V1(msg) => ix_acct(&msg.instructions, titan_idx, 3),
     }
     .context("could not find in_ata in titan ix")? as usize;
 
@@ -545,7 +545,7 @@ pub fn patch_titan_template_transaction(
     let (keys, ixs) = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => (&mut msg.account_keys, &mut msg.instructions),
         VersionedMessage::V0(msg) => (&mut msg.account_keys, &mut msg.instructions),
-        VersionedMessage::V1(_) => anyhow::bail!("V1 messages are not supported"),
+        VersionedMessage::V1(msg) => (&mut msg.account_keys, &mut msg.instructions),
     };
 
     *keys
@@ -588,7 +588,7 @@ pub fn repoint_titan_static_account(
     let key_idx = match &tx.message {
         VersionedMessage::Legacy(msg) => ix_acct(&msg.instructions, titan_idx, position),
         VersionedMessage::V0(msg) => ix_acct(&msg.instructions, titan_idx, position),
-        VersionedMessage::V1(_) => anyhow::bail!("V1 messages are not supported"),
+        VersionedMessage::V1(msg) => ix_acct(&msg.instructions, titan_idx, position),
     }
     .with_context(|| format!("titan ix has no account at position {position}"))?
         as usize;
@@ -601,7 +601,7 @@ pub fn repoint_titan_static_account(
     let keys = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => &mut msg.account_keys,
         VersionedMessage::V0(msg) => &mut msg.account_keys,
-        VersionedMessage::V1(_) => anyhow::bail!("V1 messages are not supported"),
+        VersionedMessage::V1(msg) => &mut msg.account_keys,
     };
     *keys.get_mut(key_idx).context("key idx out of range")? = new_key;
     Ok(new_tx)
@@ -646,13 +646,15 @@ pub fn add_token_ledger(tx: &VersionedTransaction, ledger: Pubkey) -> Result<Ver
             msg.account_keys.push(ledger);
             msg.header.num_readonly_unsigned_accounts += 1;
         }
-        VersionedMessage::V1(_) => anyhow::bail!("V1 messages are not supported"),
+        // V1 (SIMD-0385) has no address-table lookups,
+        // so the index-bumping doesn't apply and wouldn't appear in history.
+        VersionedMessage::V1(_) => anyhow::bail!("add_token_ledger: v1 messages unsupported"),
     }
 
     let ixs = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => &mut msg.instructions,
         VersionedMessage::V0(msg) => &mut msg.instructions,
-        VersionedMessage::V1(_) => anyhow::bail!("V1 messages are not supported"),
+        VersionedMessage::V1(msg) => &mut msg.instructions,
     };
     let titan_ix = ixs
         .iter_mut()

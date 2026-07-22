@@ -11,6 +11,10 @@ that state with arbitrary balances and bytecode. They answer question such as:
 
 These examples address real use cases and feature requests, but the protocols used are just placeholders and don't represent actual customers.
 
+## [Counterfactual Flow](./src/bin/counterfactual_flow)
+
+When developing a quoting strategy, it's difficult to determine a taker's theoretical size and response to a parameter change. This example reroutes all historical order flow through Jupiter Metis to determine the realized fills that a venue would've captured under various parameter choices, like fees, spread, and oracle bounds.
+
 ## [Measuring Spread and Depth](./src/bin/amm_liquidity)
 
 Prop AMMs price dynamically via a liquidity curve rather than resting orders on a book, so spread and depth can only be measured by quoting the venue at a range of sizes. 
@@ -18,8 +22,7 @@ This example sweeps sizes for the specified pair slot-by-slot and reports the de
 
 ## [Comparing Quotes](./src/bin/quote_compare)
 
-Benchmarking a live quote against a historical fill isn't an apples-to-apples comparison since pools and prices have moved in between. This example pauses the chain immediately before each real Jupiter swap 
-and prices a competing route against the same state, recording what each one would have paid out and the venues that were used.
+Benchmarking a live quote against a historical fill isn't an apples-to-apples comparison since pools and prices have moved in between. This example pauses the chain immediately before each real Jupiter swap and prices a competing route against the same state, recording what each one would have paid out and the venues that were used.
 This is useful for applications evaluating which router to integrate and also allows routing teams to benchmark directly against others or their own past quotes.
 
 ## [Measuring Quote Decay](./src/bin/quote_decay)
@@ -28,7 +31,7 @@ There's always latency between quote and execution, but for a retail user swappi
 This example captures swaps for the specified router and replays each one against the next 50 slots to calculate empirically how fast output decays with landing latency.
 This helps applications gauge the router with the most stable routes, and for routers to understand which venues have the most stable quotes.
 
-## [Regression Tests](./src/bin/regression_test)
+## [Capture Regressions](./src/bin/regression_test)
 
 Devnet doesn't reveal what a program upgrade does to real users. This example replays historical
 mainnet slots with custom program logic, runs the real transactions from those blocks against it, and reports every failure, log line, and token balance change--a regression suite whose inputs are real mainnet traffic.

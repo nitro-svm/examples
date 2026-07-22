@@ -115,16 +115,27 @@ impl ActionProcessor {
 
     /// Build the spread + depth scheduled actions for this run, borrowing the
     /// template (the server runs them automatically; no ownership needed here).
-    pub(crate) fn get_actions(&self, template: &Template) -> Result<Vec<ScheduledAction>> {
+    /// `start_slot`/`end_slot` bound the `AfterSlot`-anchored actions, which must
+    /// enumerate every slot they should fire at.
+    pub(crate) fn get_actions(
+        &self,
+        template: &Template,
+        start_slot: u64,
+        end_slot: u64,
+    ) -> Result<Vec<ScheduledAction>> {
         let mut actions = vec![get_spread_action(
             template,
             self.spread_size,
             self.program_id,
+            start_slot,
+            end_slot,
         )?];
         actions.extend(get_depth_actions(
             template,
             self.depth_min,
             self.program_id,
+            start_slot,
+            end_slot,
         )?);
         Ok(actions)
     }

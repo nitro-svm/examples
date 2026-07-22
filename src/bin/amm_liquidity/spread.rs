@@ -98,6 +98,8 @@ pub(crate) fn get_spread_action(
     template: &Template,
     size: u64,
     program_id: Option<Address>,
+    start_slot: u64,
+    end_slot: u64,
 ) -> Result<ScheduledAction> {
     let Template {
         quote_to_base, // (hop2)
@@ -109,12 +111,17 @@ pub(crate) fn get_spread_action(
         ..
     } = template;
 
+    // For an `AfterSlot` anchor, `transactions[i]` fires at `slots[i]`, and a
+    // slot repeated across entries collects them, in order, into one sequence.
     let anchor = if let Some(program_id) = program_id {
         ActionAnchor::AfterMatch {
             filter: DiscoveryFilter::ProgramExecuted(program_id),
         }
     } else {
-        ActionAnchor::AfterSlot
+        let slots = (start_slot..=end_slot)
+            .flat_map(|slot| [slot, slot])
+            .collect();
+        ActionAnchor::AfterSlot { slots }
     };
 
     let quote = &quote_mint.to_string();
@@ -143,10 +150,15 @@ pub(crate) fn get_spread_action(
         ledger,
     )?;
 
-    let transactions = vec![
-        STANDARD.encode(bincode::serialize(&hop1)?),
-        STANDARD.encode(bincode::serialize(&hop2)?),
-    ];
+    let hop1 = STANDARD.encode(bincode::serialize(&hop1)?);
+    let hop2 = STANDARD.encode(bincode::serialize(&hop2)?);
+    let transactions = if program_id.is_some() {
+        vec![hop1, hop2]
+    } else {
+        (start_slot..=end_slot)
+            .flat_map(|_| [hop1.clone(), hop2.clone()])
+            .collect()
+    };
 
     let account_overrides = AccountModifications(BTreeMap::from([
         (input, make_token_account(base_signer, base, size)?),
