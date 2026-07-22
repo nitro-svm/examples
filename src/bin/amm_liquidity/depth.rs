@@ -52,13 +52,13 @@ impl Depth {
     }
 }
 
-// `AfterSlot` pairs each transaction 1:1 with a slot; fan the single encoded
-// tx out to one copy per slot so the action fires at all of them.
-fn repeat_per_slot(tx: String) -> Vec<String> {
+// `AfterSlot` pairs each transaction 1:1 with a slot;
+// fan the single tx to one copy per slot so the action fires at all of them.
+fn repeat_per_slot(tx: String, program_id: Option<Address>, slot_count: usize) -> Vec<String> {
     if program_id.is_some() {
         vec![tx]
     } else {
-        vec![tx; all_slots.len()]
+        vec![tx; slot_count]
     }
 }
 
@@ -245,7 +245,7 @@ pub(crate) fn get_depth_actions(
         actions.push(ScheduledAction {
             anchor: anchor.clone(),
             kind: ActionKind::Simulate,
-            transactions: repeat_per_slot(q2b_tx),
+            transactions: repeat_per_slot(q2b_tx, program_id, all_slots.len()),
             account_overrides: q2b_overrides.clone(),
             return_accounts: vec![*q2b_output],
             label: Some(format!("{DEPTH_Q2B_PREFIX}{size}")),
@@ -254,7 +254,7 @@ pub(crate) fn get_depth_actions(
         actions.push(ScheduledAction {
             anchor: anchor.clone(),
             kind: ActionKind::Simulate,
-            transactions: repeat_per_slot(b2q_tx),
+            transactions: repeat_per_slot(b2q_tx, program_id, all_slots.len()),
             account_overrides: b2q_overrides.clone(),
             return_accounts: vec![*b2q_output],
             label: Some(format!("{DEPTH_B2Q_PREFIX}{size}")),
