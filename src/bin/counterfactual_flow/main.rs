@@ -1,8 +1,6 @@
-//! Pause at each batch that invokes the venue under test, apply a custom
-//! quoting-parameter change against the frozen chain state, then measure its
-//! effect on taker flow: every historical swap is re-quoted through Metis
-//! (simulated only, never committed), so legs touching the venue show whether
-//! the change would win more fills than it did originally.
+//! Apply a custom parameter change to a venue and measure its effect on taker flow:
+//! every historical swap is requoted through Jupiter Metis (simulated only, never committed),
+//! so legs touching the venue show whether the change would capture more fills than it did originally.
 
 mod discovery;
 
@@ -30,7 +28,7 @@ use crate::discovery::is_program_upgrade;
 
 #[derive(Parser)]
 #[command(
-    about = "Apply a quoting-parameter change at a discovered batch, then measure its effect on taker flow via Metis rerouting"
+    about = "Apply a quoting change at a discovered batch and measure its effect on taker flow via Metis rerouting"
 )]
 struct Cli {
     /// Simulator base URL (no scheme), e.g. `staging.simulator.example.com`.
@@ -56,10 +54,7 @@ struct Cli {
     program_id: Address,
 }
 
-/// Whether Metis's chosen route for `leg` touches `program_id`. `route_plan` is the raw
-/// per-hop JSON (pool addresses, not necessarily program ids), so this also falls back to
-/// a substring match against the human-readable `route_summary`.
-fn leg_touches_venue(leg: &RerouteLegNotification, program_id: &Address) -> bool {
+fn contains_venue(leg: &RerouteLegNotification, program_id: &Address) -> bool {
     let needle = program_id.to_string();
     leg.route_plan
         .as_deref()
@@ -67,7 +62,6 @@ fn leg_touches_venue(leg: &RerouteLegNotification, program_id: &Address) -> bool
         || leg.route_summary.contains(&needle)
 }
 
-/// If `endpoint` is a relative path, resolve it against `base`.
 fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
     if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
         return Ok(endpoint.to_string());
@@ -160,7 +154,7 @@ async fn main() -> Result<()> {
 
             let legs: Vec<_> = legs
                 .iter()
-                .filter(|leg| leg_touches_venue(leg, &program_id))
+                .filter(|leg| contains_venue(leg, &program_id))
                 .collect();
             if legs.is_empty() {
                 return;
@@ -204,6 +198,7 @@ async fn main() -> Result<()> {
     let mut pause_count = 0u64;
 
     loop {
+        // NOTE: if updates are frequent, this can also happen via WS instead of RPC.
         match session.advance_to_discovery(Some(1), timeout).await? {
             DiscoveryStepResult::Paused(pause) => {
                 pause_count += 1;
@@ -237,7 +232,7 @@ async fn main() -> Result<()> {
                     if is_program_upgrade(tx_with_meta) {
                         eprintln!("  [upgrade] sig={signature}");
 
-                        // TODO: replace with the custom quoting-parameter update.
+                        // TODO: replace with the custom parameter update.
                         let custom_upgrade = VersionedTransaction::default();
                         session
                             .rpc()

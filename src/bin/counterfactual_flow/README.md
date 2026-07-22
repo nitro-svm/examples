@@ -1,6 +1,6 @@
 # Counterfactual Flow
 
-This example updates a venue's quoting strategy by applying a parameter change, then measures its effect on taker flow. Every historical swap is re-quoted through Jupiter Metis, so new routes reveal whether the venue's parameter change would've captured fills that were routed elsewhere historically.
+This example updates a venue's quoting strategy by applying a parameter change, then measures its effect on taker flow. Every historical swap is requoted through Jupiter Metis, so new routes reveal whether the venue's parameter change would've captured fills that were routed elsewhere historically.
 
 ## Methodology
 
