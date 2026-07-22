@@ -11,9 +11,9 @@ that state with arbitrary balances and bytecode. They answer question such as:
 
 These examples address real use cases and feature requests, but the protocols used are just placeholders and don't represent actual customers.
 
-## [Rerouting Order Flow](./src/bin/reroute_liquidity)
+## [Counterfactual Flow](./src/bin/counterfactual_flow)
 
-Patching and re-simulating a single swap only shows how a change affects transactions already under a router's control—it says nothing about flow it doesn't currently win. This example extracts the intent behind every historical taker swap, re-quotes it through Metis, and simulates the result to see whether an updated quoting strategy would capture fills that actually went elsewhere.
+Patching and re-simulating a single swap only shows how a change affects transactions already under a venue's control—it says nothing about flow the venue doesn't currently win. This example pauses at a discovered batch to apply a quoting-parameter change against frozen chain state, then measures its effect: every historical taker swap is re-quoted through Metis and simulated in place of the original, so legs touching the venue show whether the change would capture fills that actually went elsewhere.
 
 ## [Measuring Spread and Depth](./src/bin/amm_liquidity)
 

@@ -1,14 +1,12 @@
-# Rerouting Order Flow
+# Counterfactual Flow
 
-Patching and re-simulating a single swap only shows how a change affects transactions already under a router's control—it says nothing about flow it doesn't currently win. This example reroutes all historical taker flow through Metis, revealing whether an updated quoting strategy would capture fills that actually went elsewhere.
+Patching and re-simulating a single swap only shows how a change affects transactions already under a venue's control—it says nothing about flow the venue doesn't currently win. This example applies a quoting-parameter change to a venue mid-replay, then measures its effect on taker flow: every historical swap is re-quoted through Metis (simulated only, never committed), so legs touching the venue reveal whether the change would capture fills that actually went elsewhere.
 
 ## Methodology
 
-With `--reroute-metis`, the session extracts the underlying intent from every historical taker swap (e.g. "10 SOL -> USDC" or "$1K USDT -> USD1"), submits it to Jupiter Metis for a fresh quote, and simulates the resulting route in place of the original one. Metis may route the same intent through different venues than the original transaction did, which lets a venue estimate how many fills it would win from Metis under a new quoting strategy. The simulation is never committed, so the replay itself is unaffected, but simulated swaps compose within a block.
+The session registers a `ProgramExecuted` discovery filter on `--program-id`—the venue under test—and pauses immediately before each batch that invokes it, via `advance_to_discovery`. Once the batch containing the intended trigger transaction (a BPF Loader `Upgrade`, by default; see `discovery.rs`) is found, the example sends a custom transaction against the frozen chain state through `session.rpc()`. This is where the actual quoting-parameter change belongs—the shipped example only wires up the trigger and leaves the transaction itself as a `TODO`.
 
-Results are read from `rerouteSubscribe`, a per-swap stream delivered alongside the replay. Each notification carries, per leg: the original quoted output, Metis's quoted output for the same intent, and the route Metis chose. Where available, it also carries the realized output of both the original and rerouted transaction after execution. The session summary additionally reports a server-side funnel—how many detected swaps were re-quoted, simulated, and executed without reverting.
-
-`--program-id` names the venue under evaluation—an AMM or pool program, not Jupiter's own aggregator address. When set, every count is tailored to legs whose Metis-chosen route touched that venue, answering "how many fills would this venue win under Metis." Omit it to see every rerouted leg regardless of venue.
+Concurrently, `reroute_order_flow` is enabled for the whole session, so every historical taker swap is re-quoted through Metis and the routed transaction is simulated in place of the original—never committed, so the replay itself is unaffected. Results stream in over `rerouteSubscribe`: each notification carries, per leg, the original quoted output, Metis's quoted output for the same intent, and the route Metis chose. Legs are kept only when Metis's route touches `--program-id`, and are tallied separately depending on whether the parameter change has been applied yet, so the two tallies printed at the end are a direct before/after comparison for that venue.
 
 ## Usage
 
@@ -17,8 +15,7 @@ export SIMULATOR_API_KEY=<key>
 cargo run --bin counterfactual_flow -- \
   --start-slot 433838452 \
   --end-slot 433838453 \
-  --reroute-metis \
-  --program-id <venue>
+  --program-id <venue program id>
 ```
 
-Per-swap comparisons are printed to stderr; the (venue-filtered, if `--program-id` is set) count of rerouted transactions is printed to stdout so it can be captured/piped. Running without `--reroute-metis` replays the range with rerouting disabled, so nothing is reported.
+Per-leg comparisons are printed to stderr, tagged `before`/`after` the parameter change; the post-change transaction count is printed to stdout so it can be captured/piped.
