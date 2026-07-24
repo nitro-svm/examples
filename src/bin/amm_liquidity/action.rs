@@ -9,9 +9,9 @@ use solana_address::Address;
 
 use backtest_example::utils::{accounts::native_seed_lamports, types::TitanVenueDiscriminant};
 
-use crate::Template;
 use super::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
 use super::spread::{Spread, SpreadStore, get_spread_action};
+use crate::Template;
 
 /// Read the SPL token `amount` from a returned `UiAccount` JSON value.
 pub(crate) fn token_amount(account: &serde_json::Value) -> Option<u64> {
@@ -90,6 +90,8 @@ pub(crate) struct VenueProcessor {
     template: Template,
     spread_records: SpreadStore,
     depth_records: DepthStore,
+    start_slot: u64,
+    end_slot: u64,
 }
 
 impl VenueProcessor {
@@ -105,6 +107,8 @@ impl VenueProcessor {
         depth_file: &str,
         quote_mint: &str,
         base_mint: &str,
+        start_slot: u64,
+        end_slot: u64,
     ) -> Result<Self> {
         let intra_block_inspection_enabled = program_id.is_some();
 
@@ -122,6 +126,8 @@ impl VenueProcessor {
                 quote_mint,
                 base_mint,
             )?,
+            start_slot,
+            end_slot,
         })
     }
 
@@ -132,6 +138,8 @@ impl VenueProcessor {
         //     self.spread_size,
         //     self.program_id,
         //     self.venue,
+        //     self.start_slot,
+        //     self.end_slot,
         // )?];
         let mut actions = vec![];
         actions.extend(get_depth_actions(
@@ -139,6 +147,8 @@ impl VenueProcessor {
             self.depth_min,
             self.program_id,
             self.venue,
+            self.start_slot,
+            self.end_slot,
         )?);
         Ok(actions)
     }

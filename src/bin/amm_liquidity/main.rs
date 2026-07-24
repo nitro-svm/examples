@@ -31,8 +31,9 @@ use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
 use backtest_example::utils::parse::{
-    USDC_MINT, USDT_MINT, SPCX_MINT, WSOL_MINT, derive_ata, extract_signer, get_titan_template_transaction,
-    patch_titan_disable_positive_slippage_fee, patch_titan_single_venue,
+    SPCX_MINT, USDC_MINT, USDT_MINT, WSOL_MINT, derive_ata, extract_signer,
+    get_titan_template_transaction, patch_titan_disable_positive_slippage_fee,
+    patch_titan_single_venue,
 };
 use backtest_example::utils::types::TitanVenueDiscriminant;
 
@@ -44,7 +45,7 @@ mod template;
 use action::{ActionCoordinator, VenueProcessor};
 use template::{
     titan_goonfiv2_sol_usdt_template_v3, titan_multi_sol_usdc_template_v3,
-    titan_tessera_sol_usdc_template_v3, titan_multi_spcx_usdc_template_v3,
+    titan_multi_spcx_usdc_template_v3, titan_tessera_sol_usdc_template_v3,
 };
 
 // ── configuration ──────────────────────────────────────────────────────────────
@@ -336,6 +337,8 @@ pub async fn run_measurement(config: &MeasurementConfig) -> Result<()> {
             &depth_file,
             &config.quote_mint,
             &config.base_mint,
+            config.start_slot,
+            config.end_slot,
         )?);
     }
 

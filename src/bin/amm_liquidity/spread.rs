@@ -11,16 +11,18 @@ use simulator_api::{
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use backtest_example::utils::types::TitanVenueDiscriminant;
-use backtest_example::utils::accounts::{make_native_account, make_token_account, make_token_ledger_account};
+use backtest_example::utils::accounts::{
+    make_native_account, make_token_account, make_token_ledger_account,
+};
 use backtest_example::utils::parse::{
     TITAN_PROGRAM, add_token_ledger, derive_ata, patch_titan_template_transaction,
     repoint_titan_static_account,
 };
+use backtest_example::utils::types::TitanVenueDiscriminant;
 
-use crate::Template;
 use super::action::spread_label;
 use super::depth::DEPTH_SIGNER_LAMPORTS;
+use crate::Template;
 
 pub(crate) struct Spread {
     slot: u64,
@@ -109,11 +111,14 @@ impl SpreadStore {
 ///
 /// Final SOL (`Y`) is quote_signer's lamport delta over the seeded baseline;
 /// spread = (size − Y) / size.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn get_spread_action(
     template: &Template,
     size: u64,
     program_id: Option<Address>,
     venue: TitanVenueDiscriminant,
+    start_slot: u64,
+    end_slot: u64,
 ) -> Result<ScheduledAction> {
     let Template {
         quote_to_base, // (hop2)

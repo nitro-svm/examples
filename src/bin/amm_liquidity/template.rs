@@ -13,11 +13,15 @@ pub mod titan_tessera_sol_usdc_template_v3 {
 }
 
 pub mod titan_goonfiv2_sol_usdt_template_v3 {
-    pub const SOL_TO_USDT: &str = "5ZNEJNHj7EHySJUJHKYEZ1bD3rvWF5U7AeubXqkbqvfRnCZGkBqWwPzJMEuih2xseTxbAeEDi92QBdoDdNaiscXG";
-    pub const USDT_TO_SOL: &str = "AVYYrRD92px9EdBWhngi3bitQUcMPA1T5JcTSTWQjQpGhMZKacC6XfSg3iQcs3LMY4CqrQjP8eyVjViW8KmQrKu";
+    pub const SOL_TO_USDT: &str =
+        "5ZNEJNHj7EHySJUJHKYEZ1bD3rvWF5U7AeubXqkbqvfRnCZGkBqWwPzJMEuih2xseTxbAeEDi92QBdoDdNaiscXG";
+    pub const USDT_TO_SOL: &str =
+        "AVYYrRD92px9EdBWhngi3bitQUcMPA1T5JcTSTWQjQpGhMZKacC6XfSg3iQcs3LMY4CqrQjP8eyVjViW8KmQrKu";
 }
 
 pub mod titan_multi_spcx_usdc_template_v3 {
-    pub const SPCX_TO_USDC: &str = "hZT8W3nNyyLQfwx4GhepshRb8Bort9Ttuy12xFVYvS2vLCykm5aHiUsBdFPnWSiBX9p83fKnyT9MTw4KMNbTeVp";
-    pub const USDC_TO_SPCX: &str = "2De5pexxd7LzdG46G35ThMMmMeuBGdQiXEiJFC3K8tA6UvbYcjGK4dAVjnHa7uJRYy8SSRtmsafmAg4dY2x25Xm3";
+    pub const SPCX_TO_USDC: &str =
+        "hZT8W3nNyyLQfwx4GhepshRb8Bort9Ttuy12xFVYvS2vLCykm5aHiUsBdFPnWSiBX9p83fKnyT9MTw4KMNbTeVp";
+    pub const USDC_TO_SPCX: &str =
+        "2De5pexxd7LzdG46G35ThMMmMeuBGdQiXEiJFC3K8tA6UvbYcjGK4dAVjnHa7uJRYy8SSRtmsafmAg4dY2x25Xm3";
 }

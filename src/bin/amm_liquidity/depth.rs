@@ -10,12 +10,12 @@ use simulator_api::{
 };
 use solana_address::Address;
 
-use backtest_example::utils::types::TitanVenueDiscriminant;
 use backtest_example::utils::accounts::{make_native_account, make_token_account};
 use backtest_example::utils::parse::{derive_ata, patch_titan_template_transaction};
+use backtest_example::utils::types::TitanVenueDiscriminant;
 
-use crate::Template;
 use super::action::{DepthDirection, depth_b2q_label, depth_q2b_label};
+use crate::Template;
 
 const ITERATIONS: usize = 12;
 
@@ -192,11 +192,14 @@ impl DepthStore {
 /// Geometric sweep of sizes through a single-venue template.
 /// Doubles size each step, for up to `ITERATIONS` iterations.
 /// Price impact is relative to the spot rate implied by the first (smallest) step.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn get_depth_actions(
     template: &Template,
     start_size: u64,
     program_id: Option<Address>,
     venue: TitanVenueDiscriminant,
+    start_slot: u64,
+    end_slot: u64,
 ) -> Result<Vec<ScheduledAction>> {
     let Template {
         quote_to_base,

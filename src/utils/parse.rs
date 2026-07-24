@@ -41,7 +41,7 @@ fn skip_venue_extra(disc: u8, data: &[u8], pos: &mut usize) -> Result<()> {
         // 1 extra byte (bool / u8 field)
         1 | 2 | 5 | 7 | 11 | 14 | 16 | 17 | 18 | 20 | 22 | 23 | 25 | 27 | 30 | 31 | 32 | 37
         | 39 | 43 | 44 | 45 | 49 | 52 | 54 | 55 | 57 | 58 | 60 | 63 | 64 | 65 | 68 | 69 | 71
-        | 72 => 1,
+        | 72 | 73 => 1,
         13 => 8,           // ZeroFi: expected_amount_out u64
         26 | 35 | 42 => 2, // ExponentAmm / GoonFi / Hylo
         28 => 9,           // HumidiFi: is_quote_to_base(1) + swap_id(8)
@@ -205,6 +205,7 @@ pub fn patch_titan_disable_positive_slippage_fee(
     let ixs = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => &mut msg.instructions,
         VersionedMessage::V0(msg) => &mut msg.instructions,
+        VersionedMessage::V1(msg) => &mut msg.instructions,
     };
     let titan_ix = ixs
         .iter_mut()
@@ -585,6 +586,7 @@ pub fn repoint_titan_account_via_new_key(
     let num_readonly = match &tx.message {
         VersionedMessage::Legacy(msg) => msg.header.num_readonly_unsigned_accounts,
         VersionedMessage::V0(msg) => msg.header.num_readonly_unsigned_accounts,
+        VersionedMessage::V1(msg) => msg.header.num_readonly_unsigned_accounts,
     };
     let insert_idx = static_keys.len() as u8 - num_readonly;
 
@@ -592,6 +594,7 @@ pub fn repoint_titan_account_via_new_key(
     let (keys, ixs) = match &mut new_tx.message {
         VersionedMessage::Legacy(msg) => (&mut msg.account_keys, &mut msg.instructions),
         VersionedMessage::V0(msg) => (&mut msg.account_keys, &mut msg.instructions),
+        VersionedMessage::V1(msg) => (&mut msg.account_keys, &mut msg.instructions),
     };
     keys.insert(insert_idx as usize, key);
     for ix in ixs.iter_mut() {
