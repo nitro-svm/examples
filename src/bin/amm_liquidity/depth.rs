@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufWriter, Write as _};
 
 use anyhow::{Context, Result};
@@ -9,23 +10,29 @@ use simulator_api::{
 };
 use solana_address::Address;
 
-use backtest_example::utils::accounts::{make_native_account, make_token_account};
-use backtest_example::utils::parse::{derive_ata, patch_titan_template_transaction};
+use crate::amm_liquidity::TitanVenueDiscriminant;
+use crate::utils::accounts::{make_native_account, make_token_account};
+use crate::utils::parse::{derive_ata, patch_titan_template_transaction};
 
-use crate::Template;
-use crate::action::{DEPTH_B2Q_PREFIX, DEPTH_Q2B_PREFIX, DepthDirection};
+use super::Template;
+use super::action::{DepthDirection, depth_b2q_label, depth_q2b_label};
 
-const ITERATIONS: usize = 15;
+const ITERATIONS: usize = 12;
 
 /// 1 SOL of headroom seeded into each signer for every depth action.
 /// (Output is `post_lamports - DEPTH_SIGNER_LAMPORTS`).
 pub(crate) const DEPTH_SIGNER_LAMPORTS: u64 = 1_000_000_000;
 
+const SOL_PRICE_USDC: u64 = 70;
+
+fn usdc_native_to_wsol_native(usdc_native: u64) -> u64 {
+    usdc_native.saturating_mul(1000) / SOL_PRICE_USDC
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct Depth {
     size: u64,
     out_amount: u64,
-    price_impact_bps: f64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -35,20 +42,24 @@ struct DepthKey {
     action_index: Option<u32>,
 }
 
+/// Accumulates the geometric sweep per (slot, direction) until it is complete,
+/// then streams the single best-depth row to a CSV. Only the in-flight sweeps
+/// are held in memory; finished rows are flushed immediately, so a long session
+/// doesn't retain every result.
 pub(crate) struct DepthStore {
     max_impact_bps: u64,
-    max_depth: BTreeMap<DepthKey, Depth>,
     all_depth: BTreeMap<DepthKey, Vec<Depth>>,
     intra_block_inspection_enabled: bool,
+    writer: BufWriter<File>,
+    filename: String,
+    quote_mint: String,
+    base_mint: String,
+    count: usize,
 }
 
 impl Depth {
     pub(crate) fn new(size: u64, out_amount: u64) -> Self {
-        Self {
-            size,
-            out_amount,
-            price_impact_bps: 0.0,
-        }
+        Self { size, out_amount }
     }
 }
 
@@ -63,13 +74,29 @@ fn repeat_per_slot(tx: String, program_id: Option<Address>, slot_count: usize) -
 }
 
 impl DepthStore {
-    pub(crate) fn new(max_impact_bps: u64, intra_block_inspection_enabled: bool) -> Self {
-        Self {
+    pub(crate) fn new(
+        max_impact_bps: u64,
+        intra_block_inspection_enabled: bool,
+        filename: &str,
+        quote_mint: &str,
+        base_mint: &str,
+    ) -> Result<Self> {
+        let mut writer = BufWriter::new(File::create(filename)?);
+        writeln!(
+            writer,
+            "slot,in_mint,size,out_mint,out_amount,price_impact_bps"
+        )?;
+        writer.flush()?;
+        Ok(Self {
             max_impact_bps,
-            max_depth: BTreeMap::new(),
             all_depth: BTreeMap::new(),
             intra_block_inspection_enabled,
-        }
+            writer,
+            filename: filename.to_string(),
+            quote_mint: quote_mint.to_string(),
+            base_mint: base_mint.to_string(),
+            count: 0,
+        })
     }
 
     pub(crate) fn add(
@@ -78,7 +105,7 @@ impl DepthStore {
         direction: DepthDirection,
         action_index: u32,
         depth: Depth,
-    ) {
+    ) -> Result<()> {
         let action_index = if self.intra_block_inspection_enabled {
             Some(action_index)
         } else {
@@ -95,30 +122,34 @@ impl DepthStore {
         depths.push(depth);
 
         if depths.len() == ITERATIONS {
-            self.flush(key);
+            self.flush(key)?;
         }
+        Ok(())
     }
 
-    fn flush(&mut self, key: DepthKey) {
+    /// Aggregate a completed sweep and write it out immediately.
+    fn flush(&mut self, key: DepthKey) -> Result<()> {
         let Some(mut depths) = self.all_depth.remove(&key) else {
-            return;
+            return Ok(());
         };
         depths.retain(|d| d.out_amount > 0);
         depths.sort_by_key(|d| d.size);
 
-        // Spot rate from the slope between the two smallest fills, not out[0]/size[0].
-        // The SOL leg's carries a constant offset due to rent, and a slope cancels this out.
-        // On a clean leg it equals out[0]/size[0], so this matches the canonical spot there.
-        let spot = match (depths.first(), depths.get(1)) {
-            (Some(a), Some(b)) if b.size > a.size => {
-                (b.out_amount as f64 - a.out_amount as f64) / (b.size as f64 - a.size as f64)
-            }
-            // Only one usable fill: fall back to its average rate.
-            (Some(a), _) => a.out_amount as f64 / a.size as f64,
-            _ => return,
+        // Spot rate anchored at the smallest fill's average rate, so impact is
+        // relative to the best sampled price and the first point is 0 by construction.
+        let spot = match depths.first() {
+            Some(a) => a.out_amount as f64 / a.size as f64,
+            _ => return Ok(()),
         };
 
-        let mut best: Option<Depth> = None;
+        let (in_mint, out_mint) = match key.direction {
+            DepthDirection::QuoteToBase => (&self.quote_mint, &self.base_mint),
+            DepthDirection::BaseToQuote => (&self.base_mint, &self.quote_mint),
+        };
+
+        // Emit every point of the sweep so the full liquidity curve is visible, up to the
+        // first size whose price impact exceeds `max_impact_bps` (past that the venue is
+        // effectively out of liquidity for this direction).
         for d in depths {
             let expected = spot * d.size as f64;
             let price_impact_bps = (expected - d.out_amount as f64) / expected * 10_000.0;
@@ -127,38 +158,32 @@ impl DepthStore {
                 break;
             }
 
-            best = Some(Depth {
-                price_impact_bps,
-                ..d
-            });
+            writeln!(
+                self.writer,
+                "{},{},{},{},{},{:.2}",
+                key.slot,
+                in_mint,
+                d.size,
+                out_mint,
+                d.out_amount,
+                price_impact_bps.max(0.0),
+            )?;
+            self.count += 1;
         }
-
-        if let Some(best) = best {
-            self.max_depth.insert(key, best);
-        }
+        self.writer.flush()?;
+        Ok(())
     }
 
-    pub(crate) fn write_output(&self, filename: &str, quote: &str, base: &str) -> Result<()> {
-        let f = std::fs::File::create(filename)?;
-        let mut w = BufWriter::new(f);
-        writeln!(w, "slot,in_mint,size,out_mint,out_amount,price_impact_bps")?;
-        // `max_depth` is ordered by `DepthKey` (slot ascending, then direction), so
-        // rows come out grouped per slot with quote→base before base→quote.
-        for (key, depth) in &self.max_depth {
-            let (in_mint, out_mint) = match key.direction {
-                DepthDirection::QuoteToBase => (quote, base),
-                DepthDirection::BaseToQuote => (base, quote),
-            };
-            writeln!(
-                w,
-                "{},{},{},{},{},{:.2}",
-                key.slot, in_mint, depth.size, out_mint, depth.out_amount, depth.price_impact_bps,
-            )?;
+    pub(crate) fn finish(mut self) -> Result<()> {
+        // Flush incomplete sweeps (e.g. a size failed mid-sweep) so the
+        // successful smaller fills still make it into the CSV.
+        for key in self.all_depth.keys().copied().collect::<Vec<_>>() {
+            self.flush(key)?;
         }
-
+        self.writer.flush()?;
         eprintln!(
-            "[done] wrote {} depth rows to {filename}",
-            self.max_depth.len(),
+            "[done] wrote {} depth rows to {}",
+            self.count, self.filename
         );
         Ok(())
     }
@@ -171,8 +196,7 @@ pub(crate) fn get_depth_actions(
     template: &Template,
     start_size: u64,
     program_id: Option<Address>,
-    start_slot: u64,
-    end_slot: u64,
+    venue: TitanVenueDiscriminant,
 ) -> Result<Vec<ScheduledAction>> {
     let Template {
         quote_to_base,
@@ -199,8 +223,14 @@ pub(crate) fn get_depth_actions(
         }
     };
 
-    // Pre-fund enough to cover all `ITERATIONS` doublings of start_size
-    let max_size = start_size.saturating_mul(1 << ITERATIONS);
+    // q2b sweeps USDC-native sizes; b2q sweeps the WSOL-native amount of equal
+    // USD value so both directions trade the same notional at each step.
+    let q2b_start = start_size;
+    let b2q_start = usdc_native_to_wsol_native(start_size);
+
+    // Pre-fund enough to cover all `ITERATIONS` doublings of each leg's start size.
+    let q2b_max = q2b_start.saturating_mul(1 << ITERATIONS);
+    let b2q_max = b2q_start.saturating_mul(1 << ITERATIONS);
     let quote_mint = &quote_mint.to_string();
     let base_mint = &base_mint.to_string();
 
@@ -216,30 +246,31 @@ pub(crate) fn get_depth_actions(
     let q2b_overrides = AccountModifications(BTreeMap::from([
         (
             q2b_input,
-            make_token_account(quote_signer, quote_mint, max_size)?,
+            make_token_account(quote_signer, quote_mint, q2b_max)?,
         ),
         (*q2b_output, make_native_account(DEPTH_SIGNER_LAMPORTS)),
     ]));
     let b2q_overrides = AccountModifications(BTreeMap::from([
         (
             b2q_input,
-            make_token_account(base_signer, base_mint, max_size)?,
+            make_token_account(base_signer, base_mint, b2q_max)?,
         ),
         (*b2q_output, make_token_account(base_signer, quote_mint, 0)?),
     ]));
 
-    let mut size = start_size;
+    let mut q2b_size = q2b_start;
+    let mut b2q_size = b2q_start;
     let mut actions = vec![];
     for _ in 0..ITERATIONS {
         let q2b_tx = STANDARD.encode(bincode::serialize(&patch_titan_template_transaction(
             quote_to_base,
             q2b_input,
-            size,
+            q2b_size,
         )?)?);
         let b2q_tx = STANDARD.encode(bincode::serialize(&patch_titan_template_transaction(
             base_to_quote,
             b2q_input,
-            size,
+            b2q_size,
         )?)?);
 
         actions.push(ScheduledAction {
@@ -248,7 +279,7 @@ pub(crate) fn get_depth_actions(
             transactions: repeat_per_slot(q2b_tx, program_id, all_slots.len()),
             account_overrides: q2b_overrides.clone(),
             return_accounts: vec![*q2b_output],
-            label: Some(format!("{DEPTH_Q2B_PREFIX}{size}")),
+            label: Some(depth_q2b_label(venue, q2b_size)),
         });
 
         actions.push(ScheduledAction {
@@ -257,10 +288,11 @@ pub(crate) fn get_depth_actions(
             transactions: repeat_per_slot(b2q_tx, program_id, all_slots.len()),
             account_overrides: b2q_overrides.clone(),
             return_accounts: vec![*b2q_output],
-            label: Some(format!("{DEPTH_B2Q_PREFIX}{size}")),
+            label: Some(depth_b2q_label(venue, b2q_size)),
         });
 
-        size = size.saturating_mul(2);
+        q2b_size = q2b_size.saturating_mul(2);
+        b2q_size = b2q_size.saturating_mul(2);
     }
 
     Ok(actions)

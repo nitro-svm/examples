@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io::{BufWriter, Write as _};
 
 use anyhow::{Context, Result};
@@ -10,17 +11,16 @@ use simulator_api::{
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use backtest_example::utils::accounts::{
-    make_native_account, make_token_account, make_token_ledger_account,
-};
-use backtest_example::utils::parse::{
+use crate::amm_liquidity::TitanVenueDiscriminant;
+use crate::utils::accounts::{make_native_account, make_token_account, make_token_ledger_account};
+use crate::utils::parse::{
     TITAN_PROGRAM, add_token_ledger, derive_ata, patch_titan_template_transaction,
     repoint_titan_static_account,
 };
 
-use crate::Template;
-use crate::action::SPREAD_LABEL;
-use crate::depth::DEPTH_SIGNER_LAMPORTS;
+use super::Template;
+use super::action::spread_label;
+use super::depth::DEPTH_SIGNER_LAMPORTS;
 
 pub(crate) struct Spread {
     slot: u64,
@@ -41,42 +41,57 @@ impl Spread {
     }
 }
 
+/// Streams spread rows to a CSV as they arrive, so a long session doesn't hold
+/// every record in memory. The header is written on construction, each row is
+/// flushed on [`push`](SpreadStore::push), and [`finish`](SpreadStore::finish)
+/// flushes any tail and reports the total.
 pub(crate) struct SpreadStore {
-    records: Vec<Spread>,
+    writer: BufWriter<File>,
+    filename: String,
+    quote_mint: String,
+    base_mint: String,
+    count: usize,
 }
 
 impl SpreadStore {
-    pub(crate) fn new() -> Self {
-        Self { records: vec![] }
-    }
-
-    pub(crate) fn push(&mut self, spread: Spread) {
-        self.records.push(spread);
-    }
-
-    pub(crate) fn write_output(
-        &self,
-        filename: &str,
-        quote_mint: &str,
-        base_mint: &str,
-    ) -> Result<()> {
-        let f = std::fs::File::create(filename)?;
-        let mut w = BufWriter::new(f);
+    pub(crate) fn new(filename: &str, quote_mint: &str, base_mint: &str) -> Result<Self> {
+        let mut writer = BufWriter::new(File::create(filename)?);
         writeln!(
-            w,
+            writer,
             "slot,quote_mint,base_mint,input_amount,output_amount,spread_bps"
         )?;
-        for r in &self.records {
-            writeln!(
-                w,
-                "{},{},{},{},{},{}",
-                r.slot, quote_mint, base_mint, r.input_amount, r.output_amount, r.spread_bps,
-            )?;
-        }
+        writer.flush()?;
+        Ok(Self {
+            writer,
+            filename: filename.to_string(),
+            quote_mint: quote_mint.to_string(),
+            base_mint: base_mint.to_string(),
+            count: 0,
+        })
+    }
 
+    /// Write (and flush) a single spread row as soon as it is received.
+    pub(crate) fn push(&mut self, spread: Spread) -> Result<()> {
+        writeln!(
+            self.writer,
+            "{},{},{},{},{},{}",
+            spread.slot,
+            self.quote_mint,
+            self.base_mint,
+            spread.input_amount,
+            spread.output_amount,
+            spread.spread_bps,
+        )?;
+        self.writer.flush()?;
+        self.count += 1;
+        Ok(())
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        self.writer.flush()?;
         eprintln!(
-            "[done] wrote {} spread rows to {filename}",
-            self.records.len()
+            "[done] wrote {} spread rows to {}",
+            self.count, self.filename
         );
         Ok(())
     }
@@ -98,8 +113,7 @@ pub(crate) fn get_spread_action(
     template: &Template,
     size: u64,
     program_id: Option<Address>,
-    start_slot: u64,
-    end_slot: u64,
+    venue: TitanVenueDiscriminant,
 ) -> Result<ScheduledAction> {
     let Template {
         quote_to_base, // (hop2)
@@ -173,7 +187,7 @@ pub(crate) fn get_spread_action(
         transactions,
         account_overrides,
         return_accounts: vec![*output],
-        label: Some(SPREAD_LABEL.to_string()),
+        label: Some(spread_label(venue)),
     };
 
     Ok(action)
