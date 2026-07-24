@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use crate::amm_liquidity::TitanVenueDiscriminant;
-
-use super::types::{TransactionTokenBalanceSerde, TxWithMeta};
+use super::types::{TitanVenueDiscriminant, TransactionTokenBalanceSerde, TxWithMeta};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction};
@@ -16,6 +14,7 @@ const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 pub const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+pub const SPCX_MINT: &str = "SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb";
 
 pub const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 pub const JUP_FEE_AUTHORITY: &str = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";

@@ -11,14 +11,14 @@ use simulator_api::{
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use crate::amm_liquidity::TitanVenueDiscriminant;
-use crate::utils::accounts::{make_native_account, make_token_account, make_token_ledger_account};
-use crate::utils::parse::{
+use backtest_example::utils::types::TitanVenueDiscriminant;
+use backtest_example::utils::accounts::{make_native_account, make_token_account, make_token_ledger_account};
+use backtest_example::utils::parse::{
     TITAN_PROGRAM, add_token_ledger, derive_ata, patch_titan_template_transaction,
     repoint_titan_static_account,
 };
 
-use super::Template;
+use crate::Template;
 use super::action::spread_label;
 use super::depth::DEPTH_SIGNER_LAMPORTS;
 

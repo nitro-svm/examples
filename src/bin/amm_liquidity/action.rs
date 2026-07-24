@@ -7,10 +7,9 @@ use simulator_client::ActionResultNotification;
 use solana_account_decoder::UiAccount;
 use solana_address::Address;
 
-use crate::utils::accounts::native_seed_lamports;
+use backtest_example::utils::{accounts::native_seed_lamports, types::TitanVenueDiscriminant};
 
-use super::Template;
-use super::TitanVenueDiscriminant;
+use crate::Template;
 use super::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
 use super::spread::{Spread, SpreadStore, get_spread_action};
 

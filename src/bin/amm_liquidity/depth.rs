@@ -10,11 +10,11 @@ use simulator_api::{
 };
 use solana_address::Address;
 
-use crate::amm_liquidity::TitanVenueDiscriminant;
-use crate::utils::accounts::{make_native_account, make_token_account};
-use crate::utils::parse::{derive_ata, patch_titan_template_transaction};
+use backtest_example::utils::types::TitanVenueDiscriminant;
+use backtest_example::utils::accounts::{make_native_account, make_token_account};
+use backtest_example::utils::parse::{derive_ata, patch_titan_template_transaction};
 
-use super::Template;
+use crate::Template;
 use super::action::{DepthDirection, depth_b2q_label, depth_q2b_label};
 
 const ITERATIONS: usize = 12;
@@ -224,7 +224,7 @@ pub(crate) fn get_depth_actions(
     };
 
     // q2b sweeps USDC-native sizes; b2q sweeps the WSOL-native amount of equal
-    // USD value so both directions trade the same notional at each step.
+    // USD value so both directions trade roughly the same notional at each step.
     let q2b_start = start_size;
     let b2q_start = usdc_native_to_wsol_native(start_size);
 
