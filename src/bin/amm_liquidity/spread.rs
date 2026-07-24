@@ -15,7 +15,7 @@ use backtest_example::utils::accounts::{
     make_native_account, make_token_account, make_token_ledger_account,
 };
 use backtest_example::utils::parse::{
-    TITAN_PROGRAM, add_token_ledger, derive_ata, patch_titan_template_transaction,
+    TITAN_PROGRAM, WSOL_MINT, add_token_ledger, derive_ata, patch_titan_template_transaction,
     repoint_titan_static_account,
 };
 use backtest_example::utils::types::TitanVenueDiscriminant;
@@ -99,17 +99,21 @@ impl SpreadStore {
     }
 }
 
-/// Build a round-trip action: SOL -> USDC -> SOL through one venue in two txs.
+/// Build a round-trip action: base -> quote -> base through one venue in two txs.
 ///
-/// Use SOL -> USDC -> SOL instead of USDC -> SOL -> USDC so that the intermediate
+/// Use base -> quote -> base instead of quote -> base -> quote so that the intermediate
 /// asset is an ATA and can leverage the Titan token ledger.
 /// This allows leg 1's intermediate amount to be used by leg 2 dynamically.
 ///
-///   hop1 (SOL→USDC): spend `size` WSOL, deposit USDC into `intermediate`.
-///   hop2 (USDC→SOL): read input = `balance(intermediate) − ledger.amount` (= X)
-///                    via the token ledger, output native SOL to quote_signer.
+///   hop1 (base->quote): spend `size` base, deposit quote into `intermediate`.
+///   hop2 (quote->base): read input = `balance(intermediate) − ledger.amount` (= X)
+///                    via the token ledger, output base to `output`.
 ///
-/// Final SOL (`Y`) is quote_signer's lamport delta over the seeded baseline;
+/// `output` is `quote_signer` itself when base is native SOL (Titan unwraps directly
+/// to the signer's own account); otherwise it's `quote_signer`'s ATA for the base
+/// mint, and hop2's output is repointed there.
+///
+/// Final base (`Y`) is `output`'s balance delta over the seeded baseline;
 /// spread = (size − Y) / size.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_spread_action(
@@ -127,6 +131,7 @@ pub(crate) fn get_spread_action(
         base_signer,
         quote_mint,
         base_mint,
+        quote_receiver,
         ..
     } = template;
 
@@ -145,29 +150,39 @@ pub(crate) fn get_spread_action(
 
     let quote = &quote_mint.to_string();
     let base = &base_mint.to_string();
-    let output = quote_signer;
+    let base_is_native = base.as_str() == WSOL_MINT;
+    let output = if base_is_native {
+        *quote_signer
+    } else {
+        *quote_receiver
+    };
 
-    // Intermediate USDC account, shared across hops (hop1 deposits, hop2 spends):
-    // quote_signer's USDC ATA, which is already hop2's input account.
-    let intermediate = derive_ata(quote_signer, quote).context("derive intermediate USDC")?;
-    // hop1's WSOL input, funded with the swept `size`.
-    let input = derive_ata(base_signer, base).context("derive hop1 WSOL input")?;
+    // Intermediate quote-mint account, shared across hops (hop1 deposits, hop2 spends):
+    // quote_signer's quote ATA, which is already hop2's input account.
+    let intermediate = derive_ata(quote_signer, quote).context("derive intermediate quote")?;
+    // hop1's base input, funded with the swept `size`.
+    let input = derive_ata(base_signer, base).context("derive hop1 base input")?;
     // Ledger snapshotting `intermediate` at 0, so hop2's input = what hop1 deposits.
     let titan: Pubkey = TITAN_PROGRAM.parse().context("parse titan program")?;
     let (ledger, _) = Pubkey::find_program_address(&[b"spread-ledger"], &titan);
 
-    // hop1: SOL -> USDC, output repointed from base_signer's USDC ATA to `intermediate`.
+    // hop1: base -> quote, output repointed from base_signer's quote ATA to `intermediate`.
     let hop1 = repoint_titan_static_account(
         &patch_titan_template_transaction(base_to_quote, input, size)?,
         4, // output_token_account
         intermediate,
     )?;
-    // hop2: USDC→SOL, input read from `intermediate` ledger account
-    // (the 0 here is ignored once a real ledger is supplied).
-    let hop2 = add_token_ledger(
-        &patch_titan_template_transaction(quote_to_base, intermediate, 0)?,
-        ledger,
-    )?;
+    // hop2: quote -> base, input read from `intermediate` ledger account
+    // (the 0 here is ignored once a real ledger is supplied). Only repoint the
+    // output when base isn't native SOL — native swaps already land directly in
+    // quote_signer's own account without a repoint.
+    let quote_to_base_patched = patch_titan_template_transaction(quote_to_base, intermediate, 0)?;
+    let quote_to_base_patched = if base_is_native {
+        quote_to_base_patched
+    } else {
+        repoint_titan_static_account(&quote_to_base_patched, 4, output)?
+    };
+    let hop2 = add_token_ledger(&quote_to_base_patched, ledger)?;
 
     let hop1 = STANDARD.encode(bincode::serialize(&hop1)?);
     let hop2 = STANDARD.encode(bincode::serialize(&hop2)?);
@@ -179,11 +194,17 @@ pub(crate) fn get_spread_action(
             .collect()
     };
 
+    let output_account = if base_is_native {
+        make_native_account(DEPTH_SIGNER_LAMPORTS)
+    } else {
+        make_token_account(quote_signer, base, 0)?
+    };
+
     let account_overrides = AccountModifications(BTreeMap::from([
         (input, make_token_account(base_signer, base, size)?),
         (intermediate, make_token_account(quote_signer, quote, 0)?),
         (ledger, make_token_ledger_account(&intermediate, 0)),
-        (*quote_signer, make_native_account(DEPTH_SIGNER_LAMPORTS)),
+        (output, output_account),
     ]));
 
     let action = ScheduledAction {
@@ -191,7 +212,7 @@ pub(crate) fn get_spread_action(
         kind: ActionKind::Simulate,
         transactions,
         account_overrides,
-        return_accounts: vec![*output],
+        return_accounts: vec![output],
         label: Some(spread_label(venue)),
     };
 

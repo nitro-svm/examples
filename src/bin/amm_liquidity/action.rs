@@ -7,7 +7,9 @@ use simulator_client::ActionResultNotification;
 use solana_account_decoder::UiAccount;
 use solana_address::Address;
 
-use backtest_example::utils::{accounts::native_seed_lamports, types::TitanVenueDiscriminant};
+use backtest_example::utils::{
+    accounts::native_seed_lamports, parse::WSOL_MINT, types::TitanVenueDiscriminant,
+};
 
 use super::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
 use super::spread::{Spread, SpreadStore, get_spread_action};
@@ -92,6 +94,7 @@ pub(crate) struct VenueProcessor {
     depth_records: DepthStore,
     start_slot: u64,
     end_slot: u64,
+    base_price_usdc: u64,
 }
 
 impl VenueProcessor {
@@ -109,6 +112,7 @@ impl VenueProcessor {
         base_mint: &str,
         start_slot: u64,
         end_slot: u64,
+        base_price_usdc: u64,
     ) -> Result<Self> {
         let intra_block_inspection_enabled = program_id.is_some();
 
@@ -128,6 +132,7 @@ impl VenueProcessor {
             )?,
             start_slot,
             end_slot,
+            base_price_usdc,
         })
     }
 
@@ -149,6 +154,7 @@ impl VenueProcessor {
             self.venue,
             self.start_slot,
             self.end_slot,
+            self.base_price_usdc,
         )?);
         Ok(actions)
     }
@@ -167,14 +173,18 @@ impl VenueProcessor {
     ) {
         match label {
             Label::Spread => {
-                // Round-trip SOL->USDC->SOL: the final output is unwrapped to native SOL
-                // (subtract the full seeded balance).
-                let out_amount = accounts
-                    .first()
-                    .and_then(|a| a.as_ref())
-                    .and_then(native_lamports)
-                    .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
-                    .unwrap_or(0);
+                // Round-trip base->quote->base: the final output is unwrapped to native
+                // SOL (subtract the seeded balance) only when base is native SOL;
+                // otherwise it's a plain token account.
+                let out_account = accounts.first().and_then(|a| a.as_ref());
+                let out_amount = if self.template.base_mint.to_string() == WSOL_MINT {
+                    out_account
+                        .and_then(native_lamports)
+                        .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
+                        .unwrap_or(0)
+                } else {
+                    out_account.and_then(token_amount).unwrap_or(0)
+                };
                 let spread = Spread::new(slot, self.spread_size, out_amount);
                 if let Err(e) = self.spread_records.push(spread) {
                     eprintln!(
@@ -186,12 +196,21 @@ impl VenueProcessor {
             Label::Depth(direction) => {
                 let out_account = accounts.first().and_then(|a| a.as_ref());
                 let out_amount = match direction {
-                    // q2b's SOL output is unwrapped to native SOL (subtract the seeded balance).
-                    DepthDirection::QuoteToBase => out_account
-                        .and_then(native_lamports)
-                        .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
-                        .unwrap_or(0),
-                    // b2q's USDC output is in a receiver ATA with no baseline balance.
+                    // q2b's output is unwrapped to native SOL (subtract the seeded balance)
+                    // only when base is native SOL; otherwise it's a plain token account.
+                    DepthDirection::QuoteToBase => {
+                        if self.template.base_mint.to_string() == WSOL_MINT {
+                            out_account
+                                .and_then(native_lamports)
+                                .map(|l| {
+                                    l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS))
+                                })
+                                .unwrap_or(0)
+                        } else {
+                            out_account.and_then(token_amount).unwrap_or(0)
+                        }
+                    }
+                    // b2q's quote output is in a receiver ATA with no baseline balance.
                     DepthDirection::BaseToQuote => out_account.and_then(token_amount).unwrap_or(0),
                 };
                 let depth = Depth::new(size, out_amount);

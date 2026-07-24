@@ -11,7 +11,7 @@ use simulator_api::{
 use solana_address::Address;
 
 use backtest_example::utils::accounts::{make_native_account, make_token_account};
-use backtest_example::utils::parse::{derive_ata, patch_titan_template_transaction};
+use backtest_example::utils::parse::{WSOL_MINT, derive_ata, patch_titan_template_transaction};
 use backtest_example::utils::types::TitanVenueDiscriminant;
 
 use super::action::{DepthDirection, depth_b2q_label, depth_q2b_label};
@@ -23,10 +23,11 @@ const ITERATIONS: usize = 12;
 /// (Output is `post_lamports - DEPTH_SIGNER_LAMPORTS`).
 pub(crate) const DEPTH_SIGNER_LAMPORTS: u64 = 1_000_000_000;
 
-const SOL_PRICE_USDC: u64 = 70;
-
-fn usdc_native_to_wsol_native(usdc_native: u64) -> u64 {
-    usdc_native.saturating_mul(1000) / SOL_PRICE_USDC
+/// Only meaningful when the base leg is native SOL: converts a USDC-native size
+/// to the WSOL-native amount of equal USD value, so both sweep directions trade
+/// roughly the same notional at each step.
+fn usdc_native_to_wsol_native(usdc_native: u64, base_price_usdc: u64) -> u64 {
+    usdc_native.saturating_mul(1000) / base_price_usdc
 }
 
 #[derive(Clone, Copy)]
@@ -200,6 +201,7 @@ pub(crate) fn get_depth_actions(
     venue: TitanVenueDiscriminant,
     start_slot: u64,
     end_slot: u64,
+    base_price_usdc: u64,
 ) -> Result<Vec<ScheduledAction>> {
     let Template {
         quote_to_base,
@@ -226,10 +228,13 @@ pub(crate) fn get_depth_actions(
         }
     };
 
-    // q2b sweeps USDC-native sizes; b2q sweeps the WSOL-native amount of equal
-    // USD value so both directions trade roughly the same notional at each step.
+    let base_is_native = base_mint.to_string() == WSOL_MINT;
+
+    // q2b sweeps USDC-native sizes; b2q sweeps the base-native amount of equal USD
+    // value (per `base_price_usdc`) so both directions trade roughly the same
+    // notional at each step.
     let q2b_start = start_size;
-    let b2q_start = usdc_native_to_wsol_native(start_size);
+    let b2q_start = usdc_native_to_wsol_native(start_size, base_price_usdc);
 
     // Pre-fund enough to cover all `ITERATIONS` doublings of each leg's start size.
     let q2b_max = q2b_start.saturating_mul(1 << ITERATIONS);
@@ -238,20 +243,32 @@ pub(crate) fn get_depth_actions(
     let base_mint = &base_mint.to_string();
 
     // Inputs are each signer's ATA for the mint it spends (derived here).
-    //   q2b (USDC->SOL): swap USDC from q2b_input to native SOL in q2b_output. (original SOL was `DEPTH_SIGNER_LAMPORTS`)
-    //   b2q (SOL->USDC): swap WSOL from b2q_input ATA to USDC in b2q_output ATA. (original USDC was 0)
+    //   q2b (USDC->base): swap USDC from q2b_input to base in q2b_output.
+    //     If base is native SOL, q2b_output is quote_signer itself (original SOL was
+    //     `DEPTH_SIGNER_LAMPORTS`); otherwise it's quote_signer's ATA for base_mint
+    //     (original balance was 0).
+    //   b2q (base->USDC): swap base from b2q_input ATA to USDC in b2q_output ATA. (original USDC was 0)
     let q2b_input = derive_ata(quote_signer, quote_mint).context("derive q2b USDC input")?;
-    let q2b_output = quote_signer;
-    let b2q_input = derive_ata(base_signer, base_mint).context("derive b2q WSOL input")?;
+    let q2b_output = if base_is_native {
+        *quote_signer
+    } else {
+        derive_ata(quote_signer, base_mint).context("derive q2b base output")?
+    };
+    let b2q_input = derive_ata(base_signer, base_mint).context("derive b2q base input")?;
     let b2q_output = base_receiver;
 
     // Fund the input ATA and seed each signer with native SOL for fees and rent.
+    let q2b_output_account = if base_is_native {
+        make_native_account(DEPTH_SIGNER_LAMPORTS)
+    } else {
+        make_token_account(quote_signer, base_mint, 0)?
+    };
     let q2b_overrides = AccountModifications(BTreeMap::from([
         (
             q2b_input,
             make_token_account(quote_signer, quote_mint, q2b_max)?,
         ),
-        (*q2b_output, make_native_account(DEPTH_SIGNER_LAMPORTS)),
+        (q2b_output, q2b_output_account),
     ]));
     let b2q_overrides = AccountModifications(BTreeMap::from([
         (
@@ -281,7 +298,7 @@ pub(crate) fn get_depth_actions(
             kind: ActionKind::Simulate,
             transactions: repeat_per_slot(q2b_tx, program_id, all_slots.len()),
             account_overrides: q2b_overrides.clone(),
-            return_accounts: vec![*q2b_output],
+            return_accounts: vec![q2b_output],
             label: Some(depth_q2b_label(venue, q2b_size)),
         });
 

@@ -30,11 +30,13 @@ use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
+use backtest_example::utils::block::get_block_time;
 use backtest_example::utils::parse::{
     SPCX_MINT, USDC_MINT, USDT_MINT, WSOL_MINT, derive_ata, extract_signer,
     get_titan_template_transaction, patch_titan_disable_positive_slippage_fee,
     patch_titan_single_venue,
 };
+use backtest_example::utils::price::{Ticker, get_historical_binance_price_usdc};
 use backtest_example::utils::types::TitanVenueDiscriminant;
 
 mod action;
@@ -47,6 +49,10 @@ use template::{
     titan_goonfiv2_sol_usdt_template_v3, titan_multi_sol_usdc_template_v3,
     titan_multi_spcx_usdc_template_v3, titan_tessera_sol_usdc_template_v3,
 };
+
+/// Fallback USDC/base price for sizing the b2q depth sweep when we can't fetch a
+/// real one (no tracked Binance ticker for the base mint, or the fetch fails).
+const FALLBACK_BASE_PRICE_USDC: u64 = 100;
 
 // ── configuration ──────────────────────────────────────────────────────────────
 
@@ -112,58 +118,73 @@ pub(crate) struct Template {
     base_receiver: Pubkey,
 }
 
-/// Pick the `(quote->SOL, SOL->quote)` template signature pair whose swap_route_v3 body
-/// contains `venue`, keyed by the quote mint.
+/// Pick the `(spend-quote-get-base, spend-base-get-quote)` template signature pair whose
+/// swap_route_v3 body contains `venue`, keyed by the quote and base mints.
 ///
-/// USDC: Tessera isn't co-listed with the prop venues in any SOL/USDC route, so it gets
-/// its own single-venue template; every other venue uses the multi-venue bison template.
+/// USDC/SOL: Tessera isn't co-listed with the prop venues in any SOL/USDC route, so it
+/// gets its own single-venue template; every other venue uses the multi-venue bison template.
 ///
-/// USDT: only one native SOL/USDT route exists on-chain (HumidiFi/GoonFiV2/BisonFi meshed);
+/// USDT/SOL: only one native SOL/USDT route exists on-chain (HumidiFi/GoonFiV2/BisonFi meshed);
 /// `patch_titan_single_venue` isolates whichever of those `venue` names out of it. Requesting
 /// a venue that route doesn't contain (e.g. Tessera, which has no on-chain SOL/USDT market)
 /// surfaces later as a "venue not in swaps" error from the isolation step.
+///
+/// USDC/SPCX: only GoonFiV2 and ZeroFi have an on-chain SPCX/USDC route.
+///
+/// Anything else falls back to the SOL/USDC bison template, which only makes sense when
+/// base is actually WSOL.
 fn template_signatures(
     venue: TitanVenueDiscriminant,
     quote_mint: &str,
+    base_mint: &str,
 ) -> (&'static str, &'static str) {
-    match (venue, quote_mint) {
-        (TitanVenueDiscriminant::GoonFiV2, USDT_MINT) => (
+    match (venue, quote_mint, base_mint) {
+        (TitanVenueDiscriminant::GoonFiV2, USDT_MINT, WSOL_MINT) => (
             titan_goonfiv2_sol_usdt_template_v3::USDT_TO_SOL,
             titan_goonfiv2_sol_usdt_template_v3::SOL_TO_USDT,
         ),
-        (TitanVenueDiscriminant::GoonFiV2 | TitanVenueDiscriminant::ZeroFi, SPCX_MINT) => (
+        (
+            TitanVenueDiscriminant::GoonFiV2 | TitanVenueDiscriminant::ZeroFi,
+            USDC_MINT,
+            SPCX_MINT,
+        ) => (
             titan_multi_spcx_usdc_template_v3::USDC_TO_SPCX,
             titan_multi_spcx_usdc_template_v3::SPCX_TO_USDC,
         ),
-        (TitanVenueDiscriminant::Tessera, USDC_MINT) => (
+        (TitanVenueDiscriminant::Tessera, USDC_MINT, WSOL_MINT) => (
             titan_tessera_sol_usdc_template_v3::USDC_TO_SOL,
             titan_tessera_sol_usdc_template_v3::SOL_TO_USDC,
         ),
-        (_, _) => (
+        (_, _, _) => (
             titan_multi_sol_usdc_template_v3::USDC_TO_SOL,
             titan_multi_sol_usdc_template_v3::SOL_TO_USDC,
         ),
     }
 }
 
-async fn get_template(venue: TitanVenueDiscriminant, quote_mint: &str) -> Result<Template> {
-    let (quote_to_sol_sig, sol_to_quote_sig) = template_signatures(venue, quote_mint);
-    let quote_to_sol = get_titan_template_transaction(quote_to_sol_sig).await?;
-    let sol_to_quote = get_titan_template_transaction(sol_to_quote_sig).await?;
-    let quote_signer = extract_signer(&quote_to_sol)?;
-    let base_signer = extract_signer(&sol_to_quote)?;
+async fn get_template(
+    venue: TitanVenueDiscriminant,
+    quote_mint: &str,
+    base_mint: &str,
+) -> Result<Template> {
+    let (quote_to_base_sig, base_to_quote_sig) = template_signatures(venue, quote_mint, base_mint);
+    let quote_to_base = get_titan_template_transaction(quote_to_base_sig).await?;
+    let base_to_quote = get_titan_template_transaction(base_to_quote_sig).await?;
+    let quote_signer = extract_signer(&quote_to_base)?;
+    let base_signer = extract_signer(&base_to_quote)?;
+    // q2b (quote->base) output lands in the quote signer's ATA for the base mint.
     let quote_receiver =
-        derive_ata(&quote_signer, WSOL_MINT).context("derive q2b WSOL receiver")?;
-    // b2q (SOL->quote) output lands in the base signer's ATA for the quote mint (USDC or USDT).
+        derive_ata(&quote_signer, base_mint).context("derive q2b base receiver")?;
+    // b2q (base->quote) output lands in the base signer's ATA for the quote mint (USDC or USDT).
     let base_receiver =
         derive_ata(&base_signer, quote_mint).context("derive b2q quote receiver")?;
 
     let quote_to_base = patch_titan_disable_positive_slippage_fee(&patch_titan_single_venue(
-        &quote_to_sol,
+        &quote_to_base,
         &venue,
     )?)?;
     let base_to_quote = patch_titan_disable_positive_slippage_fee(&patch_titan_single_venue(
-        &sol_to_quote,
+        &base_to_quote,
         &venue,
     )?)?;
 
@@ -171,7 +192,7 @@ async fn get_template(venue: TitanVenueDiscriminant, quote_mint: &str) -> Result
         quote_to_base,
         base_to_quote,
         quote_mint: quote_mint.parse().context("parse quote mint")?,
-        base_mint: Address::from_str_const(WSOL_MINT),
+        base_mint: base_mint.parse().context("parse base mint")?,
         quote_signer,
         base_signer,
         quote_receiver,
@@ -299,6 +320,38 @@ pub async fn run_measurement(config: &MeasurementConfig) -> Result<()> {
     // runs always auto-name (per venue + slot range) so the files can't collide.
     let single_venue = config.venue_discriminants.len() == 1;
 
+    // Base/USDC price at the start of the replay range, used to size the b2q depth
+    // sweep to the same USD notional as q2b. Only fetched when we track a Binance
+    // ticker for the configured base mint (e.g. WSOL, SPCX); if that ticker isn't
+    // reachable (e.g. Binance's geo restrictions, or the pair isn't listed there)
+    // or we don't track one at all, fall back to `FALLBACK_BASE_PRICE_USDC` rather
+    // than aborting the run.
+    let base_price_usdc = match Ticker::from_mint(&config.base_mint) {
+        Some(ticker) => {
+            let fetch = async {
+                let start_block_time = get_block_time(config.start_slot).await?;
+                get_historical_binance_price_usdc(ticker, start_block_time).await
+            };
+            match fetch.await {
+                Ok(price) => {
+                    eprintln!(
+                        "[dbg] {} price at slot {}: {price}",
+                        config.base_mint, config.start_slot
+                    );
+                    price
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[warn] couldn't fetch {} price ({e}); falling back to {FALLBACK_BASE_PRICE_USDC} USDC/base for depth sweep sizing",
+                        config.base_mint
+                    );
+                    FALLBACK_BASE_PRICE_USDC
+                }
+            }
+        }
+        None => FALLBACK_BASE_PRICE_USDC,
+    };
+
     let mut processors = Vec::with_capacity(config.venue_discriminants.len());
     for &disc in &config.venue_discriminants {
         let venue = TitanVenueDiscriminant::from_u8(disc)?;
@@ -306,7 +359,7 @@ pub async fn run_measurement(config: &MeasurementConfig) -> Result<()> {
         let program_id = config
             .enable_intra_block_inspection
             .then(|| venue.get_program_id());
-        let template = get_template(venue, &config.quote_mint).await?;
+        let template = get_template(venue, &config.quote_mint, &config.base_mint).await?;
 
         let spread_file = config
             .spread_output
@@ -339,6 +392,7 @@ pub async fn run_measurement(config: &MeasurementConfig) -> Result<()> {
             &config.base_mint,
             config.start_slot,
             config.end_slot,
+            base_price_usdc,
         )?);
     }
 
