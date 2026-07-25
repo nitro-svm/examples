@@ -4,12 +4,12 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use simulator_api::{AccountData, AccountModifications, BinaryEncoding, EncodedBinary};
 use simulator_client::BacktestSession;
+use solana_account::Account;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use super::parse::{
-    TITAN_PROGRAM, WSOL_MINT, derive_ata, get_account_info, get_mint_token_program,
-};
+use super::chain::{get_account_info, get_mint_token_program};
+use super::parse::{TITAN_PROGRAM, WSOL_MINT, derive_ata};
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const ATA_RENT_EXEMPT: u64 = 2_039_280;
@@ -95,33 +95,18 @@ pub fn make_token_account(
     })
 }
 
-/// A real token account's exact on-chain bytes/lamports/owner, so overrides can preserve
-/// Token-2022 extensions (e.g. `TransferHookAccount`) a synthetic [`make_token_account`]
-/// can't replicate.
-pub async fn fetch_real_token_account(ata: &Pubkey) -> Result<Option<(Vec<u8>, u64, Address)>> {
-    let Some((data, lamports, owner)) = get_account_info(&ata.to_string()).await? else {
-        return Ok(None);
-    };
-    Ok(Some((
-        data,
-        lamports,
-        owner.parse().context("parse owner")?,
-    )))
-}
-
-/// Build an account override for a known-real token account, patching only the amount
+/// Build an account override for a token 2022 account, patching only the amount
 /// field (offset 64) and leaving every other byte (state, extensions) untouched.
-pub fn patch_real_token_account(real: &(Vec<u8>, u64, Address), amount: u64) -> AccountData {
-    let (data, lamports, owner) = real;
-    let mut data = data.clone();
+pub fn patch_real_token22_account(account: &Account, amount: u64) -> Result<AccountData> {
+    let mut data = account.data.clone();
     data[64..72].copy_from_slice(&amount.to_le_bytes());
-    AccountData {
+    Ok(AccountData {
         space: data.len() as u64,
         data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
-        executable: false,
-        lamports: *lamports,
-        owner: *owner,
-    }
+        executable: account.executable,
+        lamports: account.lamports,
+        owner: account.owner.to_string().parse().context("parse owner")?,
+    })
 }
 
 /// Lamports a [`make_native_account`] seeds for `amount`: the requested amount

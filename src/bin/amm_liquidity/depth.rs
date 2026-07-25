@@ -11,7 +11,7 @@ use simulator_api::{
 use solana_address::Address;
 
 use backtest_example::utils::accounts::{
-    make_native_account, make_token_account, patch_real_token_account,
+    make_native_account, make_token_account, patch_real_token22_account,
 };
 use backtest_example::utils::parse::{WSOL_MINT, derive_ata, patch_titan_template_transaction};
 use backtest_example::utils::types::TitanVenueDiscriminant;
@@ -214,7 +214,7 @@ pub(crate) fn get_depth_actions(
         base_mint,
         quote_token_program,
         base_token_program,
-        quote_receiver_real,
+        base_account: quote_receiver_real,
         ..
     } = template;
 
@@ -273,7 +273,7 @@ pub(crate) fn get_depth_actions(
     let q2b_output_account = if is_native_base {
         make_native_account(DEPTH_SIGNER_LAMPORTS)
     } else if let Some(real) = quote_receiver_real {
-        patch_real_token_account(real, 0)
+        patch_real_token22_account(real, 0)?
     } else {
         make_token_account(quote_signer, base_mint, 0, base_token_program)?
     };

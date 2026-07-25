@@ -468,48 +468,6 @@ pub async fn get_titan_template_data(signature: &str) -> Result<VersionedTransac
     bincode::deserialize(&bytes).context("deserialize titan template tx")
 }
 
-/// Raw on-chain account data, lamports, and owner program for `pubkey`, or `None`
-/// if the account doesn't exist.
-pub async fn get_account_info(pubkey: &str) -> Result<Option<(Vec<u8>, u64, String)>> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getAccountInfo",
-        "params": [pubkey, {"encoding": "base64"}]
-    });
-    let resp: serde_json::Value = reqwest::Client::new()
-        .post(SOLANA_RPC)
-        .json(&body)
-        .send()
-        .await?
-        .json()
-        .await?;
-    let value = &resp["result"]["value"];
-    if value.is_null() {
-        return Ok(None);
-    }
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(
-            value["data"][0]
-                .as_str()
-                .context("account data not base64")?,
-        )
-        .context("base64 decode account data")?;
-    let lamports = value["lamports"].as_u64().context("missing lamports")?;
-    let owner = value["owner"]
-        .as_str()
-        .context("missing owner")?
-        .to_string();
-    Ok(Some((data, lamports, owner)))
-}
-
-/// The SPL token program that owns `mint` (legacy Token or Token-2022).
-pub async fn get_mint_token_program(mint: &str) -> Result<String> {
-    get_account_info(mint)
-        .await?
-        .map(|(_, _, owner)| owner)
-        .with_context(|| format!("mint {mint} not found"))
-}
-
 pub fn patch_titan_template_transaction(
     tx: &VersionedTransaction,
     in_ata: Pubkey,
