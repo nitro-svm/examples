@@ -14,7 +14,7 @@
 //! After your inspection, the session jumps directly to the next matching batch.
 
 use backtest_example::utils::parse::{
-    JUPITER_V6, USDC_MINT, WSOL_MINT, derive_ata, extract_signer, get_titan_template_transaction,
+    JUPITER_V6, USDC_MINT, WSOL_MINT, derive_ata, extract_signer, get_titan_template_data,
     parse_jupiter_swap_result, parse_titan_sim_result, patch_titan_template_transaction,
 };
 use backtest_example::utils::{accounts::set_account_balance, types::TxWithMeta};
@@ -119,7 +119,7 @@ fn write_output(filename: &str, records: &[SwapRecord]) -> Result<()> {
 
 async fn get_template_transactions() -> Result<[Template; 2]> {
     let usdc_to_sol = {
-        let tx = get_titan_template_transaction(USDC_TO_SOL_TEMPLATE).await?;
+        let tx = get_titan_template_data(USDC_TO_SOL_TEMPLATE).await?;
         let signer = extract_signer(&tx)?;
         let ata = derive_ata(&signer, USDC_MINT).context("derive USDC ATA")?;
         Template {
@@ -132,7 +132,7 @@ async fn get_template_transactions() -> Result<[Template; 2]> {
     };
 
     let sol_to_usdc = {
-        let tx = get_titan_template_transaction(SOL_TO_USDC_TEMPLATE).await?;
+        let tx = get_titan_template_data(SOL_TO_USDC_TEMPLATE).await?;
         let signer = extract_signer(&tx)?;
         let ata = derive_ata(&signer, WSOL_MINT).context("derive WSOL ATA")?;
         Template {

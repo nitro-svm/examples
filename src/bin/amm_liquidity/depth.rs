@@ -23,13 +23,6 @@ const ITERATIONS: usize = 12;
 /// (Output is `post_lamports - DEPTH_SIGNER_LAMPORTS`).
 pub(crate) const DEPTH_SIGNER_LAMPORTS: u64 = 1_000_000_000;
 
-/// Only meaningful when the base leg is native SOL: converts a USDC-native size
-/// to the WSOL-native amount of equal USD value, so both sweep directions trade
-/// roughly the same notional at each step.
-fn usdc_native_to_wsol_native(usdc_native: u64, base_price_usdc: u64) -> u64 {
-    usdc_native.saturating_mul(1000) / base_price_usdc
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct Depth {
     size: u64,
@@ -228,13 +221,19 @@ pub(crate) fn get_depth_actions(
         }
     };
 
-    let base_is_native = base_mint.to_string() == WSOL_MINT;
+    let is_native_base = base_mint.to_string() == WSOL_MINT;
 
     // q2b sweeps USDC-native sizes; b2q sweeps the base-native amount of equal USD
     // value (per `base_price_usdc`) so both directions trade roughly the same
     // notional at each step.
     let q2b_start = start_size;
-    let b2q_start = usdc_native_to_wsol_native(start_size, base_price_usdc);
+    let b2q_start = if is_native_base {
+        // SOL is 9 decimals
+        start_size.saturating_mul(1_000) / base_price_usdc
+    } else {
+        // other tokens are 6 decimals
+        start_size / base_price_usdc
+    };
 
     // Pre-fund enough to cover all `ITERATIONS` doublings of each leg's start size.
     let q2b_max = q2b_start.saturating_mul(1 << ITERATIONS);
@@ -243,13 +242,10 @@ pub(crate) fn get_depth_actions(
     let base_mint = &base_mint.to_string();
 
     // Inputs are each signer's ATA for the mint it spends (derived here).
-    //   q2b (USDC->base): swap USDC from q2b_input to base in q2b_output.
-    //     If base is native SOL, q2b_output is quote_signer itself (original SOL was
-    //     `DEPTH_SIGNER_LAMPORTS`); otherwise it's quote_signer's ATA for base_mint
-    //     (original balance was 0).
-    //   b2q (base->USDC): swap base from b2q_input ATA to USDC in b2q_output ATA. (original USDC was 0)
+    //   q2b (quote->base): swap quote from q2b_input to base in q2b_output.
+    //   b2q (base->quote): swap base from b2q_input ATA to USDC in b2q_output ATA.
     let q2b_input = derive_ata(quote_signer, quote_mint).context("derive q2b USDC input")?;
-    let q2b_output = if base_is_native {
+    let q2b_output = if is_native_base {
         *quote_signer
     } else {
         derive_ata(quote_signer, base_mint).context("derive q2b base output")?
@@ -258,7 +254,7 @@ pub(crate) fn get_depth_actions(
     let b2q_output = base_receiver;
 
     // Fund the input ATA and seed each signer with native SOL for fees and rent.
-    let q2b_output_account = if base_is_native {
+    let q2b_output_account = if is_native_base {
         make_native_account(DEPTH_SIGNER_LAMPORTS)
     } else {
         make_token_account(quote_signer, base_mint, 0)?

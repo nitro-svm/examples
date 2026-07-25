@@ -43,10 +43,8 @@ impl Spread {
     }
 }
 
-/// Streams spread rows to a CSV as they arrive, so a long session doesn't hold
-/// every record in memory. The header is written on construction, each row is
-/// flushed on [`push`](SpreadStore::push), and [`finish`](SpreadStore::finish)
-/// flushes any tail and reports the total.
+/// Streams spread rows to a CSV as they arrive,
+/// so a long session doesn't hold every record in memory.
 pub(crate) struct SpreadStore {
     writer: BufWriter<File>,
     filename: String,
@@ -109,9 +107,8 @@ impl SpreadStore {
 ///   hop2 (quote->base): read input = `balance(intermediate) − ledger.amount` (= X)
 ///                    via the token ledger, output base to `output`.
 ///
-/// `output` is `quote_signer` itself when base is native SOL (Titan unwraps directly
-/// to the signer's own account); otherwise it's `quote_signer`'s ATA for the base
-/// mint, and hop2's output is repointed there.
+/// `output` is `quote_signer` itself when base is native SOL, otherwise its base-mint ATA
+/// (hop2 already defaults there, no repoint needed).
 ///
 /// Final base (`Y`) is `output`'s balance delta over the seeded baseline;
 /// spread = (size − Y) / size.
@@ -150,8 +147,8 @@ pub(crate) fn get_spread_action(
 
     let quote = &quote_mint.to_string();
     let base = &base_mint.to_string();
-    let base_is_native = base.as_str() == WSOL_MINT;
-    let output = if base_is_native {
+    let is_native_base = base.as_str() == WSOL_MINT;
+    let output = if is_native_base {
         *quote_signer
     } else {
         *quote_receiver
@@ -173,16 +170,11 @@ pub(crate) fn get_spread_action(
         intermediate,
     )?;
     // hop2: quote -> base, input read from `intermediate` ledger account
-    // (the 0 here is ignored once a real ledger is supplied). Only repoint the
-    // output when base isn't native SOL — native swaps already land directly in
-    // quote_signer's own account without a repoint.
-    let quote_to_base_patched = patch_titan_template_transaction(quote_to_base, intermediate, 0)?;
-    let quote_to_base_patched = if base_is_native {
-        quote_to_base_patched
-    } else {
-        repoint_titan_static_account(&quote_to_base_patched, 4, output)?
-    };
-    let hop2 = add_token_ledger(&quote_to_base_patched, ledger)?;
+    // (the 0 here is ignored once a real ledger is supplied).
+    let hop2 = add_token_ledger(
+        &patch_titan_template_transaction(quote_to_base, intermediate, 0)?,
+        ledger,
+    )?;
 
     let hop1 = STANDARD.encode(bincode::serialize(&hop1)?);
     let hop2 = STANDARD.encode(bincode::serialize(&hop2)?);
@@ -194,7 +186,7 @@ pub(crate) fn get_spread_action(
             .collect()
     };
 
-    let output_account = if base_is_native {
+    let output_account = if is_native_base {
         make_native_account(DEPTH_SIGNER_LAMPORTS)
     } else {
         make_token_account(quote_signer, base, 0)?

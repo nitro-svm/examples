@@ -176,20 +176,6 @@ pub fn patch_titan_single_venue(
 
 /// Point Titan's `positive_slippage_fee_receiver` slot back at the "None" sentinel so the
 /// venue's full output lands in the user's output token account.
-///
-/// swap_route_v3 account layout: `[10] provider_fee_receiver`, `[11] positive_slippage_fee_receiver`,
-/// both optional. Anchor encodes an omitted optional account by pointing it at the program id,
-/// which is exactly what `program_id_index` already references. When the positive-slippage slot
-/// is populated, Titan diverts the surplus above `expected_amount_out` to it; a reader that
-/// snapshots only the user's receiver (as this tool does) then undercounts the output — measured
-/// spread too wide, depth too shallow. This matters most because [`patch_titan_template_transaction`]
-/// zeroes `expected_amount_out`, so on resimulation the *entire* output counts as positive slippage
-/// and would be skimmed if that slot were live.
-///
-/// Only the positive-slippage slot is touched. `provider_fee_receiver` is left alone: when a
-/// route's config expects a provider fee, dropping that account makes the program fail with
-/// `MissingRemainingAccount` (0x1775). Its cut is a small fixed fee that applies uniformly across
-/// venues, so leaving it in place keeps every template on the same footing.
 pub fn patch_titan_disable_positive_slippage_fee(
     tx: &VersionedTransaction,
 ) -> Result<VersionedTransaction> {
@@ -458,7 +444,7 @@ pub fn parse_jupiter_swap_result(
     })
 }
 
-pub async fn get_titan_template_transaction(signature: &str) -> Result<VersionedTransaction> {
+pub async fn get_titan_template_data(signature: &str) -> Result<VersionedTransaction> {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1,
         "method": "getTransaction",
@@ -568,8 +554,7 @@ pub fn repoint_titan_static_account(
 }
 
 /// Insert `key` as a fresh *writable* non-signer static key and point the Titan swap's
-/// account at `position` to it. For slots whose current key is aliased (e.g. the q2b
-/// template's output slot is the signer itself, referenced as payer/user too), an
+/// account at `position` to it. For slots whose current key is aliased, an
 /// in-place rewrite via [`repoint_titan_static_account`] would move every reference;
 /// inserting a new key repoints only the one slot. The key goes at the end of the
 /// writable non-signer region, so every index at or past the insertion point shifts up.

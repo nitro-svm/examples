@@ -33,8 +33,7 @@ use solana_transaction::versioned::VersionedTransaction;
 use backtest_example::utils::block::get_block_time;
 use backtest_example::utils::parse::{
     SPCX_MINT, USDC_MINT, USDT_MINT, WSOL_MINT, derive_ata, extract_signer,
-    get_titan_template_transaction, patch_titan_disable_positive_slippage_fee,
-    patch_titan_single_venue,
+    get_titan_template_data, patch_titan_disable_positive_slippage_fee, patch_titan_single_venue,
 };
 use backtest_example::utils::price::{Ticker, get_historical_binance_price_usdc};
 use backtest_example::utils::types::TitanVenueDiscriminant;
@@ -85,26 +84,6 @@ pub struct MeasurementConfig {
     pub venue_discriminants: Vec<u8>,
 }
 
-impl Default for MeasurementConfig {
-    fn default() -> Self {
-        Self {
-            url: "staging.simulator.termina.technology".to_string(),
-            api_key: String::new(),
-            start_slot: 422_818_048,
-            end_slot: 422_818_148,
-            spread_output: None,
-            depth_output: None,
-            enable_intra_block_inspection: false,
-            quote_mint: USDC_MINT.to_string(),
-            base_mint: WSOL_MINT.to_string(),
-            spread_size: 50_000_000_000,
-            depth_min: 10_000_000,
-            max_impact_bps: 1000,
-            venue_discriminants: vec![TitanVenueDiscriminant::BisonFi as u8],
-        }
-    }
-}
-
 // ── template ─────────────────────────────────────────────────────────────────
 
 pub(crate) struct Template {
@@ -120,20 +99,7 @@ pub(crate) struct Template {
 
 /// Pick the `(spend-quote-get-base, spend-base-get-quote)` template signature pair whose
 /// swap_route_v3 body contains `venue`, keyed by the quote and base mints.
-///
-/// USDC/SOL: Tessera isn't co-listed with the prop venues in any SOL/USDC route, so it
-/// gets its own single-venue template; every other venue uses the multi-venue bison template.
-///
-/// USDT/SOL: only one native SOL/USDT route exists on-chain (HumidiFi/GoonFiV2/BisonFi meshed);
-/// `patch_titan_single_venue` isolates whichever of those `venue` names out of it. Requesting
-/// a venue that route doesn't contain (e.g. Tessera, which has no on-chain SOL/USDT market)
-/// surfaces later as a "venue not in swaps" error from the isolation step.
-///
-/// USDC/SPCX: only GoonFiV2 and ZeroFi have an on-chain SPCX/USDC route.
-///
-/// Anything else falls back to the SOL/USDC bison template, which only makes sense when
-/// base is actually WSOL.
-fn template_signatures(
+fn find_titan_template_signatures(
     venue: TitanVenueDiscriminant,
     quote_mint: &str,
     base_mint: &str,
@@ -167,9 +133,10 @@ async fn get_template(
     quote_mint: &str,
     base_mint: &str,
 ) -> Result<Template> {
-    let (quote_to_base_sig, base_to_quote_sig) = template_signatures(venue, quote_mint, base_mint);
-    let quote_to_base = get_titan_template_transaction(quote_to_base_sig).await?;
-    let base_to_quote = get_titan_template_transaction(base_to_quote_sig).await?;
+    let (quote_to_base_sig, base_to_quote_sig) =
+        find_titan_template_signatures(venue, quote_mint, base_mint);
+    let quote_to_base = get_titan_template_data(quote_to_base_sig).await?;
+    let base_to_quote = get_titan_template_data(base_to_quote_sig).await?;
     let quote_signer = extract_signer(&quote_to_base)?;
     let base_signer = extract_signer(&base_to_quote)?;
     // q2b (quote->base) output lands in the quote signer's ATA for the base mint.
@@ -235,13 +202,6 @@ fn is_program_upgrade(tx: &VersionedTransaction, program_id: &Pubkey) -> bool {
 
 /// Drive a single managed session to completion, routing every action result to
 /// `action_processor` as it arrives.
-///
-/// The [`ManagedBacktestSession`] folds control-plane advancing and the action
-/// subscription into one `next_event()` stream, and handles reconnect on both:
-/// a dropped socket resumes via the server's `replayFromSlot` cursor (with
-/// replayed events de-duplicated) rather than aborting the run. That replaces the
-/// previous split of a manual advance loop plus a one-shot action subscription,
-/// neither of which survived a websocket drop.
 async fn run_session(
     config: &MeasurementConfig,
     mut action_processor: ActionCoordinator,
@@ -294,8 +254,6 @@ async fn run_session(
                 session.shutdown().await;
                 anyhow::bail!("simulator error: {e}");
             }
-            // Progress/among-others events we don't act on (no discovery pacing,
-            // and we don't subscribe to tx/account-diff streams here).
             Ok(_) => {}
             Err(ManagedSessionError::Cancelled) => break,
             Err(e) => {
@@ -311,8 +269,8 @@ async fn run_session(
 
 // ── public entry point ──────────────────────────────────────────────────────────
 
-/// Run a full spread/depth measurement across every configured venue, streaming
-/// results to their CSV files. This is exactly what the CLI binary does.
+/// Run a full spread/depth measurement across every configured venue,
+/// streaming results to their CSV files.
 pub async fn run_measurement(config: &MeasurementConfig) -> Result<()> {
     eprintln!("[ws] connecting to {}", backtest_ws_url(&config.url));
 
@@ -320,12 +278,10 @@ pub async fn run_measurement(config: &MeasurementConfig) -> Result<()> {
     // runs always auto-name (per venue + slot range) so the files can't collide.
     let single_venue = config.venue_discriminants.len() == 1;
 
-    // Base/USDC price at the start of the replay range, used to size the b2q depth
-    // sweep to the same USD notional as q2b. Only fetched when we track a Binance
-    // ticker for the configured base mint (e.g. WSOL, SPCX); if that ticker isn't
-    // reachable (e.g. Binance's geo restrictions, or the pair isn't listed there)
-    // or we don't track one at all, fall back to `FALLBACK_BASE_PRICE_USDC` rather
-    // than aborting the run.
+    // Calculate the base/USDC price at the start of the replay range
+    // to match the starting value of the depth sweep in both directions.
+    // If that ticker isn't reachable (e.g. Binance's geo restrictions),
+    // fall back to a default value.
     let base_price_usdc = match Ticker::from_mint(&config.base_mint) {
         Some(ticker) => {
             let fetch = async {
