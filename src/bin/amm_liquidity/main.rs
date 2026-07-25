@@ -30,10 +30,12 @@ use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
+use backtest_example::utils::accounts::fetch_real_token_account;
 use backtest_example::utils::block::get_block_time;
 use backtest_example::utils::parse::{
-    SPCX_MINT, USDC_MINT, USDT_MINT, WSOL_MINT, derive_ata, extract_signer,
-    get_titan_template_data, patch_titan_disable_positive_slippage_fee, patch_titan_single_venue,
+    SPCX_MINT, USDC_MINT, USDT_MINT, WSOL_MINT, derive_ata_with_program, extract_signer,
+    get_mint_token_program, get_titan_template_data, patch_titan_disable_positive_slippage_fee,
+    patch_titan_single_venue,
 };
 use backtest_example::utils::price::{Ticker, get_historical_binance_price_usdc};
 use backtest_example::utils::types::TitanVenueDiscriminant;
@@ -95,6 +97,11 @@ pub(crate) struct Template {
     base_signer: Pubkey,
     quote_receiver: Pubkey,
     base_receiver: Pubkey,
+    quote_token_program: Address,
+    base_token_program: Address,
+    /// `quote_receiver`'s real on-chain bytes, when it already exists — reused to preserve
+    /// Token-2022 extensions (e.g. `TransferHookAccount`) a synthetic account can't replicate.
+    quote_receiver_real: Option<(Vec<u8>, u64, Address)>,
 }
 
 /// Pick the `(spend-quote-get-base, spend-base-get-quote)` template signature pair whose
@@ -139,12 +146,15 @@ async fn get_template(
     let base_to_quote = get_titan_template_data(base_to_quote_sig).await?;
     let quote_signer = extract_signer(&quote_to_base)?;
     let base_signer = extract_signer(&base_to_quote)?;
+    let quote_token_program = get_mint_token_program(quote_mint).await?;
+    let base_token_program = get_mint_token_program(base_mint).await?;
     // q2b (quote->base) output lands in the quote signer's ATA for the base mint.
-    let quote_receiver =
-        derive_ata(&quote_signer, base_mint).context("derive q2b base receiver")?;
+    let quote_receiver = derive_ata_with_program(&quote_signer, base_mint, &base_token_program)
+        .context("derive q2b base receiver")?;
     // b2q (base->quote) output lands in the base signer's ATA for the quote mint (USDC or USDT).
-    let base_receiver =
-        derive_ata(&base_signer, quote_mint).context("derive b2q quote receiver")?;
+    let base_receiver = derive_ata_with_program(&base_signer, quote_mint, &quote_token_program)
+        .context("derive b2q quote receiver")?;
+    let quote_receiver_real = fetch_real_token_account(&quote_receiver).await?;
 
     let quote_to_base = patch_titan_disable_positive_slippage_fee(&patch_titan_single_venue(
         &quote_to_base,
@@ -164,6 +174,13 @@ async fn get_template(
         base_signer,
         quote_receiver,
         base_receiver,
+        quote_token_program: quote_token_program
+            .parse()
+            .context("parse quote token program")?,
+        base_token_program: base_token_program
+            .parse()
+            .context("parse base token program")?,
+        quote_receiver_real,
     })
 }
 

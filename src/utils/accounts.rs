@@ -7,7 +7,9 @@ use simulator_client::BacktestSession;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use super::parse::{TITAN_PROGRAM, TOKEN_PROGRAM, WSOL_MINT, derive_ata};
+use super::parse::{
+    TITAN_PROGRAM, WSOL_MINT, derive_ata, get_account_info, get_mint_token_program,
+};
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const ATA_RENT_EXEMPT: u64 = 2_039_280;
@@ -61,7 +63,14 @@ async fn modify_with_retry(
     Err(last.unwrap()).with_context(|| format!("{label} failed after {ATTEMPTS} attempts"))
 }
 
-pub fn make_token_account(owner: &Address, mint: &str, amount: u64) -> Result<AccountData> {
+/// `token_program` must be the mint's real owning program (legacy Token or Token-2022) —
+/// overriding a Token-2022 account with a legacy-Token owner breaks any CPI into it.
+pub fn make_token_account(
+    owner: &Address,
+    mint: &str,
+    amount: u64,
+    token_program: &str,
+) -> Result<AccountData> {
     let mut data = [0u8; 165];
     data[0..32].copy_from_slice(mint.parse::<Pubkey>()?.as_ref());
     data[32..64].copy_from_slice(owner.as_ref());
@@ -81,9 +90,38 @@ pub fn make_token_account(owner: &Address, mint: &str, amount: u64) -> Result<Ac
         data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
         executable: false,
         lamports,
-        owner: TOKEN_PROGRAM.parse().expect("Should parse token program"),
+        owner: token_program.parse().context("parse token program")?,
         space: 165,
     })
+}
+
+/// A real token account's exact on-chain bytes/lamports/owner, so overrides can preserve
+/// Token-2022 extensions (e.g. `TransferHookAccount`) a synthetic [`make_token_account`]
+/// can't replicate.
+pub async fn fetch_real_token_account(ata: &Pubkey) -> Result<Option<(Vec<u8>, u64, Address)>> {
+    let Some((data, lamports, owner)) = get_account_info(&ata.to_string()).await? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        data,
+        lamports,
+        owner.parse().context("parse owner")?,
+    )))
+}
+
+/// Build an account override for a known-real token account, patching only the amount
+/// field (offset 64) and leaving every other byte (state, extensions) untouched.
+pub fn patch_real_token_account(real: &(Vec<u8>, u64, Address), amount: u64) -> AccountData {
+    let (data, lamports, owner) = real;
+    let mut data = data.clone();
+    data[64..72].copy_from_slice(&amount.to_le_bytes());
+    AccountData {
+        space: data.len() as u64,
+        data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
+        executable: false,
+        lamports: *lamports,
+        owner: *owner,
+    }
 }
 
 /// Lamports a [`make_native_account`] seeds for `amount`: the requested amount
@@ -149,7 +187,8 @@ pub async fn set_ata_balance(
             space: 0,
         }
     } else {
-        make_token_account(&owner_addr, mint, amount)?
+        let token_program = get_mint_token_program(mint).await?;
+        make_token_account(&owner_addr, mint, amount, &token_program)?
     };
 
     let mods = AccountModifications(BTreeMap::from([(

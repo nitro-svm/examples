@@ -129,6 +129,8 @@ pub(crate) fn get_spread_action(
         quote_mint,
         base_mint,
         quote_receiver,
+        quote_token_program,
+        base_token_program,
         ..
     } = template;
 
@@ -147,6 +149,8 @@ pub(crate) fn get_spread_action(
 
     let quote = &quote_mint.to_string();
     let base = &base_mint.to_string();
+    let quote_token_program = &quote_token_program.to_string();
+    let base_token_program = &base_token_program.to_string();
     let is_native_base = base.as_str() == WSOL_MINT;
     let output = if is_native_base {
         *quote_signer
@@ -189,12 +193,18 @@ pub(crate) fn get_spread_action(
     let output_account = if is_native_base {
         make_native_account(DEPTH_SIGNER_LAMPORTS)
     } else {
-        make_token_account(quote_signer, base, 0)?
+        make_token_account(quote_signer, base, 0, base_token_program)?
     };
 
     let account_overrides = AccountModifications(BTreeMap::from([
-        (input, make_token_account(base_signer, base, size)?),
-        (intermediate, make_token_account(quote_signer, quote, 0)?),
+        (
+            input,
+            make_token_account(base_signer, base, size, base_token_program)?,
+        ),
+        (
+            intermediate,
+            make_token_account(quote_signer, quote, 0, quote_token_program)?,
+        ),
         (ledger, make_token_ledger_account(&intermediate, 0)),
         (output, output_account),
     ]));

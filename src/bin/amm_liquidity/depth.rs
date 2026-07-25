@@ -10,7 +10,9 @@ use simulator_api::{
 };
 use solana_address::Address;
 
-use backtest_example::utils::accounts::{make_native_account, make_token_account};
+use backtest_example::utils::accounts::{
+    make_native_account, make_token_account, patch_real_token_account,
+};
 use backtest_example::utils::parse::{WSOL_MINT, derive_ata, patch_titan_template_transaction};
 use backtest_example::utils::types::TitanVenueDiscriminant;
 
@@ -22,6 +24,11 @@ const ITERATIONS: usize = 12;
 /// 1 SOL of headroom seeded into each signer for every depth action.
 /// (Output is `post_lamports - DEPTH_SIGNER_LAMPORTS`).
 pub(crate) const DEPTH_SIGNER_LAMPORTS: u64 = 1_000_000_000;
+
+/// Native SOL headroom for a real historical signer whose current balance may be too
+/// low to cover incidental costs (tx fees, an ATA program's defensive rent top-up on
+/// an already-initialized account) — independent of any token-account overrides.
+const FEE_HEADROOM_LAMPORTS: u64 = 10_000_000;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Depth {
@@ -201,9 +208,13 @@ pub(crate) fn get_depth_actions(
         base_to_quote,
         quote_signer,
         base_signer,
+        quote_receiver,
         base_receiver,
         quote_mint,
         base_mint,
+        quote_token_program,
+        base_token_program,
+        quote_receiver_real,
         ..
     } = template;
 
@@ -240,6 +251,8 @@ pub(crate) fn get_depth_actions(
     let b2q_max = b2q_start.saturating_mul(1 << ITERATIONS);
     let quote_mint = &quote_mint.to_string();
     let base_mint = &base_mint.to_string();
+    let quote_token_program = &quote_token_program.to_string();
+    let base_token_program = &base_token_program.to_string();
 
     // Inputs are each signer's ATA for the mint it spends (derived here).
     //   q2b (quote->base): swap quote from q2b_input to base in q2b_output.
@@ -248,30 +261,44 @@ pub(crate) fn get_depth_actions(
     let q2b_output = if is_native_base {
         *quote_signer
     } else {
-        derive_ata(quote_signer, base_mint).context("derive q2b base output")?
+        *quote_receiver
     };
     let b2q_input = derive_ata(base_signer, base_mint).context("derive b2q base input")?;
     let b2q_output = base_receiver;
 
     // Fund the input ATA and seed each signer with native SOL for fees and rent.
+    // When a real q2b_output already exists on-chain, patch its balance in place instead of
+    // synthesizing a bare account — a synthetic account can't replicate Token-2022 extensions
+    // (e.g. TransferHookAccount) that the mint may require.
     let q2b_output_account = if is_native_base {
         make_native_account(DEPTH_SIGNER_LAMPORTS)
+    } else if let Some(real) = quote_receiver_real {
+        patch_real_token_account(real, 0)
     } else {
-        make_token_account(quote_signer, base_mint, 0)?
+        make_token_account(quote_signer, base_mint, 0, base_token_program)?
     };
-    let q2b_overrides = AccountModifications(BTreeMap::from([
+    let mut q2b_overrides_map = BTreeMap::from([
         (
             q2b_input,
-            make_token_account(quote_signer, quote_mint, q2b_max)?,
+            make_token_account(quote_signer, quote_mint, q2b_max, quote_token_program)?,
         ),
         (q2b_output, q2b_output_account),
-    ]));
+    ]);
+    if !is_native_base {
+        // quote_signer's real balance may be too drained to cover the ATA program's
+        // defensive rent top-up on an already-initialized Token-2022 output account.
+        q2b_overrides_map.insert(*quote_signer, make_native_account(FEE_HEADROOM_LAMPORTS));
+    }
+    let q2b_overrides = AccountModifications(q2b_overrides_map);
     let b2q_overrides = AccountModifications(BTreeMap::from([
         (
             b2q_input,
-            make_token_account(base_signer, base_mint, b2q_max)?,
+            make_token_account(base_signer, base_mint, b2q_max, base_token_program)?,
         ),
-        (*b2q_output, make_token_account(base_signer, quote_mint, 0)?),
+        (
+            *b2q_output,
+            make_token_account(base_signer, quote_mint, 0, quote_token_program)?,
+        ),
     ]));
 
     let mut q2b_size = q2b_start;

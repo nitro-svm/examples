@@ -266,8 +266,17 @@ impl ActionCoordinator {
             ..
         } = notification;
 
-        if let Some(err) = transaction_outcomes.first().and_then(|o| o.err.as_ref()) {
-            eprintln!("Action transaction failed for slot {slot} (label={label:?}): {err}");
+        if let Some(outcome) = transaction_outcomes.first().filter(|o| o.err.is_some()) {
+            eprintln!(
+                "Action transaction failed for slot {slot} (label={label:?}): {}\n  logs:\n{}",
+                outcome.err.as_deref().unwrap_or_default(),
+                outcome
+                    .logs
+                    .iter()
+                    .map(|l| format!("    {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
             return;
         }
 
