@@ -1,23 +1,21 @@
-use anyhow::{Context, Result};
+use std::collections::HashMap;
+
+use anyhow::Result;
 use serde::Deserialize;
 use simulator_api::ScheduledAction;
-use simulator_client::{
-    ActionResultNotification, ActionSubscriptionHandle, BacktestSession, subscribe_actions,
-};
+use simulator_client::ActionResultNotification;
 use solana_account_decoder::UiAccount;
 use solana_address::Address;
-use tokio::sync::mpsc::UnboundedReceiver;
 
-use backtest_example::utils::accounts::native_seed_lamports;
+use backtest_example::utils::{
+    accounts::native_seed_lamports, parse::WSOL_MINT, types::TitanVenueDiscriminant,
+};
 
+use super::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
+use super::spread::{Spread, SpreadStore, get_spread_action};
 use crate::Template;
-use crate::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
-use crate::resolve_url;
-use crate::spread::{Spread, SpreadStore, get_spread_action};
 
 /// Read the SPL token `amount` from a returned `UiAccount` JSON value.
-/// Deserializes the account envelope and decodes its data, then reads the
-/// token `amount` at the SPL token account's `[64..72]` byte range.
 pub(crate) fn token_amount(account: &serde_json::Value) -> Option<u64> {
     let data = UiAccount::deserialize(account).ok()?.data.decode()?;
     let amount = data.get(64..72)?;
@@ -29,11 +27,21 @@ pub(crate) fn native_lamports(account: &serde_json::Value) -> Option<u64> {
     Some(UiAccount::deserialize(account).ok()?.lamports)
 }
 
-/// Label tagged on the spread [`ScheduledAction`](simulator_api::ScheduledAction).
-pub(crate) const SPREAD_LABEL: &str = "spread";
-/// Prefixs for depth action labels; followed by the sweep size.
-pub(crate) const DEPTH_Q2B_PREFIX: &str = "depth-q2b-";
-pub(crate) const DEPTH_B2Q_PREFIX: &str = "depth-b2q-";
+// Action labels are `{venue_disc}-{kind}` so one session can measure several venues at
+// once and route each result back to the venue that produced it.
+const SPREAD_LABEL: &str = "spread";
+const DEPTH_Q2B_PREFIX: &str = "depth-q2b-";
+const DEPTH_B2Q_PREFIX: &str = "depth-b2q-";
+
+pub(crate) fn spread_label(venue: TitanVenueDiscriminant) -> String {
+    format!("{}-{SPREAD_LABEL}", venue as u8)
+}
+pub(crate) fn depth_q2b_label(venue: TitanVenueDiscriminant, size: u64) -> String {
+    format!("{}-{DEPTH_Q2B_PREFIX}{size}", venue as u8)
+}
+pub(crate) fn depth_b2q_label(venue: TitanVenueDiscriminant, size: u64) -> String {
+    format!("{}-{DEPTH_B2Q_PREFIX}{size}", venue as u8)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum DepthDirection {
@@ -47,173 +55,250 @@ pub(crate) enum Label {
 }
 
 impl Label {
-    pub(crate) fn parse(name: &str) -> Option<(Self, u64)> {
-        if name == SPREAD_LABEL {
-            return Some((Self::Spread, 0));
+    /// Parse a `{venue}-{kind}` label into `(venue_disc, label, sweep_size)`.
+    pub(crate) fn parse(name: &str) -> Option<(TitanVenueDiscriminant, Self, u64)> {
+        let (venue, rest) = name.split_once('-')?;
+        let discriminant: u8 = venue.parse().ok()?;
+        let venue = TitanVenueDiscriminant::from_u8(discriminant).ok()?;
+        if rest == SPREAD_LABEL {
+            return Some((venue, Self::Spread, 0));
         }
-        if let Some(size) = name.strip_prefix(DEPTH_Q2B_PREFIX) {
-            return Some((Self::Depth(DepthDirection::QuoteToBase), size.parse().ok()?));
+        if let Some(size) = rest.strip_prefix(DEPTH_Q2B_PREFIX) {
+            return Some((
+                venue,
+                Self::Depth(DepthDirection::QuoteToBase),
+                size.parse().ok()?,
+            ));
         }
-        if let Some(size) = name.strip_prefix(DEPTH_B2Q_PREFIX) {
-            return Some((Self::Depth(DepthDirection::BaseToQuote), size.parse().ok()?));
+        if let Some(size) = rest.strip_prefix(DEPTH_B2Q_PREFIX) {
+            return Some((
+                venue,
+                Self::Depth(DepthDirection::BaseToQuote),
+                size.parse().ok()?,
+            ));
         }
 
         None
     }
 }
 
-pub(crate) async fn subscribe_action_results(
-    session: &BacktestSession,
-    url: &str,
-) -> Result<(
-    ActionSubscriptionHandle,
-    UnboundedReceiver<ActionResultNotification>,
-)> {
-    let rpc_endpoint = session
-        .rpc_endpoint()
-        .context("session has no rpc endpoint")?;
-    let rpc_url = resolve_url(&format!("https://{}", url), rpc_endpoint);
-    eprintln!("[dbg] rpc_endpoint={rpc_endpoint:?} -> rpc_url={rpc_url}");
-
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    let handle = subscribe_actions(&rpc_url, move |result| {
-        let tx = tx.clone();
-        async move {
-            let _ = tx.send(result);
-        }
-    })
-    .await?;
-
-    Ok((handle, rx))
-}
-
-pub(crate) struct ActionProcessor {
+/// Spread + depth measurement for a single venue:
+/// owns its patched template, output stores, and intra-block program filter.
+pub(crate) struct VenueProcessor {
+    venue: TitanVenueDiscriminant,
     spread_size: u64,
     depth_min: u64,
     program_id: Option<Address>,
+    template: Template,
     spread_records: SpreadStore,
     depth_records: DepthStore,
+    start_slot: u64,
+    end_slot: u64,
+    base_price_usdc: u64,
 }
 
-impl ActionProcessor {
+impl VenueProcessor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
+        venue: TitanVenueDiscriminant,
         spread_size: u64,
         depth_min: u64,
         max_impact_bps: u64,
         program_id: Option<Address>,
-    ) -> Self {
-        let intra_block_inspection_enabled = program_id.is_some();
-
-        Self {
-            spread_size,
-            depth_min,
-            program_id,
-            spread_records: SpreadStore::new(),
-            depth_records: DepthStore::new(max_impact_bps, intra_block_inspection_enabled),
-        }
-    }
-
-    /// Build the spread + depth scheduled actions for this run, borrowing the
-    /// template (the server runs them automatically; no ownership needed here).
-    /// `start_slot`/`end_slot` bound the `AfterSlot`-anchored actions, which must
-    /// enumerate every slot they should fire at.
-    pub(crate) fn get_actions(
-        &self,
-        template: &Template,
-        start_slot: u64,
-        end_slot: u64,
-    ) -> Result<Vec<ScheduledAction>> {
-        let mut actions = vec![get_spread_action(
-            template,
-            self.spread_size,
-            self.program_id,
-            start_slot,
-            end_slot,
-        )?];
-        actions.extend(get_depth_actions(
-            template,
-            self.depth_min,
-            self.program_id,
-            start_slot,
-            end_slot,
-        )?);
-        Ok(actions)
-    }
-
-    /// Consume scheduled-action results from the subscription channel until it closes,
-    /// parsing each into spread/depth records. Runs concurrently with the advance loop;
-    /// returns once the subscription's sender is dropped and the channel drains.
-    pub(crate) async fn parse_events(
-        mut self,
-        mut rx: UnboundedReceiver<ActionResultNotification>,
-    ) -> Self {
-        while let Some(notification) = rx.recv().await {
-            let ActionResultNotification {
-                slot,
-                accounts,
-                label,
-                transaction_outcomes,
-                action_index,
-                ..
-            } = notification;
-
-            if let Some(err) = transaction_outcomes.first().and_then(|o| o.err.as_ref()) {
-                eprintln!("Action transaction failed for slot {slot} (label={label:?}): {err}");
-                continue;
-            }
-
-            let Some((label, depth_size)) = label.as_deref().and_then(Label::parse) else {
-                continue;
-            };
-
-            match label {
-                Label::Spread => {
-                    // Round-trip SOL->USDC->SOL: the final output is unwrapped to native SOL
-                    // (subtract the full seeded balance).
-                    let out_amount = accounts
-                        .first()
-                        .and_then(|a| a.as_ref())
-                        .and_then(native_lamports)
-                        .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
-                        .unwrap_or(0);
-                    let spread = Spread::new(slot, self.spread_size, out_amount);
-                    self.spread_records.push(spread);
-                }
-                Label::Depth(direction) => {
-                    let out_account = accounts.first().and_then(|a| a.as_ref());
-                    let out_amount = match direction {
-                        // q2b's SOL output is unwrapped to native SOL
-                        // (subtract the full seeded balance).
-                        DepthDirection::QuoteToBase => out_account
-                            .and_then(native_lamports)
-                            .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
-                            .unwrap_or(0),
-                        // b2q's USDC output is in a receiver ATA with no baseline balance.
-                        DepthDirection::BaseToQuote => {
-                            out_account.and_then(token_amount).unwrap_or(0)
-                        }
-                    };
-                    let depth = Depth::new(depth_size, out_amount);
-                    self.depth_records.add(slot, direction, action_index, depth);
-                }
-            }
-        }
-
-        self
-    }
-
-    pub(crate) fn write_output(
-        &self,
+        template: Template,
         spread_file: &str,
         depth_file: &str,
         quote_mint: &str,
         base_mint: &str,
-    ) -> Result<()> {
-        self.spread_records
-            .write_output(spread_file, quote_mint, base_mint)?;
-        self.depth_records
-            .write_output(depth_file, quote_mint, base_mint)?;
+        start_slot: u64,
+        end_slot: u64,
+        base_price_usdc: u64,
+    ) -> Result<Self> {
+        let intra_block_inspection_enabled = program_id.is_some();
 
+        Ok(Self {
+            venue,
+            spread_size,
+            depth_min,
+            program_id,
+            template,
+            spread_records: SpreadStore::new(spread_file, quote_mint, base_mint)?,
+            depth_records: DepthStore::new(
+                max_impact_bps,
+                intra_block_inspection_enabled,
+                depth_file,
+                quote_mint,
+                base_mint,
+            )?,
+            start_slot,
+            end_slot,
+            base_price_usdc,
+        })
+    }
+
+    /// Build this venue's spread + depth scheduled actions, tagged with its discriminant.
+    fn get_actions(&self) -> Result<Vec<ScheduledAction>> {
+        // let mut actions = vec![get_spread_action(
+        //     &self.template,
+        //     self.spread_size,
+        //     self.program_id,
+        //     self.venue,
+        //     self.start_slot,
+        //     self.end_slot,
+        // )?];
+        let mut actions = vec![];
+        actions.extend(get_depth_actions(
+            &self.template,
+            self.depth_min,
+            self.program_id,
+            self.venue,
+            self.start_slot,
+            self.end_slot,
+            self.base_price_usdc,
+        )?);
+        Ok(actions)
+    }
+
+    /// Record one parsed action result into this venue's spread/depth stores.
+    ///
+    /// Output is read from the returned output account balance.
+    /// `patch_titan_template_transaction` zeroes `fee_centi_bps`, so no Titan routing fee is taken.
+    fn record(
+        &mut self,
+        slot: u64,
+        label: Label,
+        size: u64,
+        action_index: u32,
+        accounts: &[Option<serde_json::Value>],
+    ) {
+        match label {
+            Label::Spread => {
+                // Round-trip base->quote->base: the final output is unwrapped to native
+                // SOL (subtract the seeded balance) only when base is native SOL;
+                // otherwise it's a plain token account.
+                let out_account = accounts.first().and_then(|a| a.as_ref());
+                let out_amount = if self.template.base_mint.to_string() == WSOL_MINT {
+                    out_account
+                        .and_then(native_lamports)
+                        .map(|l| l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS)))
+                        .unwrap_or(0)
+                } else {
+                    out_account.and_then(token_amount).unwrap_or(0)
+                };
+                let spread = Spread::new(slot, self.spread_size, out_amount);
+                if let Err(e) = self.spread_records.push(spread) {
+                    eprintln!(
+                        "failed to write spread row for venue {} slot {slot}: {e}",
+                        self.venue as u8
+                    );
+                }
+            }
+            Label::Depth(direction) => {
+                let out_account = accounts.first().and_then(|a| a.as_ref());
+                let out_amount = match direction {
+                    // q2b's output is unwrapped to native SOL (subtract the seeded balance)
+                    // only when base is native SOL; otherwise it's a plain token account.
+                    DepthDirection::QuoteToBase => {
+                        if self.template.base_mint.to_string() == WSOL_MINT {
+                            out_account
+                                .and_then(native_lamports)
+                                .map(|l| {
+                                    l.saturating_sub(native_seed_lamports(DEPTH_SIGNER_LAMPORTS))
+                                })
+                                .unwrap_or(0)
+                        } else {
+                            out_account.and_then(token_amount).unwrap_or(0)
+                        }
+                    }
+                    // b2q's quote output is in a receiver ATA with no baseline balance.
+                    DepthDirection::BaseToQuote => out_account.and_then(token_amount).unwrap_or(0),
+                };
+                let depth = Depth::new(size, out_amount);
+                if let Err(e) = self.depth_records.add(slot, direction, action_index, depth) {
+                    eprintln!(
+                        "failed to write depth row for venue {} slot {slot}: {e}",
+                        self.venue as u8
+                    );
+                }
+            }
+        }
+    }
+
+    fn finish(self) -> Result<()> {
+        self.spread_records.finish()?;
+        self.depth_records.finish()?;
+        Ok(())
+    }
+}
+
+/// Routes action results from a shared session to the right [`VenueProcessor`] by the
+/// venue discriminant encoded in each action label.
+pub(crate) struct ActionCoordinator {
+    venues: HashMap<TitanVenueDiscriminant, VenueProcessor>,
+}
+
+impl ActionCoordinator {
+    pub(crate) fn new(venues: Vec<VenueProcessor>) -> Self {
+        Self {
+            venues: venues.into_iter().map(|v| (v.venue, v)).collect(),
+        }
+    }
+
+    /// Every venue's spread + depth actions, registered together in one session.
+    pub(crate) fn get_actions(&self) -> Result<Vec<ScheduledAction>> {
+        let mut actions = Vec::new();
+        for venue in self.venues.values() {
+            actions.extend(venue.get_actions()?);
+        }
+        Ok(actions)
+    }
+
+    /// Route one scheduled-action result to its venue's stores, keyed by the
+    /// discriminant encoded in the action label. Called inline by the managed
+    /// session's event loop as each `ManagedEvent::ActionResult` arrives.
+    pub(crate) fn handle_action_result(&mut self, notification: ActionResultNotification) {
+        let ActionResultNotification {
+            slot,
+            accounts,
+            label,
+            transaction_outcomes,
+            action_index,
+            ..
+        } = notification;
+
+        if let Some(outcome) = transaction_outcomes.first().filter(|o| o.err.is_some()) {
+            eprintln!(
+                "Action transaction failed for slot {slot} (label={label:?}): {}\n  logs:\n{}",
+                outcome.err.as_deref().unwrap_or_default(),
+                outcome
+                    .logs
+                    .iter()
+                    .map(|l| format!("    {l}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            return;
+        }
+
+        let Some((venue, label, size)) = label.as_deref().and_then(Label::parse) else {
+            return;
+        };
+
+        match self.venues.get_mut(&venue) {
+            Some(processor) => processor.record(slot, label, size, action_index, &accounts),
+            None => eprintln!(
+                "result for unregistered venue {} at slot {slot}",
+                venue as u8
+            ),
+        }
+    }
+
+    /// Flush any buffered tail and report totals for every venue. Rows are already
+    /// written incrementally as results arrive, so this only finalizes the files.
+    pub(crate) fn finish(self) -> Result<()> {
+        for venue in self.venues.into_values() {
+            venue.finish()?;
+        }
         Ok(())
     }
 }

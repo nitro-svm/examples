@@ -1,5 +1,7 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use solana_account_decoder::parse_token::UiTokenAmount;
+use solana_address::Address;
 use solana_transaction::versioned::VersionedTransaction;
 use solana_transaction_error::TransactionError;
 use solana_transaction_status::InnerInstructions;
@@ -43,4 +45,56 @@ pub struct TxWithMeta {
     pub balance_diffs: Option<BalanceDiffs>,
     pub logs: Option<Vec<String>>,
     pub inner_instructions: Option<Vec<InnerInstructions>>,
+}
+
+// ── venue identifiers ───────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TitanVenueDiscriminant {
+    ZeroFi = 13,
+    HumidiFi = 28,
+    GoonFi = 35,
+    BisonFi = 55,
+    GoonFiV2 = 57,
+    Tessera = 23,
+}
+
+impl TitanVenueDiscriminant {
+    pub fn from_u8(disc: u8) -> Result<Self> {
+        match disc {
+            13 => Ok(Self::ZeroFi),
+            23 => Ok(Self::Tessera),
+            28 => Ok(Self::HumidiFi),
+            35 => Ok(Self::GoonFi),
+            55 => Ok(Self::BisonFi),
+            57 => Ok(Self::GoonFiV2),
+            other => anyhow::bail!("unknown venue discriminant: {other}"),
+        }
+    }
+
+    /// Short lowercase venue name, used for default output filenames.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::ZeroFi => "zerofi",
+            Self::HumidiFi => "humidifi",
+            Self::GoonFi => "goonfi",
+            Self::BisonFi => "bisonfi",
+            Self::GoonFiV2 => "goonfiv2",
+            Self::Tessera => "tessera",
+        }
+    }
+
+    pub fn get_program_id(self) -> Address {
+        let program_id = match self {
+            Self::ZeroFi => "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",
+            Self::HumidiFi => "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp",
+            Self::GoonFi => "goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdBUL17BnS5j",
+            Self::BisonFi => "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi",
+            Self::GoonFiV2 => "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",
+            Self::Tessera => "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",
+        };
+
+        Address::from_str_const(program_id)
+    }
 }

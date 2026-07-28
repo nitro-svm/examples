@@ -3,7 +3,7 @@
 //!
 //! ## Spread methodology
 //!
-//! Round-trip (quote→base then base→quote) against the same frozen state.
+//! Round-trip against the same frozen state.
 //! ```text
 //! spread_bps = (size - final_out) / size * 10_000
 //! ```
@@ -18,119 +18,76 @@
 //! The industry-standard depth metric is reported at 200 bps (2%) of impact.
 //! The full curve is written to the depth CSV so any threshold can be read off.
 
-use backtest_example::utils::parse::{
-    USDC_MINT, WSOL_MINT, derive_ata, extract_signer, get_titan_template_transaction,
-    patch_titan_single_venue,
-};
-
 use std::sync::LazyLock;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use simulator_client::{BacktestClient, Continue, CreateSession};
+use simulator_api::{AccountModifications, ContinueParams};
+use simulator_client::{
+    CreateSession, ManagedBacktestSession, ManagedEvent, ManagedSessionError, backtest_ws_url,
+};
+use solana_account::Account;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
+use backtest_example::utils::chain::{get_account_info, get_block_time, get_mint_token_program};
+use backtest_example::utils::parse::{
+    SPCX_MINT, USDC_MINT, USDT_MINT, WSOL_MINT, derive_ata_with_program, extract_signer,
+    get_titan_template_data, patch_titan_disable_positive_slippage_fee, patch_titan_single_venue,
+};
+use backtest_example::utils::price::{Ticker, get_historical_binance_price_usdc};
+use backtest_example::utils::types::TitanVenueDiscriminant;
+
 mod action;
 mod depth;
 mod spread;
+mod template;
 
-use action::{ActionProcessor, subscribe_action_results};
+use action::{ActionCoordinator, VenueProcessor};
+use template::{
+    titan_goonfiv2_sol_usdt_template_v3, titan_multi_sol_usdc_template_v3,
+    titan_multi_spcx_usdc_template_v3, titan_tessera_sol_usdc_template_v3,
+};
 
-#[repr(u8)]
-enum TitanVenueDiscriminant {
-    ZeroFi = 13,
-    HumidiFi = 28,
-    GoonFi = 35,
-    BisonFi = 55,
-    GoonFiV2 = 57,
-}
+/// Fallback USDC/base price for sizing the b2q depth sweep when we can't fetch a
+/// real one (no tracked Binance ticker for the base mint, or the fetch fails).
+const FALLBACK_BASE_PRICE_USDC: u64 = 100;
 
-impl TitanVenueDiscriminant {
-    fn from_u8(disc: u8) -> Result<Self> {
-        match disc {
-            13 => Ok(Self::ZeroFi),
-            28 => Ok(Self::HumidiFi),
-            35 => Ok(Self::GoonFi),
-            55 => Ok(Self::BisonFi),
-            57 => Ok(Self::GoonFiV2),
-            other => anyhow::bail!("unknown venue discriminant: {other}"),
-        }
-    }
+// ── configuration ──────────────────────────────────────────────────────────────
 
-    fn get_program_id(self) -> Address {
-        let program_id = match self {
-            Self::ZeroFi => "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",
-            Self::HumidiFi => "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp",
-            Self::GoonFi => "goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdBUL17BnS5j",
-            Self::BisonFi => "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi",
-            Self::GoonFiV2 => "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE",
-        };
-
-        Address::from_str_const(program_id)
-    }
-}
-
-mod titan_template_v3 {
-    pub const SOL_TO_USDC: &str =
-        "24RysBDMt3gavdURB1H835C9KBC5ovsAdQ9AhdJ3HwccX9dvk29mNQkeUAKqUfHEC8UeqecoGkPqCKe2TViVF45Y";
-    pub const USDC_TO_SOL: &str =
-        "2RtLqCUeYBVhRppiJ2DFZoyVcwuJtPWprauRFfocynoiREYrGeJoqbpLM8bKsJkSoYpgr4oLnYEwCvrpDpiEZZV8";
-}
-
-#[derive(Parser)]
-#[command(about = "Measure spread and depth for a single prop AMM venue across blocks")]
-struct Cli {
-    #[arg(long, default_value = "staging.simulator.termina.technology")]
-    url: String,
-
-    #[arg(long, env = "SIMULATOR_API_KEY")]
-    api_key: String,
-
-    #[arg(long, default_value_t = 422_818_048)]
-    start_slot: u64,
-
-    #[arg(long, default_value_t = 422_818_148)]
-    end_slot: u64,
-
-    #[arg(long, default_value = "spread.csv")]
-    spread_output: String,
-
-    #[arg(long, default_value = "depth.csv")]
-    depth_output: String,
-
-    #[arg(long, default_value_t = false)]
-    enable_intra_block_inspection: bool,
-
-    #[arg(long, default_value = USDC_MINT)]
-    quote_mint: String,
-
-    #[arg(long, default_value = WSOL_MINT)]
-    base_mint: String,
-
+/// Everything needed to run a spread/depth measurement, decoupled from the CLI so
+/// library callers can drive it directly. Field defaults match the CLI defaults.
+#[derive(Clone, Debug)]
+pub struct MeasurementConfig {
+    /// Simulator host (no scheme); used for both the `wss://…/backtest` control
+    /// plane and the `https://…` RPC data plane.
+    pub url: String,
+    /// Simulator API key.
+    pub api_key: String,
+    pub start_slot: u64,
+    pub end_slot: u64,
+    /// Explicit spread CSV path; only honored for single-venue runs. Multi-venue
+    /// runs always auto-name per venue + slot range so files can't collide.
+    pub spread_output: Option<String>,
+    /// Explicit depth CSV path; single-venue only (see `spread_output`).
+    pub depth_output: Option<String>,
+    pub enable_intra_block_inspection: bool,
+    pub quote_mint: String,
+    pub base_mint: String,
     /// Spread measurement size in base native units.
-    #[arg(long, default_value_t = 50_000_000_000)]
-    spread_size: u64,
-
+    pub spread_size: u64,
     /// Smallest size for the depth sweep (quote-mint native units).
-    #[arg(long, default_value_t = 10_000_000)]
-    depth_min: u64,
-
+    pub depth_min: u64,
     /// Stop the depth sweep once price impact exceeds this many bps.
-    #[arg(long, default_value_t = 1000)]
-    max_impact_bps: u64,
-
-    /// Titan Venue discriminant to isolate (55 = BisonFi, 13 = ZeroFi, 28 = HumidiFi,
-    /// 35 = GoonFi, 57 = GoonFiV2). See the Venue enum in the Titan IDL.
-    #[arg(long, default_value_t = TitanVenueDiscriminant::BisonFi as u8)]
-    venue_disciminant: u8,
+    pub max_impact_bps: u64,
+    /// Titan venue discriminant(s) to isolate; all are measured in one session.
+    pub venue_discriminants: Vec<u8>,
 }
 
 // ── template ─────────────────────────────────────────────────────────────────
 
-struct Template {
+pub(crate) struct Template {
     quote_to_base: VersionedTransaction,
     base_to_quote: VersionedTransaction,
     quote_mint: Address,
@@ -139,29 +96,90 @@ struct Template {
     base_signer: Pubkey,
     quote_receiver: Pubkey,
     base_receiver: Pubkey,
+    quote_token_program: Address,
+    base_token_program: Address,
+    /// only used when the base mint has token-2022 extensions
+    /// since a synthetic account can't replicate.
+    base_account: Option<Account>,
 }
 
-async fn get_template(venue_disc: u8) -> Result<Template> {
-    let usdc_to_sol = get_titan_template_transaction(titan_template_v3::USDC_TO_SOL).await?;
-    let sol_to_usdc = get_titan_template_transaction(titan_template_v3::SOL_TO_USDC).await?;
-    let quote_signer = extract_signer(&usdc_to_sol)?;
-    let base_signer = extract_signer(&sol_to_usdc)?;
-    let quote_receiver =
-        derive_ata(&quote_signer, WSOL_MINT).context("derive q2b WSOL receiver")?;
-    let base_receiver = derive_ata(&base_signer, USDC_MINT).context("derive b2q USDC receiver")?;
+/// Pick the `(spend-quote-get-base, spend-base-get-quote)` template signature pair whose
+/// swap_route_v3 body contains `venue`, keyed by the quote and base mints.
+fn find_titan_template_signatures(
+    venue: TitanVenueDiscriminant,
+    quote_mint: &str,
+    base_mint: &str,
+) -> (&'static str, &'static str) {
+    match (venue, quote_mint, base_mint) {
+        (TitanVenueDiscriminant::GoonFiV2, USDT_MINT, WSOL_MINT) => (
+            titan_goonfiv2_sol_usdt_template_v3::USDT_TO_SOL,
+            titan_goonfiv2_sol_usdt_template_v3::SOL_TO_USDT,
+        ),
+        (
+            TitanVenueDiscriminant::GoonFiV2 | TitanVenueDiscriminant::ZeroFi,
+            USDC_MINT,
+            SPCX_MINT,
+        ) => (
+            titan_multi_spcx_usdc_template_v3::USDC_TO_SPCX,
+            titan_multi_spcx_usdc_template_v3::SPCX_TO_USDC,
+        ),
+        (TitanVenueDiscriminant::Tessera, USDC_MINT, WSOL_MINT) => (
+            titan_tessera_sol_usdc_template_v3::USDC_TO_SOL,
+            titan_tessera_sol_usdc_template_v3::SOL_TO_USDC,
+        ),
+        (_, _, _) => (
+            titan_multi_sol_usdc_template_v3::USDC_TO_SOL,
+            titan_multi_sol_usdc_template_v3::SOL_TO_USDC,
+        ),
+    }
+}
 
-    let quote_to_base = patch_titan_single_venue(&usdc_to_sol, venue_disc)?;
-    let base_to_quote = patch_titan_single_venue(&sol_to_usdc, venue_disc)?;
+async fn get_template(
+    venue: TitanVenueDiscriminant,
+    quote_mint: &str,
+    base_mint: &str,
+) -> Result<Template> {
+    let (quote_to_base_sig, base_to_quote_sig) =
+        find_titan_template_signatures(venue, quote_mint, base_mint);
+    let quote_to_base = get_titan_template_data(quote_to_base_sig).await?;
+    let base_to_quote = get_titan_template_data(base_to_quote_sig).await?;
+    let quote_signer = extract_signer(&quote_to_base)?;
+    let base_signer = extract_signer(&base_to_quote)?;
+    let quote_token_program = get_mint_token_program(quote_mint).await?;
+    let base_token_program = get_mint_token_program(base_mint).await?;
+    // q2b (quote->base) output lands in the quote signer's ATA for the base mint.
+    let q2b_receiver = derive_ata_with_program(&quote_signer, base_mint, &base_token_program)
+        .context("derive q2b base receiver")?;
+    // b2q (base->quote) output lands in the base signer's ATA for the quote mint (USDC or USDT).
+    let b2q_receiver = derive_ata_with_program(&base_signer, quote_mint, &quote_token_program)
+        .context("derive b2q quote receiver")?;
+    let q2b_data = get_account_info(&q2b_receiver.to_string()).await?;
+
+    let quote_to_base = patch_titan_disable_positive_slippage_fee(&patch_titan_single_venue(
+        &quote_to_base,
+        &venue,
+    )?)?;
+    let base_to_quote = patch_titan_disable_positive_slippage_fee(&patch_titan_single_venue(
+        &base_to_quote,
+        &venue,
+    )?)?;
 
     Ok(Template {
         quote_to_base,
         base_to_quote,
-        quote_mint: Address::from_str_const(USDC_MINT),
-        base_mint: Address::from_str_const(WSOL_MINT),
+        quote_mint: quote_mint.parse().context("parse quote mint")?,
+        base_mint: base_mint.parse().context("parse base mint")?,
         quote_signer,
         base_signer,
-        quote_receiver,
-        base_receiver,
+        quote_receiver: q2b_receiver,
+        base_receiver: b2q_receiver,
+        quote_token_program: quote_token_program
+            .parse()
+            .context("parse quote token program")?,
+        base_token_program: base_token_program
+            .parse()
+            .context("parse base token program")?,
+        base_account: q2b_data,
     })
 }
 
@@ -198,81 +216,235 @@ fn is_program_upgrade(tx: &VersionedTransaction, program_id: &Pubkey) -> bool {
 
 // ── session runners ───────────────────────────────────────────────────────────
 
-/// Resolve a possibly-relative session endpoint against the base HTTP URL.
-fn resolve_url(base: &str, endpoint: &str) -> String {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return endpoint.to_string();
-    }
-    format!("{base}/{}", endpoint.trim_start_matches('/'))
-}
-
+/// Drive a single managed session to completion, routing every action result to
+/// `action_processor` as it arrives.
 async fn run_session(
-    client: BacktestClient,
-    cli: &Cli,
-    template: &Template,
-    program_id: Option<Address>,
-) -> Result<ActionProcessor> {
-    let timeout = Some(Duration::from_secs(120));
-    let action_processor = ActionProcessor::new(
-        cli.spread_size,
-        cli.depth_min,
-        cli.max_impact_bps,
-        program_id,
-    );
+    config: &MeasurementConfig,
+    mut action_processor: ActionCoordinator,
+) -> Result<ActionCoordinator> {
+    let actions = action_processor.get_actions()?;
+    eprintln!("[dbg] registering {} actions", actions.len());
 
-    let actions = action_processor.get_actions(template, cli.start_slot, cli.end_slot)?;
-    eprintln!("[dbg] registering {} actions", actions.len(),);
+    let create = CreateSession::builder()
+        .start_slot(config.start_slot)
+        .end_slot(config.end_slot)
+        .disconnect_timeout_secs(900u16)
+        .capacity_wait_timeout_secs(900u16)
+        .actions(actions)
+        .build()
+        .into_request()
+        .context("building create-session request")?;
 
-    let mut session = client
-        .create_session(
-            CreateSession::builder()
-                .start_slot(cli.start_slot)
-                .end_slot(cli.end_slot)
-                .disconnect_timeout_secs(900u16)
-                .capacity_wait_timeout_secs(900u16)
-                .actions(actions)
-                .build(),
-        )
-        .await?;
+    let ws_url = backtest_ws_url(&config.url);
+    let mut session = ManagedBacktestSession::start(ws_url, config.api_key.clone(), create)
+        .await
+        .context("starting managed session")?;
 
-    session.ensure_ready(Some(Duration::from_secs(600))).await?;
+    // Actions are registered in the create request; this attaches the result
+    // consumer that feeds `handle_action_result` below.
+    session.subscribe_actions();
 
-    // Subscribe only after the session is ready, but before advancing any slot.
-    // The one-shot `subscribe_actions` has no reconnect, so subscribing before the
-    // data plane is up gets an immediate `subscriptionComplete` and zero results.
-    // sim-cli avoids this by attaching subscriptions to an already-registered
-    // session route; here we wait for `ensure_ready` first. The subscription is
-    // still live before the advance loop, so no action results are missed.
-    let (sub, rx) = subscribe_action_results(&session, &cli.url).await?;
-    let handle = tokio::spawn(action_processor.parse_events(rx));
-
+    let advance_count = config.end_slot - config.start_slot;
     loop {
-        let result = session
-            .advance(
-                Continue::builder()
-                    .advance_count(cli.end_slot - cli.start_slot)
-                    .build(),
-                timeout,
-                |_| {},
-            )
-            .await?;
-
-        if result.completed {
-            break;
+        match session.next_event().await {
+            // The server is ready for another `Continue`; advance the whole range.
+            // Re-issued on each `ReadyForContinue` in case the range spans several.
+            Ok(ManagedEvent::ReadyForContinue) => {
+                let params = ContinueParams {
+                    advance_count,
+                    transactions: Vec::new(),
+                    modify_account_states: AccountModifications(Default::default()),
+                };
+                session
+                    .send_continue(params)
+                    .await
+                    .context("send_continue")?;
+            }
+            Ok(ManagedEvent::ActionResult(notification)) => {
+                action_processor.handle_action_result(notification);
+            }
+            // Trailing action results are drained and delivered before `Completed`,
+            // so by here every result has already been routed.
+            Ok(ManagedEvent::Completed { .. }) => break,
+            Ok(ManagedEvent::Error(e)) => {
+                session.shutdown().await;
+                anyhow::bail!("simulator error: {e}");
+            }
+            Ok(_) => {}
+            Err(ManagedSessionError::Cancelled) => break,
+            Err(e) => {
+                session.shutdown().await;
+                return Err(anyhow::anyhow!("session failed: {e}"));
+            }
         }
     }
 
-    // Stop the subscription; dropping its sender closes the channel, which ends
-    // the processor's `recv()` loop after it drains the tail results.
-    sub.stop.send(true).ok();
-    sub.join_handle.await.ok();
-    let action_processor = handle.await.context("action processor panicked")?;
-    let _ = session.close(Some(Duration::from_secs(10))).await;
-
+    session.shutdown().await;
     Ok(action_processor)
 }
 
-// ── main ──────────────────────────────────────────────────────────────────────
+// ── public entry point ──────────────────────────────────────────────────────────
+
+/// Run a full spread/depth measurement across every configured venue,
+/// streaming results to their CSV files.
+pub async fn run_measurement(config: &MeasurementConfig) -> Result<()> {
+    eprintln!("[ws] connecting to {}", backtest_ws_url(&config.url));
+
+    // Explicit spread_output/depth_output only apply to single-venue runs; multi-venue
+    // runs always auto-name (per venue + slot range) so the files can't collide.
+    let single_venue = config.venue_discriminants.len() == 1;
+
+    // Calculate the base/USDC price at the start of the replay range
+    // to match the starting value of the depth sweep in both directions.
+    // If that ticker isn't reachable (e.g. Binance's geo restrictions),
+    // fall back to a default value.
+    let base_price_usdc = match Ticker::from_mint(&config.base_mint) {
+        Some(ticker) => {
+            let fetch = async {
+                let start_block_time = get_block_time(config.start_slot).await?;
+                get_historical_binance_price_usdc(ticker, start_block_time).await
+            };
+            match fetch.await {
+                Ok(price) => {
+                    eprintln!(
+                        "[dbg] {} price at slot {}: {price}",
+                        config.base_mint, config.start_slot
+                    );
+                    price
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[warn] couldn't fetch {} price ({e}); falling back to {FALLBACK_BASE_PRICE_USDC} USDC/base for depth sweep sizing",
+                        config.base_mint
+                    );
+                    FALLBACK_BASE_PRICE_USDC
+                }
+            }
+        }
+        None => FALLBACK_BASE_PRICE_USDC,
+    };
+
+    let mut processors = Vec::with_capacity(config.venue_discriminants.len());
+    for &disc in &config.venue_discriminants {
+        let venue = TitanVenueDiscriminant::from_u8(disc)?;
+        let name = venue.name();
+        let program_id = config
+            .enable_intra_block_inspection
+            .then(|| venue.get_program_id());
+        let template = get_template(venue, &config.quote_mint, &config.base_mint).await?;
+
+        let spread_file = config
+            .spread_output
+            .clone()
+            .filter(|_| single_venue)
+            .unwrap_or_else(|| {
+                format!(
+                    "spread_{name}_{}_{}.csv",
+                    config.start_slot, config.end_slot
+                )
+            });
+        let depth_file = config
+            .depth_output
+            .clone()
+            .filter(|_| single_venue)
+            .unwrap_or_else(|| {
+                format!("depth_{name}_{}_{}.csv", config.start_slot, config.end_slot)
+            });
+
+        processors.push(VenueProcessor::new(
+            venue,
+            config.spread_size,
+            config.depth_min,
+            config.max_impact_bps,
+            program_id,
+            template,
+            &spread_file,
+            &depth_file,
+            &config.quote_mint,
+            &config.base_mint,
+            config.start_slot,
+            config.end_slot,
+            base_price_usdc,
+        )?);
+    }
+
+    let coordinator = run_session(config, ActionCoordinator::new(processors)).await?;
+    coordinator.finish()?;
+
+    Ok(())
+}
+
+#[derive(Parser)]
+#[command(about = "Measure spread and depth for a single prop AMM venue across blocks")]
+struct Cli {
+    #[arg(long, default_value = "staging.simulator.termina.technology")]
+    url: String,
+
+    #[arg(long, env = "SIMULATOR_API_KEY")]
+    api_key: String,
+
+    #[arg(long, default_value_t = 422_818_048)]
+    start_slot: u64,
+
+    #[arg(long, default_value_t = 422_818_148)]
+    end_slot: u64,
+
+    /// Spread CSV path. Defaults to `spread_<venue>.csv` so runs don't clobber each other.
+    #[arg(long)]
+    spread_output: Option<String>,
+
+    /// Depth CSV path. Defaults to `depth_<venue>.csv` so runs don't clobber each other.
+    #[arg(long)]
+    depth_output: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    enable_intra_block_inspection: bool,
+
+    #[arg(long, default_value = USDC_MINT)]
+    quote_mint: String,
+
+    #[arg(long, default_value = WSOL_MINT)]
+    base_mint: String,
+
+    /// Spread measurement size in base native units.
+    #[arg(long, default_value_t = 50_000_000_000)]
+    spread_size: u64,
+
+    /// Smallest size for the depth sweep (quote-mint native units).
+    #[arg(long, default_value_t = 1_000_000_000)]
+    depth_min: u64,
+
+    /// Stop the depth sweep once price impact exceeds this many bps.
+    #[arg(long, default_value_t = 1000)]
+    max_impact_bps: u64,
+
+    /// Titan Venue discriminant(s) to isolate, comma-separated or repeated
+    /// All listed venues are measured in the same simulator session.
+    /// 55 = BisonFi, 13 = ZeroFi, 28 = HumidiFi, 57 = GoonFiV2, 23 = Tessera.
+    /// See the Venue enum in the Titan IDL.
+    #[arg(long = "venue-discriminant", value_delimiter = ',', default_value = "55", num_args = 1..)]
+    venue_discriminants: Vec<u8>,
+}
+
+impl From<Cli> for MeasurementConfig {
+    fn from(cli: Cli) -> Self {
+        MeasurementConfig {
+            url: cli.url,
+            api_key: cli.api_key,
+            start_slot: cli.start_slot,
+            end_slot: cli.end_slot,
+            spread_output: cli.spread_output,
+            depth_output: cli.depth_output,
+            enable_intra_block_inspection: cli.enable_intra_block_inspection,
+            quote_mint: cli.quote_mint,
+            base_mint: cli.base_mint,
+            spread_size: cli.spread_size,
+            depth_min: cli.depth_min,
+            max_impact_bps: cli.max_impact_bps,
+            venue_discriminants: cli.venue_discriminants,
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -281,26 +453,10 @@ async fn main() -> Result<()> {
         .ok();
 
     let cli = Cli::parse();
-    let template = get_template(cli.venue_disciminant).await?;
+    // Validate discriminants up front so a bad value fails before opening a session.
+    for &disc in &cli.venue_discriminants {
+        TitanVenueDiscriminant::from_u8(disc)?;
+    }
 
-    let client = BacktestClient::builder()
-        .url(&cli.url)
-        .api_key(cli.api_key.clone())
-        .build();
-
-    eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
-
-    let spread_file = cli.spread_output.clone();
-    let depth_file = cli.depth_output.clone();
-
-    let program_id = if cli.enable_intra_block_inspection {
-        Some(TitanVenueDiscriminant::from_u8(cli.venue_disciminant)?.get_program_id())
-    } else {
-        None
-    };
-
-    let action_processor = run_session(client, &cli, &template, program_id).await?;
-    action_processor.write_output(&spread_file, &depth_file, &cli.quote_mint, &cli.base_mint)?;
-
-    Ok(())
+    run_measurement(&MeasurementConfig::from(cli)).await
 }

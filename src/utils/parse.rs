@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use super::types::{TransactionTokenBalanceSerde, TxWithMeta};
+use super::types::{TitanVenueDiscriminant, TransactionTokenBalanceSerde, TxWithMeta};
 use anyhow::{Context, Result};
 use base64::Engine as _;
 use solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction};
@@ -10,9 +10,12 @@ use solana_transaction::versioned::VersionedTransaction;
 
 pub const SOLANA_RPC: &str = "https://api.mainnet-beta.solana.com";
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
 pub const WSOL_MINT: &str = "So11111111111111111111111111111111111111112";
 pub const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+pub const USDT_MINT: &str = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB";
+pub const SPCX_MINT: &str = "SPCXxcqXj6e5dJDVNovHN8744zkbhM2bYudU45BimGb";
 
 pub const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 pub const JUP_FEE_AUTHORITY: &str = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
@@ -39,7 +42,7 @@ fn skip_venue_extra(disc: u8, data: &[u8], pos: &mut usize) -> Result<()> {
         // 1 extra byte (bool / u8 field)
         1 | 2 | 5 | 7 | 11 | 14 | 16 | 17 | 18 | 20 | 22 | 23 | 25 | 27 | 30 | 31 | 32 | 37
         | 39 | 43 | 44 | 45 | 49 | 52 | 54 | 55 | 57 | 58 | 60 | 63 | 64 | 65 | 68 | 69 | 71
-        | 72 => 1,
+        | 72 | 73 => 1,
         13 => 8,           // ZeroFi: expected_amount_out u64
         26 | 35 | 42 => 2, // ExponentAmm / GoonFi / Hylo
         28 => 9,           // HumidiFi: is_quote_to_base(1) + swap_id(8)
@@ -99,7 +102,7 @@ fn parse_titan_v3_swaps(data: &[u8]) -> Result<Vec<ParsedSwap>> {
 /// Sets mesh_size=1 and weight_nanos=1_000_000_000 for the kept entry.
 pub fn patch_titan_single_venue(
     tx: &VersionedTransaction,
-    venue_disc: u8,
+    venue: &TitanVenueDiscriminant,
 ) -> Result<VersionedTransaction> {
     let static_keys = tx.message.static_account_keys();
     let titan_idx = static_keys
@@ -119,10 +122,11 @@ pub fn patch_titan_single_venue(
         })
         .context("no swap_route_v3 found")?;
 
+    let discriminant = *venue as u8;
     let target_pos = swaps
         .iter()
-        .position(|s| s.venue_disc == venue_disc)
-        .with_context(|| format!("venue {venue_disc} not in swaps"))?;
+        .position(|s| s.venue_disc == discriminant)
+        .with_context(|| format!("venue {discriminant} not in swaps"))?;
     let total_rem: usize = swaps.iter().map(|s| s.n_accounts as usize).sum();
 
     let old_ix = &ixs[titan_ix_pos];
@@ -171,101 +175,41 @@ pub fn patch_titan_single_venue(
     Ok(new_tx)
 }
 
-/// DIAGNOSTIC: resolve the v0 ALTs and print, for the Titan swap instruction, the
-/// resolved pubkey at each account position, labeling named programs and the known
-/// venue programs. Used to locate venue-group boundaries in the account list.
-pub async fn debug_dump_venue_positions(tx: &VersionedTransaction) -> Result<()> {
-    let static_keys = tx.message.static_account_keys().to_vec();
+/// Point Titan's `positive_slippage_fee_receiver` slot back at the "None" sentinel so the
+/// venue's full output lands in the user's output token account.
+pub fn patch_titan_disable_positive_slippage_fee(
+    tx: &VersionedTransaction,
+) -> Result<VersionedTransaction> {
+    const POSITIVE_SLIPPAGE_FEE_RECEIVER: usize = 11;
+
+    let static_keys = tx.message.static_account_keys();
     let titan_idx = static_keys
         .iter()
         .position(|k| k.to_string() == TITAN_PROGRAM)
-        .context("titan not in static keys")? as u8;
+        .context("titan program not in static keys")? as u8;
 
-    // Resolve ALTs: loaded order is all-writable (across tables) then all-readonly.
-    let mut writable: Vec<Pubkey> = Vec::new();
-    let mut readonly: Vec<Pubkey> = Vec::new();
-    if let VersionedMessage::V0(msg) = &tx.message {
-        for lut in &msg.address_table_lookups {
-            let addrs = fetch_alt_addresses(&lut.account_key.to_string()).await?;
-            for &i in &lut.writable_indexes {
-                writable.push(*addrs.get(i as usize).context("alt writable idx oob")?);
-            }
-            for &i in &lut.readonly_indexes {
-                readonly.push(*addrs.get(i as usize).context("alt readonly idx oob")?);
-            }
-        }
-    }
-    let mut full = static_keys.clone();
-    full.extend(writable);
-    full.extend(readonly);
-
-    let ixs = tx.message.instructions();
-    let (_, swaps) = ixs
-        .iter()
-        .enumerate()
-        .find_map(|(i, ix)| {
-            if ix.program_id_index != titan_idx {
-                return None;
-            }
-            parse_titan_v3_swaps(&ix.data).ok().map(|s| (i, s))
-        })
-        .context("no swap_route_v3 found")?;
-    let titan_ix = ixs
-        .iter()
-        .find(|ix| ix.program_id_index == titan_idx)
-        .unwrap();
-
-    // venue group start positions (within the full instruction account list)
-    let total_rem: usize = swaps.iter().map(|s| s.n_accounts as usize).sum();
-    let prefix = titan_ix.accounts.len() - total_rem;
-    eprintln!(
-        "[venuedbg] ix.accounts.len()={} total_rem={} prefix={}",
-        titan_ix.accounts.len(),
-        total_rem,
-        prefix
-    );
-    // boundaries assuming venue accounts start right after `prefix`
-    let mut starts = Vec::new();
-    let mut acc = prefix;
-    for s in &swaps {
-        starts.push((acc, s.venue_disc, s.n_accounts));
-        acc += s.n_accounts as usize;
-    }
-
-    let label = |k: &str| -> &'static str {
-        match k {
-            "11111111111111111111111111111111" => " <system_program>",
-            "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT" => " <titan/None>",
-            "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp" => " <<< ZeroFi prog",
-            "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi" => " <<< BisonFi prog",
-            "goonuddtQRrWqqn5nFyczVKaie28f3kDkHWkHtURSLE" => " <<< GoonFiV2 prog",
-            _ => "",
-        }
+    let mut new_tx = tx.clone();
+    let ixs = match &mut new_tx.message {
+        VersionedMessage::Legacy(msg) => &mut msg.instructions,
+        VersionedMessage::V0(msg) => &mut msg.instructions,
+        VersionedMessage::V1(msg) => &mut msg.instructions,
     };
-    for (pos, &idx) in titan_ix.accounts.iter().enumerate() {
-        let k = full
-            .get(idx as usize)
-            .map(|k| k.to_string())
-            .unwrap_or_else(|| "??".into());
-        let group = starts
-            .iter()
-            .rev()
-            .find(|(st, _, _)| pos >= *st)
-            .map(|(st, disc, n)| format!("venue@{st} disc={disc} n={n}"))
-            .filter(|_| pos >= prefix)
-            .unwrap_or_else(|| {
-                if pos < prefix {
-                    "PREFIX".into()
-                } else {
-                    String::new()
-                }
-            });
-        eprintln!(
-            "[venuedbg] pos={pos:>3} idx={idx:>3} {k}{}  [{group}]",
-            label(&k)
-        );
-    }
-    Ok(())
+    let titan_ix = ixs
+        .iter_mut()
+        .find(|ix| ix.program_id_index == titan_idx && ix.data.first() == Some(&0x2a))
+        .context("no swap_route_v3 titan ix found")?;
+
+    // "None" for an Anchor optional account == the program id, i.e. program_id_index.
+    let none_sentinel = titan_ix.program_id_index;
+    let slot = titan_ix
+        .accounts
+        .get_mut(POSITIVE_SLIPPAGE_FEE_RECEIVER)
+        .with_context(|| {
+            format!("titan ix has no account at position {POSITIVE_SLIPPAGE_FEE_RECEIVER}")
+        })?;
+    *slot = none_sentinel;
+
+    Ok(new_tx)
 }
 
 /// Fetch an Address Lookup Table account and return its stored addresses.
@@ -501,7 +445,7 @@ pub fn parse_jupiter_swap_result(
     })
 }
 
-pub async fn get_titan_template_transaction(signature: &str) -> Result<VersionedTransaction> {
+pub async fn get_titan_template_data(signature: &str) -> Result<VersionedTransaction> {
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1,
         "method": "getTransaction",
@@ -556,8 +500,9 @@ pub fn patch_titan_template_transaction(
         .iter_mut()
         .find(|ix| ix.program_id_index == titan_idx)
         .context("titan ix not found")?;
-    // v3 layout: [0]=disc(0x2a) [1]=config [2..10]=amount [10..18]=expected_amount_out [18..20]=slippage_threshold_bps
-    anyhow::ensure!(titan_ix.data.len() >= 20, "titan ix data too short for v3");
+    // v3 layout: [0]=disc(0x2a) [1]=config [2..10]=amount [10..18]=expected_amount_out
+    //            [18..20]=slippage_threshold_bps [20]=mints [21..23]=fee_centi_bps
+    anyhow::ensure!(titan_ix.data.len() >= 23, "titan ix data too short for v3");
     anyhow::ensure!(
         titan_ix.data[0] == 0x2a,
         "unexpected titan ix discriminator (not swap_route_v3)"
@@ -567,6 +512,8 @@ pub fn patch_titan_template_transaction(
     titan_ix.data[10..18].copy_from_slice(&0u64.to_le_bytes());
     // bump dynamic-allocation slippage threshold to 10,000 bps (100%) so resimulation doesn't error
     titan_ix.data[18..20].copy_from_slice(&10_000u16.to_le_bytes());
+    // zero Titan's routing fee (fee_centi_bps): we measure the venue's raw quote, not Titan's fee
+    titan_ix.data[21..23].copy_from_slice(&0u16.to_le_bytes());
 
     Ok(new_tx)
 }
@@ -604,6 +551,62 @@ pub fn repoint_titan_static_account(
         VersionedMessage::V1(msg) => &mut msg.account_keys,
     };
     *keys.get_mut(key_idx).context("key idx out of range")? = new_key;
+    Ok(new_tx)
+}
+
+/// Insert `key` as a fresh *writable* non-signer static key and point the Titan swap's
+/// account at `position` to it. For slots whose current key is aliased, an
+/// in-place rewrite via [`repoint_titan_static_account`] would move every reference;
+/// inserting a new key repoints only the one slot. The key goes at the end of the
+/// writable non-signer region, so every index at or past the insertion point shifts up.
+pub fn repoint_titan_account_via_new_key(
+    tx: &VersionedTransaction,
+    position: usize,
+    key: Pubkey,
+) -> Result<VersionedTransaction> {
+    let static_keys = tx.message.static_account_keys();
+    let titan_idx = static_keys
+        .iter()
+        .position(|k| k.to_string() == TITAN_PROGRAM)
+        .context("titan program not in static keys")? as u8;
+    let num_readonly = match &tx.message {
+        VersionedMessage::Legacy(msg) => msg.header.num_readonly_unsigned_accounts,
+        VersionedMessage::V0(msg) => msg.header.num_readonly_unsigned_accounts,
+        VersionedMessage::V1(msg) => msg.header.num_readonly_unsigned_accounts,
+    };
+    let insert_idx = static_keys.len() as u8 - num_readonly;
+
+    let mut new_tx = tx.clone();
+    let (keys, ixs) = match &mut new_tx.message {
+        VersionedMessage::Legacy(msg) => (&mut msg.account_keys, &mut msg.instructions),
+        VersionedMessage::V0(msg) => (&mut msg.account_keys, &mut msg.instructions),
+        VersionedMessage::V1(msg) => (&mut msg.account_keys, &mut msg.instructions),
+    };
+    keys.insert(insert_idx as usize, key);
+    for ix in ixs.iter_mut() {
+        if ix.program_id_index >= insert_idx {
+            ix.program_id_index += 1;
+        }
+        for a in &mut ix.accounts {
+            if *a >= insert_idx {
+                *a += 1;
+            }
+        }
+    }
+
+    let titan_idx = if titan_idx >= insert_idx {
+        titan_idx + 1
+    } else {
+        titan_idx
+    };
+    let titan_ix = ixs
+        .iter_mut()
+        .find(|ix| ix.program_id_index == titan_idx)
+        .context("titan ix not found")?;
+    *titan_ix
+        .accounts
+        .get_mut(position)
+        .with_context(|| format!("titan ix has no account at position {position}"))? = insert_idx;
     Ok(new_tx)
 }
 
@@ -856,9 +859,22 @@ pub fn extract_signer(tx: &VersionedTransaction) -> Result<Pubkey> {
     Ok(signer)
 }
 
+/// ATA derivation seeded with the legacy Token program. Wrong for Token-2022 mints —
+/// use [`derive_ata_with_program`] when the mint's owning program isn't already known
+/// to be legacy Token.
 pub fn derive_ata(wallet: &Pubkey, mint_str: &str) -> Option<Pubkey> {
+    derive_ata_with_program(wallet, mint_str, TOKEN_PROGRAM)
+}
+
+/// ATA derivation seeded with `token_program` — must be the mint's real owning program
+/// (legacy Token or Token-2022), since the ATA address depends on which one is used.
+pub fn derive_ata_with_program(
+    wallet: &Pubkey,
+    mint_str: &str,
+    token_program: &str,
+) -> Option<Pubkey> {
     let assoc: Pubkey = ASSOCIATED_TOKEN_PROGRAM.parse().ok()?;
-    let token: Pubkey = TOKEN_PROGRAM.parse().ok()?;
+    let token: Pubkey = token_program.parse().ok()?;
     let mint: Pubkey = mint_str.parse().ok()?;
     let (ata, _) =
         Pubkey::find_program_address(&[wallet.as_ref(), token.as_ref(), mint.as_ref()], &assoc);
