@@ -35,11 +35,11 @@ struct Cli {
     api_key: String,
 
     /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 428_824_220)]
+    #[arg(long, default_value_t = 436_845_301)]
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 428_824_225)]
+    #[arg(long, default_value_t = 436_845_311)]
     end_slot: u64,
 
     /// File to write transaction logs to.
@@ -254,7 +254,11 @@ async fn main() -> Result<()> {
                     .advance_count(1)
                     .build(),
                 None,
-                |_| {},
+                |event| {
+                    if let simulator_api::BacktestResponse::SlotNotification(slot) = event {
+                        println!("[slot] {slot}");
+                    }
+                },
             )
             .await?;
 
