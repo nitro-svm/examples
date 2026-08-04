@@ -4,7 +4,7 @@ This repo contains starter code for various use cases of the simulation API.
 
 Every example rests on the same primitive: a backtest session replays historical Solana slots and
 can freeze the chain at any point—-including partway through a block--then simulate against
-that state with arbitrary balances and bytecode. They answer question such as:
+that state with arbitrary balances and bytecode. They answer questions such as:
 - What would this prop AMM have quoted at 10x the size?
 - Would my router have won that trade?
 - Does my new bytecode break real traffic?
@@ -13,7 +13,7 @@ These examples address real use cases and feature requests, but the protocols us
 
 ## [Counterfactual Flow](./src/bin/counterfactual_flow)
 
-When developing a quoting strategy, it's difficult to determine a taker's theoretical size and response to a parameter change. This example reroutes all historical order flow through Jupiter Metis to determine the realized fills that a venue would've captured under various parameter choices, like fees, spread, and oracle bounds.
+When developing a quoting strategy, it's difficult to determine a taker's theoretical size and response to a parameter change. This example rewrites the venue's own oracle, curve, or fee account — re-priced at each state's own slot, or the same state posted early or late — re-quotes the historical order flow through Jupiter Metis to determine the impact of the change. Jupiter's flow by default; the other aggregators on request (DFlow, Titan, OKX). More details in the example's README.
 
 ## [Measuring Spread and Depth](./src/bin/amm_liquidity)
 
@@ -39,7 +39,8 @@ mainnet slots with custom program logic, runs the real transactions from those b
 ## Notes
 Please see the [documentation](https://docs.termina.technology/documentation) for a comprehensive overview of the API interface and client libraries.
 
-To see all supported slot ranges:
+The hosted examples default `--url` to `simulator.termina.technology`. To see that
+deployment's supported slot ranges:
 ```sh
 curl https://simulator.termina.technology/available-ranges | jq
 ```

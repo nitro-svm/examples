@@ -214,6 +214,7 @@ pub(crate) fn get_spread_action(
         kind: ActionKind::Simulate,
         transactions,
         account_overrides,
+        feeds_reroute: false,
         return_accounts: vec![output],
         label: Some(spread_label(venue)),
     };

@@ -1,88 +1,199 @@
-//! Apply a custom parameter change to a venue and measure its effect on taker flow:
-//! every historical swap is requoted through Jupiter Metis (simulated only, never committed),
-//! so legs touching the venue show whether the change would capture more fills than it did originally.
+//! Change a venue's state and measure the taker flow it wins or loses.
+//!
+//! `capture` records the account's per-slot states; `run` posts them back modified, visible only
+//! to the router. `--price-shift-bps` re-prices, `--lag`/`--lead` shifts in time.
+//!
+//! `--setup-transactions` carries a time shift as the venue's own update transaction re-executed
+//! at the shifted slot. A venue that stamps its last-update slot needs this for `--lead`, since a
+//! future snapshot is rejected; it requires a `--no-replay` capture.
 
-mod discovery;
+mod cli;
+mod jsonl;
+mod session;
+mod venue;
 
-use backtest_example::utils::types::TxWithMeta;
+#[cfg(test)]
+mod tests;
 
 use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+    collections::{BTreeMap, HashMap},
+    fs,
+    future::ready,
+    io::{self, Write},
+    path::PathBuf,
+    sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use clap::Parser;
-use simulator_api::{DiscoveryFilter, RerouteVenues, SwapVenue};
+use simulator_api::{
+    AccountData, AccountModifications, ActionAnchor, ActionKind, RerouteFilter, RerouteStatsReport,
+    RerouteVenues, ScheduledAction,
+};
 use simulator_client::{
-    BacktestClient, CreateSession, DiscoveryStepResult, RerouteNotification, subscribe_reroutes,
+    AccountDiffNotification, CreateSession, ManagedBacktestSession, RerouteLegNotification,
+    RerouteNotification, subscribe_account_diffs, subscribe_reroutes,
 };
 use solana_address::Address;
-use solana_transaction::versioned::VersionedTransaction;
 
-use crate::discovery::{contains_venue, is_program_upgrade, resolve_venue_label};
+use crate::{
+    cli::{
+        CaptureArgs, Cli, Command, CompareArgs, ConnectionArgs, RangeArgs, RunArgs, filter_from,
+        shift_label,
+    },
+    jsonl::{
+        CaptureRow, JoinedLeg, RerouteLegRow, RerouteRow, load_capture_rows, wire_transaction,
+        write_capture,
+    },
+    session::{CaptureCollector, create_session, drive_to_completion},
+    venue::{WHOLE_LEG, original_venue_share, resolve_venue_label, venue_share},
+};
 
-#[derive(Parser)]
-#[command(
-    about = "Apply a quoting change at a discovered batch and measure its effect on taker flow via Metis rerouting"
-)]
-struct Cli {
-    /// Simulator base URL (no scheme), e.g. `staging.simulator.example.com`.
-    #[arg(long, default_value = "staging.simulator.termina.technology")]
-    url: String,
+type LegKey = (String, usize);
 
-    /// API key sent as the `X-API-Key` header.
-    #[arg(long, env = "SIMULATOR_API_KEY")]
-    api_key: String,
-
-    /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 433838452)]
-    start_slot: u64,
-
-    /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 433838553)]
-    end_slot: u64,
-
-    /// The venue under test: batches invoking this program pause for inspection
-    /// (to apply the parameter change). Its Jupiter/Metis route label is resolved
-    /// automatically via `program-id-to-label` and used to match rerouted legs,
-    /// since `route_plan`/`route_summary` carry pool addresses and display labels,
-    /// never program ids.
-    #[arg(long)]
-    program_id: Address,
+#[derive(Clone, Debug)]
+struct LegRecord {
+    input_mint: String,
+    output_mint: String,
+    amount: u64,
+    metis_quoted_out: u64,
+    original_quoted_out: u64,
 }
 
-fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return Ok(endpoint.to_string());
-    }
-    let path = endpoint.trim_start_matches('/');
-    Ok(format!("{base}/{path}"))
-}
-
-/// Rerouted-leg counts for the run.
+/// The venue's flow before and after re-quoting, over the legs this run actually saw.
 #[derive(Default)]
-struct Summary {
-    // Number of transactions that Metis rerouted to the specified venue.
-    txs: AtomicU64,
-    // Number of legs (multiple legs per transactions) rerouted to venue.
-    legs: AtomicU64,
-    // Number of legs where new output > original output.
-    improvements: AtomicU64,
+struct VenueTally {
+    txs: u64,
+    by_direction: HashMap<(String, String), VenueCounts>,
 }
 
-impl Summary {
-    fn report(&self, label: &str) {
-        eprintln!(
-            "{label}: transactions={} legs={} legs where metis quoted higher={}",
-            self.txs.load(Ordering::Relaxed),
-            self.legs.load(Ordering::Relaxed),
-            self.improvements.load(Ordering::Relaxed),
-        );
+/// Every field counts participation in a leg, not the share of it: a venue on a split route
+/// counts the same as one holding the whole leg. `split` is the honest qualifier on that.
+#[derive(Clone, Copy, Default)]
+struct VenueCounts {
+    legs: u64,
+    l1_legs: u64,
+    held: u64,
+    improvements: u64,
+    split: u64,
+    unresolved: u64,
+}
+
+impl VenueCounts {
+    /// Legs the re-quote took from another venue — including every leg whose L1 route was never
+    /// recovered, since only a recovered route can put a leg in `held`.
+    const fn won(self) -> u64 {
+        self.legs.saturating_sub(self.held)
     }
+
+    /// Legs the venue had on a recovered L1 route and lost to the re-quote.
+    const fn lost(self) -> u64 {
+        self.l1_legs.saturating_sub(self.held)
+    }
+
+    fn add(&mut self, other: Self) {
+        self.legs += other.legs;
+        self.l1_legs += other.l1_legs;
+        self.held += other.held;
+        self.improvements += other.improvements;
+        self.split += other.split;
+        self.unresolved += other.unresolved;
+    }
+}
+
+/// The venue's flow per trade direction, plus the totals across them.
+struct VenueReport {
+    txs: u64,
+    total: VenueCounts,
+    by_direction: Vec<((String, String), VenueCounts)>,
+}
+
+impl VenueTally {
+    fn report(&self) -> VenueReport {
+        let mut by_direction: Vec<_> = self
+            .by_direction
+            .iter()
+            .map(|(mints, counts)| (mints.clone(), *counts))
+            .collect();
+        by_direction.sort_unstable_by_key(|(_, counts)| std::cmp::Reverse(counts.legs));
+        let total = by_direction
+            .iter()
+            .fold(VenueCounts::default(), |mut total, (_, counts)| {
+                total.add(*counts);
+                total
+            });
+        VenueReport {
+            txs: self.txs,
+            total,
+            by_direction,
+        }
+    }
+}
+
+fn short_mint(mint: &str) -> String {
+    match mint.len() > 12 {
+        true => format!("{}..{}", &mint[..6], &mint[mint.len() - 4..]),
+        false => mint.to_string(),
+    }
+}
+
+struct RunOutput {
+    funnel: Option<RerouteStatsReport>,
+    legs: BTreeMap<LegKey, LegRecord>,
+    venue: VenueReport,
+    scheduled: usize,
+}
+
+/// The venue under test.
+#[derive(Clone)]
+struct Venue {
+    /// Metis's display label, how its hops are named in the re-quoted route.
+    label: String,
+    /// The program, which is how its hops are named in the original's route.
+    program: Address,
+}
+
+struct RunConfig {
+    range: RangeArgs,
+    schedule: Schedule,
+    filter: Option<RerouteFilter>,
+    venue: Option<Venue>,
+    jsonl_out: Option<PathBuf>,
+    detect_failed_l1_swaps: bool,
+    circular_arbs: bool,
+    reroute_venues: Option<RerouteVenues>,
+}
+
+/// Empty on both counts is the baseline; the carriers are alternatives, never
+/// combined.
+#[derive(Default)]
+struct Schedule {
+    /// Captured bytes, one entry per anchor slot.
+    overrides: Vec<(u64, AccountModifications)>,
+    /// The venue's own update transactions, simulated at their shifted slots; the account
+    /// state each leaves behind is published in place of the bytes.
+    setup: Option<ScheduledAction>,
+}
+
+impl Schedule {
+    /// Anchor slots the schedule posts at, either way it carries them.
+    fn entries(&self) -> usize {
+        self.overrides.len()
+            + self
+                .setup
+                .as_ref()
+                .map_or(0, |action| match &action.anchor {
+                    ActionAnchor::BeforeSlot { slots } => slots.len(),
+                    _ => 0,
+                })
+    }
+}
+
+struct DeltaSummary {
+    matched: usize,
+    median_abs_bps: f64,
+    mean_abs_bps: f64,
+    p90_abs_bps: f64,
 }
 
 #[tokio::main]
@@ -92,180 +203,670 @@ async fn main() -> Result<()> {
         .install_default()
         .ok();
 
-    let venue_label = resolve_venue_label(&cli.program_id).await?;
-    eprintln!("[jup] resolved venue label: {venue_label:?}");
+    match cli.command {
+        Command::Capture(args) => capture(args).await,
+        Command::Run(args) => run(args).await.map(|_| ()),
+        Command::Compare(args) => compare(args).await,
+    }
+}
 
-    let client = BacktestClient::builder()
-        .url(format!("wss://{}/backtest", &cli.url))
-        .api_key(cli.api_key)
-        .build();
+async fn capture(args: CaptureArgs) -> Result<()> {
+    let conn = &args.conn;
+    let create = CreateSession::builder()
+        .start_slot(args.range.start_slot)
+        .slot_count(args.range.slot_count)
+        .replay_account_state(!args.range.no_replay)
+        .send_summary(true)
+        .build()
+        .into_request()?;
+    let mut session =
+        ManagedBacktestSession::start(conn.websocket_url(), conn.api_key.clone(), create).await?;
 
-    eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
+    session.subscribe_transactions(vec![args.account]);
 
-    let mut session = client
-        .create_session(
-            CreateSession::builder()
-                .start_slot(cli.start_slot)
-                .end_slot(cli.end_slot)
-                .disconnect_timeout_secs(900u16)
-                .capacity_wait_timeout_secs(900u16)
-                .reroute_order_flow(true)
-                // The server re-quotes Jupiter order flow alone by default. A venue's share of
-                // the book is contested across every aggregator that routes to it, so name them
-                // all: dropping one drops the legs it carried, not just its label.
-                .reroute_venues(RerouteVenues::new([
-                    SwapVenue::Jupiter,
-                    SwapVenue::Okx,
-                    SwapVenue::Titan,
-                    SwapVenue::Dflow,
-                ]))
-                .discoveries(vec![DiscoveryFilter::ProgramExecuted(cli.program_id)])
-                .build(),
-        )
-        .await?;
+    let collector = Arc::new(Mutex::new(CaptureCollector::default()));
+    let start_slot = args.range.start_slot;
+    let sink = collector.clone();
+    let handle = subscribe_account_diffs(
+        &conn.rpc_url(&session.session_info().rpc_endpoint),
+        &args.account.to_string(),
+        move |diff: AccountDiffNotification| {
+            sink.lock()
+                .expect("capture collector")
+                .record_diff(&diff, start_slot);
+            ready(())
+        },
+    )
+    .await?;
 
-    eprintln!(
-        "[ws] session: {}",
-        session
-            .session_id()
-            .map_or_else(|| "?".to_string(), |id| id.to_string())
+    let mut wire = HashMap::new();
+    let mut undecodable = 0u64;
+    drive_to_completion(
+        &mut session,
+        args.range.slot_count,
+        |transaction| match wire_transaction(&transaction.transaction) {
+            Some((signature, encoded)) => {
+                wire.insert(signature, encoded);
+            }
+            None => undecodable += 1,
+        },
+    )
+    .await?;
+    handle.stop.send(true).ok();
+    handle.join_handle.await??;
+    session.shutdown().await;
+
+    let collected = std::mem::take(&mut *collector.lock().expect("capture collector"));
+    if let Some(error) = collected.conversion_error {
+        return Err(error);
+    }
+    let rows = collected
+        .rows
+        .into_values()
+        .map(|row| CaptureRow {
+            transaction: row
+                .signature
+                .as_ref()
+                .and_then(|signature| wire.get(signature).cloned()),
+            ..row
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        !rows.is_empty(),
+        "account {} never appeared in [{}, {}]",
+        args.account,
+        args.range.start_slot,
+        args.range.start_slot + args.range.slot_count
     );
-
-    let rpc_endpoint = session
-        .rpc_endpoint()
-        .context("no rpc_endpoint")?
-        .to_string();
-    let rpc_url = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
-    eprintln!("[ws] rpc_endpoint: {rpc_url}");
-
-    // No `ensure_ready()` here: it would consume the server's one-time `ReadyForContinue`
-    // without replying to it, and `advance_to_discovery` below only sends the `Continue`
-    // that kicks off execution in reaction to seeing that message — leaving the session
-    // stuck waiting on a signal that already came and went.
-    eprintln!("[ws] venue={} venue_label={venue_label:?}", cli.program_id);
-
-    let summary = Arc::new(Summary::default());
-
-    let summary_cb = summary.clone();
-    let venue_label_cb = venue_label.clone();
-
-    let sub = subscribe_reroutes(&rpc_url, move |notification| {
-        let summary = summary_cb.clone();
-        let venue_label = venue_label_cb.clone();
-        async move {
-            let RerouteNotification {
-                slot,
-                original_signature,
-                legs,
-                err,
-                ..
-            } = notification;
-
-            let legs: Vec<_> = legs
-                .iter()
-                .filter(|leg| contains_venue(leg, &venue_label))
-                .collect();
-            if legs.is_empty() {
-                return;
-            }
-
-            summary.txs.fetch_add(1, Ordering::Relaxed);
-
-            if let Some(err) = &err {
-                eprintln!("[reroute] slot={slot} sig={original_signature} simulation failed: {err}");
-                return;
-            }
-
-            for leg in &legs {
-                summary.legs.fetch_add(1, Ordering::Relaxed);
-                let improvement_bps = (leg.metis_quoted_out as f64 - leg.original_quoted_out as f64)
-                    / leg.original_quoted_out as f64
-                    * 10_000.0;
-                if leg.metis_quoted_out > leg.original_quoted_out {
-                    summary.improvements.fetch_add(1, Ordering::Relaxed);
-                }
-                eprintln!(
-                    "[reroute] slot={slot} sig={original_signature} {}->{} amount={} original_out={} metis_out={} ({improvement_bps:+.2} bps) via {}",
-                    leg.input_mint, leg.output_mint, leg.amount, leg.original_quoted_out, leg.metis_quoted_out, leg.route_summary,
-                );
-            }
-        }
-    })
-    .await
-    .context("subscribe to reroutes")?;
-    eprintln!("[sub] listening for rerouted swaps touching \"{venue_label}\"");
-
-    // Covers the first step, which waits out session startup: a rerouting session also builds
-    // the metis router's market cache before any batch executes, and that is minutes rather
-    // than the seconds a plain replay needs.
-    let timeout = Some(Duration::from_secs(900));
-    let mut pause_count = 0u64;
-
-    loop {
-        // NOTE: if updates are frequent, this can also happen via WS instead of RPC.
-        match session.advance_to_discovery(Some(1), timeout).await? {
-            DiscoveryStepResult::Paused(pause) => {
-                pause_count += 1;
-
-                let slot = pause.paused.slot;
-                let batch = pause.paused.batch_index.unwrap_or(0);
-                eprintln!("[pause #{pause_count}] slot={slot} batch={batch}");
-
-                let txs: Vec<TxWithMeta> = pause
-                    .discovery
-                    .transactions
-                    .iter()
-                    .filter_map(|bin| {
-                        let bytes = bin.decode().ok()?;
-                        bincode::deserialize(&bytes).ok()
-                    })
-                    .collect();
-
-                for tx_with_meta in &txs {
-                    let signature = tx_with_meta
-                        .transaction
-                        .signatures
-                        .first()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-
-                    if is_program_upgrade(tx_with_meta) {
-                        eprintln!("  [upgrade] sig={signature}");
-
-                        // TODO: replace with the custom parameter update.
-                        let custom_upgrade = VersionedTransaction::default();
-                        session
-                            .rpc()
-                            .send_transaction(&custom_upgrade)
-                            .await
-                            .context("send tx failed")?;
-                    }
-                }
-            }
-
-            DiscoveryStepResult::Completed => {
-                eprintln!("[done] session completed; total pauses: {pause_count}");
-                break;
-            }
-        }
+    let resolved = rows.iter().filter(|row| row.transaction.is_some()).count();
+    write_capture(&args.out, &rows)?;
+    println!(
+        "captured {} states ({resolved} with a transaction) to {}",
+        rows.len(),
+        args.out.display()
+    );
+    if undecodable > 0 {
+        eprintln!("[capture] {undecodable} streamed transactions could not be re-encoded");
     }
-
-    // Drain the subscription before closing.
-    sub.stop.send(true).ok();
-    eprintln!("[sub] draining subscription...");
-    let mut join_handle = sub.join_handle;
-    loop {
-        tokio::select! {
-            _ = &mut join_handle => break,
-            _ = session.next_event(Some(Duration::from_secs(30))) => {}
-        }
-    }
-
-    let _ = session.close(Some(Duration::from_secs(10))).await;
-
-    eprintln!("=== Counterfactual summary (venue={}) ===", cli.program_id);
-    summary.report("rerouted");
-    // Bare transaction count to stdout so it can be captured/piped.
-    println!("{}", summary.txs.load(Ordering::Relaxed));
     Ok(())
+}
+
+fn nearest_capture_at_or_before(
+    captured: &BTreeMap<u64, AccountData>,
+    slot: u64,
+) -> Option<&AccountData> {
+    captured
+        .range(..=slot)
+        .next_back()
+        .map(|(_, account)| account)
+}
+
+/// One override per captured slot, each posting the state captured `shift` slots away:
+/// negative lags the venue behind reality, positive runs it ahead.
+fn build_shift_actions(
+    shift: i64,
+    account: Address,
+    captured: &BTreeMap<u64, AccountData>,
+    start: u64,
+    end: u64,
+) -> Vec<(u64, AccountModifications)> {
+    captured
+        .range(start..=end)
+        .filter_map(|(slot, _)| {
+            let target = slot.checked_add_signed(shift)?;
+            nearest_capture_at_or_before(captured, target).map(|state| {
+                (
+                    *slot,
+                    AccountModifications(BTreeMap::from([(account, state.clone())])),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The transaction that ran at slot `t` is simulated at `t - shift` instead. Only `account`'s
+/// post-state is published, so the rest of what the transaction touches stays out.
+fn build_setup_action(
+    shift: i64,
+    account: Address,
+    rows: &[CaptureRow],
+    start: u64,
+    end: u64,
+) -> Option<ScheduledAction> {
+    let anchored = rows
+        .iter()
+        .filter_map(|row| {
+            let transaction = row.transaction.clone()?;
+            let anchor = row.slot.checked_add_signed(shift.checked_neg()?)?;
+            (start..=end)
+                .contains(&anchor)
+                .then_some((anchor, transaction))
+        })
+        // A slot named twice runs its transactions there in order, so the later capture wins.
+        .fold(
+            BTreeMap::<u64, Vec<String>>::new(),
+            |mut by_slot, (anchor, tx)| {
+                by_slot.entry(anchor).or_default().push(tx);
+                by_slot
+            },
+        );
+    let (slots, transactions): (Vec<u64>, Vec<String>) = anchored
+        .into_iter()
+        .flat_map(|(slot, txs)| txs.into_iter().map(move |tx| (slot, tx)))
+        .unzip();
+    (!slots.is_empty()).then(|| ScheduledAction {
+        anchor: ActionAnchor::BeforeSlot { slots },
+        kind: ActionKind::Simulate,
+        transactions,
+        account_overrides: AccountModifications::default(),
+        feeds_reroute: true,
+        return_accounts: vec![account],
+        label: Some("venue update".to_string()),
+    })
+}
+
+/// Move every `price_field` by `shift_bps`. Relative, so the fixed-point scale is irrelevant.
+fn reprice(account: &mut AccountData, fields: &[usize], shift_bps: f64) -> Result<Vec<usize>> {
+    let mut raw = account
+        .data
+        .decode()
+        .context("decoding captured account data")?;
+    let factor = 1.0 + shift_bps / 10_000.0;
+    let written = fields.iter().try_fold(Vec::new(), |mut written, &offset| {
+        let end = offset + 8;
+        ensure!(
+            end <= raw.len(),
+            "--price-field {offset} is past the account's {} bytes",
+            raw.len()
+        );
+        let value = i64::from_le_bytes(raw[offset..end].try_into().expect("eight bytes"));
+        // A mis-aimed offset usually lands on padding; writing there would fake a re-priced venue.
+        if value > 0 {
+            let moved = (value as f64 * factor).round() as i64;
+            raw[offset..end].copy_from_slice(&moved.to_le_bytes());
+            written.push(offset);
+        }
+        Ok(written)
+    })?;
+    account.data = simulator_api::EncodedBinary::from_bytes(&raw, account.data.encoding);
+    Ok(written)
+}
+
+/// The counterfactual's payload for the arm `args` asks for. Without `--lag`/`--lead`/
+/// `--price-shift-bps` it is empty: the baseline replays the venue as it ran.
+fn shifted_schedule(args: &RunArgs) -> Result<Schedule> {
+    ensure!(
+        args.price_field.is_empty() || args.price_shift_bps.is_some(),
+        "--price-field moves a price; pass --price-shift-bps"
+    );
+    match args.shift() {
+        Some(shift) => schedule_for(args, shift, args.price_shift_bps),
+        None => {
+            ensure!(
+                !args.setup_transactions,
+                "--setup-transactions carries a shift; pass --lag or --lead"
+            );
+            Ok(Schedule::default())
+        }
+    }
+}
+
+/// One arm's payload at an explicit `shift` and re-price, so the control can be built from
+/// the same capture and the same carrier as the arm it is the reference for.
+fn schedule_for(args: &RunArgs, shift: i64, price_shift_bps: Option<f64>) -> Result<Schedule> {
+    // The setup carrier rebuilds the action from the captured transaction, which carries the
+    // venue's real price: a re-price would be silently dropped and reported as applied.
+    ensure!(
+        !(args.setup_transactions && price_shift_bps.is_some()),
+        "--price-shift-bps cannot be carried by --setup-transactions: the setup replays the \
+         venue's own captured update, which re-prices itself. Drop one of the two."
+    );
+    let path = args
+        .capture
+        .as_deref()
+        .ok_or_else(|| anyhow!("--capture is required with --lag/--lead/--price-shift-bps"))?;
+    let mut rows = load_capture_rows(path)?;
+    if let Some(shift_bps) = price_shift_bps {
+        ensure!(
+            !args.price_field.is_empty(),
+            "--price-shift-bps needs at least one --price-field"
+        );
+        let written = rows.iter_mut().try_fold(
+            BTreeMap::<usize, usize>::new(),
+            |mut written, row| -> Result<_> {
+                for offset in reprice(&mut row.account, &args.price_field, shift_bps)? {
+                    *written.entry(offset).or_default() += 1;
+                }
+                Ok(written)
+            },
+        )?;
+        eprintln!(
+            "[price] moved {}/{} --price-field(s) by {shift_bps:+} bps over {} states, {} writes",
+            written.len(),
+            args.price_field.len(),
+            rows.len(),
+            written.values().sum::<usize>()
+        );
+        for offset in args
+            .price_field
+            .iter()
+            .filter(|offset| !written.contains_key(offset))
+        {
+            eprintln!(
+                "[price] --price-field {offset} held no positive value in any state and was never written — probably padding"
+            );
+        }
+    }
+    let start = args.range.start_slot;
+    let end = start + args.range.slot_count;
+    let schedule = if !args.setup_transactions {
+        Schedule {
+            overrides: build_shift_actions(
+                shift,
+                args.account,
+                &rows
+                    .into_iter()
+                    .map(|row| (row.slot, row.account))
+                    .collect(),
+                start,
+                end,
+            ),
+            setup: None,
+        }
+    } else {
+        let unresolved = rows.iter().filter(|row| row.transaction.is_none()).count();
+        ensure!(
+            unresolved < rows.len(),
+            "no captured state in {} carries a transaction; capture the range with --no-replay",
+            path.display()
+        );
+        if unresolved > 0 {
+            eprintln!(
+                "[setup] {unresolved}/{} captured states have no transaction and are skipped",
+                rows.len()
+            );
+        }
+        Schedule {
+            overrides: Vec::new(),
+            setup: build_setup_action(shift, args.account, &rows, start, end),
+        }
+    };
+    // A silently empty schedule runs as a plain baseline while reporting itself as the arm.
+    ensure!(
+        schedule.entries() > 0,
+        "{} built no overrides; does {} cover [{start}, {end}]?",
+        shift_label(shift),
+        path.display()
+    );
+    Ok(schedule)
+}
+
+/// The venue under test, when one was named.
+async fn venue_of(args: &RunArgs) -> Result<Option<Venue>> {
+    let Some(program) = args.program_id else {
+        return Ok(None);
+    };
+    let label = resolve_venue_label(&program).await?;
+    eprintln!("[jup] resolved venue label: {label:?}");
+    Ok(Some(Venue { label, program }))
+}
+
+async fn run(args: RunArgs) -> Result<RunOutput> {
+    let schedule = shifted_schedule(&args)?;
+    if let Some(shift) = args.shift() {
+        eprintln!(
+            "[{}] {} anchor slots, carried as {}",
+            shift_label(shift),
+            schedule.entries(),
+            if args.setup_transactions {
+                "setup transactions"
+            } else {
+                "account bytes"
+            }
+        );
+    }
+    let config = RunConfig {
+        range: args.range.clone(),
+        schedule,
+        filter: filter_from(&args),
+        venue: venue_of(&args).await?,
+        jsonl_out: Some(args.out.clone()),
+        detect_failed_l1_swaps: !args.skip_l1_failures,
+        circular_arbs: args.circular_arbs,
+        reroute_venues: args.reroute_venues.clone(),
+    };
+    let output = run_once(&args.conn, config).await?;
+    report_run("run", &output);
+    Ok(output)
+}
+
+const fn is_split(share: u8) -> bool {
+    share > 0 && share < WHOLE_LEG
+}
+
+/// One leg's contribution to the tally, or `None` when the venue is on neither side of it.
+fn leg_counts(leg: &RerouteLegNotification, venue: &Venue) -> Option<VenueCounts> {
+    let after = venue_share(leg, &venue.label);
+    let before = original_venue_share(leg, &venue.program);
+    let ran_before = before.is_some_and(|share| share > 0);
+    (after > 0 || ran_before).then(|| VenueCounts {
+        legs: u64::from(after > 0),
+        l1_legs: u64::from(ran_before),
+        held: u64::from(after > 0 && ran_before),
+        improvements: u64::from(after > 0 && leg.metis_quoted_out > leg.original_quoted_out),
+        split: u64::from(is_split(after) || before.is_some_and(is_split)),
+        unresolved: u64::from(before.is_none()),
+    })
+}
+
+/// Everything the reroute subscription accumulates, behind one lock.
+#[derive(Default)]
+struct RerouteCollector {
+    venue: Option<Venue>,
+    legs: BTreeMap<LegKey, LegRecord>,
+    tally: VenueTally,
+    jsonl: Option<io::BufWriter<fs::File>>,
+    write_error: Option<io::Error>,
+}
+
+impl RerouteCollector {
+    fn record_legs(&mut self, notification: &RerouteNotification) {
+        self.legs
+            .extend(notification.legs.iter().enumerate().map(|(index, leg)| {
+                (
+                    (notification.original_signature.clone(), index),
+                    LegRecord {
+                        input_mint: leg.input_mint.clone(),
+                        output_mint: leg.output_mint.clone(),
+                        amount: leg.amount,
+                        metis_quoted_out: leg.metis_quoted_out,
+                        original_quoted_out: leg.original_quoted_out,
+                    },
+                )
+            }));
+    }
+
+    /// Both sides over the same legs, so won and lost are differences on one population rather
+    /// than two counts from different runs.
+    fn tally_venue(&mut self, notification: &RerouteNotification) {
+        let Some(venue) = &self.venue else { return };
+        let mut matched = 0;
+        for (leg, counts) in notification
+            .legs
+            .iter()
+            .filter_map(|leg| Some((leg, leg_counts(leg, venue)?)))
+        {
+            let direction = (leg.input_mint.clone(), leg.output_mint.clone());
+            self.tally
+                .by_direction
+                .entry(direction)
+                .or_default()
+                .add(counts);
+            matched += counts.legs;
+        }
+        if matched > 0 {
+            self.tally.txs += 1;
+        }
+    }
+
+    fn write_jsonl_row(&mut self, notification: &RerouteNotification) {
+        let Some(jsonl) = &mut self.jsonl else {
+            return;
+        };
+        let row = RerouteRow {
+            slot: notification.slot,
+            original_signature: &notification.original_signature,
+            legs: notification.legs.iter().map(RerouteLegRow::from).collect(),
+            err: notification.err.as_deref(),
+            compute_units: notification.compute_units_consumed,
+            realized_out: notification.realized_output_amount,
+            original_realized_out: notification.original_realized_output_amount,
+        };
+        let written = serde_json::to_string(&row)
+            .map_err(io::Error::from)
+            .and_then(|line| writeln!(jsonl, "{line}"));
+        if let Err(error) = written {
+            self.write_error.get_or_insert(error);
+        }
+    }
+}
+
+async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput> {
+    let scheduled = config.schedule.entries();
+    let slot_count = config.range.slot_count;
+    let venue = config.venue.clone();
+    let jsonl_out = config.jsonl_out.clone();
+    let create = create_session(config)?;
+    let mut session =
+        ManagedBacktestSession::start(conn.websocket_url(), conn.api_key.clone(), create).await?;
+
+    let jsonl = jsonl_out
+        .map(|path| fs::File::create(path).map(io::BufWriter::new))
+        .transpose()?;
+    let collector = Arc::new(Mutex::new(RerouteCollector {
+        venue,
+        jsonl,
+        ..RerouteCollector::default()
+    }));
+    let sink = collector.clone();
+    let handle = subscribe_reroutes(
+        &conn.rpc_url(&session.session_info().rpc_endpoint),
+        move |notification: RerouteNotification| {
+            let mut collector = sink.lock().expect("reroute collector");
+            collector.record_legs(&notification);
+            collector.tally_venue(&notification);
+            collector.write_jsonl_row(&notification);
+            ready(())
+        },
+    )
+    .await?;
+
+    let funnel = drive_to_completion(&mut session, slot_count, |_| {}).await?;
+    handle.stop.send(true).ok();
+    handle.join_handle.await??;
+    session.shutdown().await;
+
+    let mut collected = std::mem::take(&mut *collector.lock().expect("reroute collector"));
+    if let Some(error) = collected.write_error {
+        return Err(error.into());
+    }
+    if let Some(jsonl) = &mut collected.jsonl {
+        jsonl.flush()?;
+    }
+    Ok(RunOutput {
+        scheduled,
+        funnel,
+        legs: collected.legs,
+        venue: collected.tally.report(),
+    })
+}
+
+fn report_run(label: &str, output: &RunOutput) {
+    if let Some(stats) = &output.funnel {
+        eprintln!(
+            "[{label}] reroute: {} detected -> {} rerouted -> {} simulated -> {} succeeded | {} requote-fail",
+            stats.swaps_detected,
+            stats.swaps_rerouted,
+            stats.swaps_simulated,
+            stats.swaps_succeeded,
+            stats.requote_failures,
+        );
+        if stats.override_setup_failures > 0 {
+            eprintln!(
+                "[{label}] {}/{} scheduled actions failed and posted no state; those slots kept the previous override in force",
+                stats.override_setup_failures, output.scheduled
+            );
+        }
+    }
+    let venue = &output.venue;
+    let total = venue.total;
+    eprintln!("[{label}] {} re-quoted legs seen", output.legs.len());
+    if total.legs > 0 || total.l1_legs > 0 {
+        eprintln!(
+            "[{label}] venue on L1: legs={} | after re-quote: legs={} transactions={} (held={} won={} lost={} split={}) | legs where metis quoted higher={}",
+            total.l1_legs,
+            total.legs,
+            venue.txs,
+            total.held,
+            total.won(),
+            total.lost(),
+            total.split,
+            total.improvements
+        );
+        eprintln!(
+            "[{label}] won/lost read only as a difference against the `--lag 0` control, which itself reports the venue losing most of its L1 legs with nothing changed — an absolute lost is not attributable"
+        );
+        if total.split > 0 {
+            eprintln!(
+                "[{label}] {} of the venue's legs were split routes it only partly held; held/won/lost count participation, not share",
+                total.split
+            );
+        }
+        if total.unresolved > 0 {
+            eprintln!(
+                "[{label}] {} legs carried no recoverable L1 route; their before-side is unknown",
+                total.unresolved
+            );
+        }
+        // A price change moves the two directions of a book opposite ways, so the totals above
+        // can net a collapse against a gain and read as neither.
+        for ((input, output), counts) in &venue.by_direction {
+            eprintln!(
+                "[{label}]   {}->{}: L1={} after={} (held={} won={} lost={} split={}) improved={}",
+                short_mint(input),
+                short_mint(output),
+                counts.l1_legs,
+                counts.legs,
+                counts.held,
+                counts.won(),
+                counts.lost(),
+                counts.split,
+                counts.improvements
+            );
+        }
+    }
+}
+
+async fn compare(args: CompareArgs) -> Result<()> {
+    let shift = args.run.shift().ok_or_else(|| {
+        anyhow!(
+            "--lag/--lead/--price-shift-bps is required for compare; its reference arm is the \
+             null control, the same capture posted unmodified at each state's own slot"
+        )
+    })?;
+    let label = shift_label(shift);
+    let venue = venue_of(&args.run).await?;
+    let make_config = |schedule| RunConfig {
+        range: args.run.range.clone(),
+        schedule,
+        filter: filter_from(&args.run),
+        venue: venue.clone(),
+        jsonl_out: None,
+        detect_failed_l1_swaps: !args.run.skip_l1_failures,
+        circular_arbs: args.run.circular_arbs,
+        reroute_venues: args.run.reroute_venues.clone(),
+    };
+
+    let schedule = shifted_schedule(&args.run)?;
+
+    eprintln!("[control] running the reroute (no override)...");
+    let baseline = run_once(&args.run.conn, make_config(Schedule::default())).await?;
+    report_run("control", &baseline);
+
+    eprintln!("[modified] running with {label}...");
+    let modified = run_once(&args.run.conn, make_config(schedule)).await?;
+    report_run("modified", &modified);
+
+    let (joined, zero_baseline) = join_legs(shift, &baseline.legs, &modified.legs);
+    let mut report = io::BufWriter::new(fs::File::create(&args.report)?);
+    for row in &joined {
+        writeln!(report, "{}", serde_json::to_string(row)?)?;
+    }
+    report.flush()?;
+
+    let deltas = joined.iter().map(|row| row.delta_bps).collect::<Vec<_>>();
+    let stats = delta_summary(&deltas);
+    let moved = deltas.iter().filter(|delta| **delta != 0.0).count();
+    println!("=== {label} vs the null control ===");
+    println!(
+        "legs matched: {} ({moved} moved){}",
+        stats.matched,
+        match zero_baseline {
+            0 => String::new(),
+            n => format!(", {n} legs excluded where the control quoted zero"),
+        }
+    );
+    println!(
+        "|delta| bps: median {:.3} | mean {:.3} | p90 {:.3}",
+        stats.median_abs_bps, stats.mean_abs_bps, stats.p90_abs_bps
+    );
+    if args.run.program_id.is_some() {
+        println!(
+            "venue legs captured: control {} -> modified {}",
+            baseline.venue.total.legs, modified.venue.total.legs
+        );
+    }
+    println!("report written to {}", args.report.display());
+    // Quoting is not deterministic run to run: re-run both sides and trust only the
+    // legs that move consistently. See the README.
+    eprintln!("[note] single-run deltas include router noise; repeat both runs before attributing");
+    Ok(())
+}
+
+/// `None` when the baseline quoted zero out — a delta is meaningless there.
+fn delta_bps(base: u64, variant: u64) -> Option<f64> {
+    (base != 0).then(|| (variant as f64 - base as f64) / base as f64 * 10_000.0)
+}
+
+/// Joins legs present in both runs; returns the rows plus the count of matched legs
+/// excluded for a zero baseline quote.
+fn join_legs(
+    shift: i64,
+    base: &BTreeMap<LegKey, LegRecord>,
+    modified: &BTreeMap<LegKey, LegRecord>,
+) -> (Vec<JoinedLeg>, usize) {
+    let matched = base
+        .iter()
+        .filter_map(|(key, base)| modified.get(key).map(|modified| (key, base, modified)))
+        .collect::<Vec<_>>();
+    let rows = matched
+        .iter()
+        .filter_map(|(key, base, modified)| {
+            delta_bps(base.metis_quoted_out, modified.metis_quoted_out).map(|delta_bps| JoinedLeg {
+                shift,
+                original_signature: key.0.clone(),
+                leg_index: key.1,
+                input_mint: base.input_mint.clone(),
+                output_mint: base.output_mint.clone(),
+                amount: base.amount,
+                original_quoted_out: base.original_quoted_out,
+                base_quoted_out: base.metis_quoted_out,
+                quoted_out: modified.metis_quoted_out,
+                delta_bps,
+            })
+        })
+        .collect::<Vec<_>>();
+    let zero_baseline = matched.len() - rows.len();
+    (rows, zero_baseline)
+}
+
+fn delta_summary(deltas: &[f64]) -> DeltaSummary {
+    let mut absolute = deltas.iter().map(|delta| delta.abs()).collect::<Vec<_>>();
+    absolute.sort_by(f64::total_cmp);
+    let at = |quantile: f64| {
+        absolute
+            .get(((absolute.len() as f64 - 1.0) * quantile).round() as usize)
+            .copied()
+            .unwrap_or(0.0)
+    };
+    DeltaSummary {
+        matched: absolute.len(),
+        median_abs_bps: at(0.5),
+        mean_abs_bps: if absolute.is_empty() {
+            0.0
+        } else {
+            absolute.iter().sum::<f64>() / absolute.len() as f64
+        },
+        p90_abs_bps: at(0.9),
+    }
 }

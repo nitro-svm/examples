@@ -246,6 +246,7 @@ async fn build_action(
         kind: ActionKind::Simulate,
         transactions: vec![tx; slots.len()],
         account_overrides: AccountModifications(overrides),
+        feeds_reroute: false,
         return_accounts,
         label: Some(swap.signature.clone()),
     })
