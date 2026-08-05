@@ -7,12 +7,11 @@
 //!   track slippage decay over time.
 
 use backtest_example::utils::accounts::{
-    make_native_account, make_token_account, native_seed_lamports,
+    account_override, empty_token_override, native_override, native_seed_lamports,
 };
-use backtest_example::utils::chain::{get_mint_token_program, get_transactions};
+use backtest_example::utils::chain::get_transactions;
 use backtest_example::utils::parse::{
-    JUPITER_V6, TOKEN_PROGRAM, WSOL_MINT, derive_ata, extract_signer, parse_any_jupiter_swap,
-    patch_jup_min_out,
+    JUPITER_V6, WSOL_MINT, derive_ata, extract_signer, parse_any_jupiter_swap, patch_jup_min_out,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -34,9 +33,6 @@ use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
 
-const SLOT_ADVANCE: u64 = 50;
-const MAX_SWAPS: usize = 5;
-
 #[derive(Parser)]
 #[command(about = "Track Jupiter swap output decay across 50 slots")]
 struct Cli {
@@ -44,13 +40,17 @@ struct Cli {
     url: String,
     #[arg(long, env = "SIMULATOR_API_KEY")]
     api_key: String,
-    /// Starting slot: collect swaps here, then simulate over the next 50 slots.
-    #[arg(long, default_value_t = 422_818_048)]
-    start_slot: u64,
-    #[arg(long, default_value = "results.csv")]
-    output: String,
+    /// Program id: router program to measure.
     #[arg(long, default_value = JUPITER_V6)]
     program_id: String,
+    /// Starting slot: collect all swaps for the given `program_id` at this slot.
+    #[arg(long, default_value_t = 437_249_802)]
+    start_slot: u64,
+    /// Slot count: simulate all swaps from `start_slot` for this many successive slots.
+    #[arg(long, default_value_t = 50)]
+    slot_count: u64,
+    #[arg(long, default_value = "results.csv")]
+    output: String,
 }
 
 struct OriginalSwap {
@@ -85,10 +85,6 @@ async fn collect_swaps(cli: &Cli) -> Result<Vec<OriginalSwap>> {
     let mut captured: Vec<OriginalSwap> = Vec::new();
 
     for tx_with_meta in &txs {
-        if captured.len() >= MAX_SWAPS {
-            break;
-        }
-
         let touches_program = tx_with_meta
             .transaction
             .message
@@ -188,60 +184,36 @@ struct SwapAccounts {
 /// of `in_mint`, and zero out the output side so the returned post-execution
 /// balance *is* the swap's output (no separate "before" read needed).
 async fn build_overrides(swap: &OriginalSwap) -> Result<SwapAccounts> {
-    let signer_addr: Address = swap.signer.to_string().parse().context("parse signer")?;
     let mut overrides = BTreeMap::new();
 
     // Input side. For WSOL: either seed native SOL and let the tx wrap it
     // itself (wrap-and-swap pattern), or seed the wSOL ATA directly.
-    if swap.in_mint == WSOL_MINT {
-        if contains_wsol_creation(swap) {
-            overrides.insert(signer_addr, make_native_account(swap.in_amount));
-        } else {
-            let in_ata: Address = derive_ata(&swap.signer, WSOL_MINT)
-                .context("derive wSOL input ATA")?
-                .to_string()
-                .parse()?;
-            overrides.insert(
-                in_ata,
-                make_token_account(&signer_addr, WSOL_MINT, swap.in_amount, TOKEN_PROGRAM)?,
-            );
-        }
-    } else {
-        let in_ata: Address = derive_ata(&swap.signer, &swap.in_mint)
-            .context("derive input ATA")?
-            .to_string()
-            .parse()?;
-        let in_token_program = get_mint_token_program(&swap.in_mint).await?;
-        overrides.insert(
-            in_ata,
-            make_token_account(
-                &signer_addr,
-                &swap.in_mint,
-                swap.in_amount,
-                &in_token_program,
-            )?,
-        );
-    }
+    let (in_addr, in_data) = account_override(
+        &swap.signer,
+        &swap.in_mint,
+        swap.in_amount,
+        contains_wsol_creation(swap),
+    )
+    .await?;
+    overrides.insert(in_addr, in_data);
 
     // Output side, zeroed so the post-execution read is the swap output directly.
+    // WSOL output always reads as native SOL, never an ATA.
+    let (out_addr, out_data) = if swap.out_mint == WSOL_MINT {
+        native_override(&swap.signer, 0)?
+    } else {
+        empty_token_override(&swap.signer, &swap.out_mint).await?
+    };
+    overrides.insert(out_addr, out_data);
+
     let return_accounts = if swap.out_mint == WSOL_MINT {
-        overrides.insert(signer_addr, make_native_account(0));
         let wsol_ata: Address = derive_ata(&swap.signer, WSOL_MINT)
             .context("derive wSOL output ATA")?
             .to_string()
             .parse()?;
-        vec![signer_addr, wsol_ata]
+        vec![out_addr, wsol_ata]
     } else {
-        let out_ata: Address = derive_ata(&swap.signer, &swap.out_mint)
-            .context("derive output ATA")?
-            .to_string()
-            .parse()?;
-        let out_token_program = get_mint_token_program(&swap.out_mint).await?;
-        overrides.insert(
-            out_ata,
-            make_token_account(&signer_addr, &swap.out_mint, 0, &out_token_program)?,
-        );
-        vec![out_ata]
+        vec![out_addr]
     };
 
     Ok(SwapAccounts {
@@ -251,10 +223,14 @@ async fn build_overrides(swap: &OriginalSwap) -> Result<SwapAccounts> {
 }
 
 /// One `ScheduledAction` per swap: the patched transaction repeated once per
-/// slot in `start_slot..=start_slot + SLOT_ADVANCE`, funded via `account_overrides`
+/// slot in `start_slot..=start_slot + slot_count`, funded via `account_overrides`
 /// so each firing re-simulates against a consistent, freshly-funded balance.
-async fn build_action(swap: &OriginalSwap, start_slot: u64) -> Result<ScheduledAction> {
-    let slots: Vec<u64> = (start_slot..=start_slot + SLOT_ADVANCE).collect();
+async fn build_action(
+    swap: &OriginalSwap,
+    start_slot: u64,
+    slot_count: u64,
+) -> Result<ScheduledAction> {
+    let slots: Vec<u64> = (start_slot..=start_slot + slot_count).collect();
     let SwapAccounts {
         overrides,
         return_accounts,
@@ -275,8 +251,8 @@ async fn build_action(swap: &OriginalSwap, start_slot: u64) -> Result<ScheduledA
     })
 }
 
-/// Read the swap output from a `ScheduledAction`'s returned accounts, matching
-/// the zeroed baseline `build_overrides` set on the output side.
+/// Read the swap output from a `ScheduledAction`'s returned accounts,
+/// matching the zeroed baseline `build_overrides` set on the output side.
 fn read_sim_out(out_mint: &str, accounts: &[Option<serde_json::Value>]) -> u64 {
     if out_mint == WSOL_MINT {
         // accounts[0] = signer (native SOL, zeroed baseline), accounts[1] = wSOL ATA.
@@ -311,10 +287,11 @@ async fn run_simulations(
     cli: &Cli,
     swaps: &[OriginalSwap],
     start_slot: u64,
+    slot_count: u64,
 ) -> Result<Vec<SimulatedSwap>> {
     let mut actions = Vec::with_capacity(swaps.len());
     for swap in swaps {
-        actions.push(build_action(swap, start_slot).await?);
+        actions.push(build_action(swap, start_slot, slot_count).await?);
     }
     eprintln!("[phase2] registering {} actions", actions.len());
 
@@ -323,7 +300,7 @@ async fn run_simulations(
 
     let create = CreateSession::builder()
         .start_slot(start_slot)
-        .end_slot(start_slot + SLOT_ADVANCE)
+        .end_slot(start_slot + slot_count)
         .disconnect_timeout_secs(900u16)
         .capacity_wait_timeout_secs(900u16)
         .actions(actions)
@@ -337,14 +314,13 @@ async fn run_simulations(
         .context("starting managed session")?;
     session.subscribe_actions();
 
-    let advance_count = SLOT_ADVANCE;
     let mut records: Vec<SimulatedSwap> = Vec::new();
 
     loop {
         match session.next_event().await {
             Ok(ManagedEvent::ReadyForContinue) => {
                 let params = ContinueParams {
-                    advance_count,
+                    advance_count: slot_count,
                     transactions: Vec::new(),
                     modify_account_states: AccountModifications(Default::default()),
                 };
@@ -367,11 +343,18 @@ async fn run_simulations(
                     .filter(|o| o.err.is_some())
                 {
                     eprintln!(
-                        "    [sim err] sig={} slot={} {}",
+                        "    [sim err] sig={} slot={} {}\n{}",
                         &signature[..16],
                         notification.slot,
-                        outcome.err.as_deref().unwrap_or_default()
+                        outcome.err.as_deref().unwrap_or_default(),
+                        outcome
+                            .logs
+                            .iter()
+                            .map(|l| format!("      {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
                     );
+                    continue;
                 }
 
                 let sim_out = read_sim_out(&swap.out_mint, &notification.accounts);
@@ -446,18 +429,12 @@ async fn main() -> Result<()> {
         .ok();
     let cli = Cli::parse();
 
-    eprintln!(
-        "[phase1] collecting up to {MAX_SWAPS} swaps from slot {}",
-        cli.start_slot
-    );
+    eprintln!("[phase1] collecting swaps from slot {}", cli.start_slot);
     let captured = collect_swaps(&cli).await?;
     eprintln!("[phase1] collected {} swaps", captured.len());
 
     if captured.is_empty() {
-        eprintln!(
-            "[warn] no Jupiter swaps found in slot {} — exiting",
-            cli.start_slot
-        );
+        eprintln!("[warn] no swaps found in slot {} — exiting", cli.start_slot);
         return Ok(());
     }
 
@@ -465,9 +442,9 @@ async fn main() -> Result<()> {
         "[phase2] simulating {} swaps over slots {}..={}",
         captured.len(),
         cli.start_slot,
-        cli.start_slot + SLOT_ADVANCE
+        cli.start_slot + cli.slot_count
     );
-    let records = run_simulations(&cli, &captured, cli.start_slot).await?;
+    let records = run_simulations(&cli, &captured, cli.start_slot, cli.slot_count).await?;
 
     write_output(&cli.output, &records)?;
     eprintln!("[done] wrote {} rows to {}", records.len(), cli.output);

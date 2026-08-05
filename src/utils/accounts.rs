@@ -129,41 +129,24 @@ pub fn make_native_account(amount: u64) -> AccountData {
     }
 }
 
-async fn set_native_balance(session: &BacktestSession, owner: &Pubkey, amount: u64) -> Result<u64> {
-    let addr: Address = owner.to_string().parse()?;
-    let original = session
-        .rpc()
-        .get_account(&addr)
-        .await
-        .ok()
-        .map(|a| a.lamports)
-        .unwrap_or(0);
-
-    let mods = AccountModifications(BTreeMap::from([(addr, make_native_account(amount))]));
-    modify_with_retry(session, &mods, "modify_accounts (native)").await?;
-    Ok(original)
+/// Address + account data for a native SOL override at `amount`.
+pub fn native_override(owner: &Pubkey, amount: u64) -> Result<(Address, AccountData)> {
+    let addr: Address = owner.to_string().parse().context("parse owner")?;
+    Ok((addr, make_native_account(amount)))
 }
 
-pub async fn set_ata_balance(
-    session: &BacktestSession,
+/// Address + account data for `owner`'s ATA of `mint` at `amount`. `amount = 0`
+/// zeroes the account out (it "shouldn't exist") rather than leaving a stale
+/// empty token account.
+pub async fn token_override(
     owner: &Pubkey,
     mint: &str,
     amount: u64,
-) -> Result<u64> {
+) -> Result<(Address, AccountData)> {
     let ata = derive_ata(owner, mint).context("derive_ata failed")?;
     let owner_addr: Address = owner.to_string().parse()?;
-    let original = session
-        .rpc()
-        .get_account(&ata)
-        .await
-        .ok()
-        .filter(|a| a.data.len() >= 72)
-        .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap()))
-        .unwrap_or(0);
 
     let account_data = if amount == 0 {
-        // amount=0 means the account shouldn't exist.
-        // zero it out so there's not a stale empty token account.
         AccountData {
             data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
             executable: false,
@@ -176,10 +159,71 @@ pub async fn set_ata_balance(
         make_token_account(&owner_addr, mint, amount, &token_program)?
     };
 
-    let mods = AccountModifications(BTreeMap::from([(
+    Ok((ata.to_string().parse::<Address>()?, account_data))
+}
+
+/// Address + account data for `owner`'s ATA of `mint`, initialized but with a
+/// zero balance — for reading back a swap's output without erasing an ATA that
+/// already exists on-chain (unlike [`token_override`]'s `amount = 0`, which
+/// wipes it to "doesn't exist" and breaks any tx that doesn't recreate it).
+pub async fn empty_token_override(owner: &Pubkey, mint: &str) -> Result<(Address, AccountData)> {
+    let ata = derive_ata(owner, mint).context("derive_ata failed")?;
+    let owner_addr: Address = owner.to_string().parse()?;
+    let token_program = get_mint_token_program(mint).await?;
+    Ok((
         ata.to_string().parse::<Address>()?,
-        account_data,
-    )]));
+        make_token_account(&owner_addr, mint, 0, &token_program)?,
+    ))
+}
+
+/// Address + account data funding `owner` with `amount` of `mint`: native SOL
+/// when `mint` is WSOL and `set_native` (e.g. a wrap-and-swap transaction that
+/// funds its own wSOL ATA), otherwise a token account override.
+pub async fn account_override(
+    owner: &Pubkey,
+    mint: &str,
+    amount: u64,
+    set_native: bool,
+) -> Result<(Address, AccountData)> {
+    if mint == WSOL_MINT && set_native {
+        native_override(owner, amount)
+    } else {
+        token_override(owner, mint, amount).await
+    }
+}
+
+async fn set_native_balance(session: &BacktestSession, owner: &Pubkey, amount: u64) -> Result<u64> {
+    let (addr, account_data) = native_override(owner, amount)?;
+    let original = session
+        .rpc()
+        .get_account(&addr)
+        .await
+        .ok()
+        .map(|a| a.lamports)
+        .unwrap_or(0);
+
+    let mods = AccountModifications(BTreeMap::from([(addr, account_data)]));
+    modify_with_retry(session, &mods, "modify_accounts (native)").await?;
+    Ok(original)
+}
+
+pub async fn set_ata_balance(
+    session: &BacktestSession,
+    owner: &Pubkey,
+    mint: &str,
+    amount: u64,
+) -> Result<u64> {
+    let (ata, account_data) = token_override(owner, mint, amount).await?;
+    let original = session
+        .rpc()
+        .get_account(&ata)
+        .await
+        .ok()
+        .filter(|a| a.data.len() >= 72)
+        .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap()))
+        .unwrap_or(0);
+
+    let mods = AccountModifications(BTreeMap::from([(ata, account_data)]));
     modify_with_retry(session, &mods, "modify_accounts (ata)").await?;
 
     Ok(original)
