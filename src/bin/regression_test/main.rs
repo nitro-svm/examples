@@ -114,7 +114,12 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-    eprintln!("[ws] session_id: {}", session.session_id().unwrap_or("?"));
+    eprintln!(
+        "[ws] session_id: {}",
+        session
+            .session_id()
+            .map_or_else(|| "?".to_string(), |id| id.to_string())
+    );
     let rpc_endpoint = session
         .rpc_endpoint()
         .context("no rpc_endpoint")?

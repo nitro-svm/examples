@@ -3355,9 +3355,9 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simulator-api"
-version = "0.15.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a997179afb172bba336d6f90461524f284bff37a613dcccb6b929016a897c964"
+checksum = "72535c2e6202b0cd93d5dc9cb1c76fb479f3962d9c73e327be1e7faba65c2dcb"
 dependencies = [
  "base64 0.22.1",
  "bon",
@@ -3367,14 +3367,18 @@ dependencies = [
  "serde_with",
  "solana-account 4.3.1",
  "solana-address 2.6.1",
+ "spl-token-2022-interface",
+ "spl-token-interface",
+ "thiserror 2.0.18",
+ "uuid",
  "zstd",
 ]
 
 [[package]]
 name = "simulator-client"
-version = "0.15.0"
+version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de017c6f7c119c6d29a56f0676cf98bcea92347128b131404fe0d4b9adbdad41"
+checksum = "9bdcafc8c420bc4ca973d38e784c6d85729ac239f65c9fae30eadee7af948398"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",
@@ -3386,14 +3390,14 @@ dependencies = [
  "serde",
  "serde_json",
  "simulator-api",
+ "solana-account-decoder",
  "solana-address 2.6.1",
  "solana-client",
  "solana-commitment-config",
  "solana-loader-v3-interface",
  "solana-rpc-client-api",
+ "solana-sdk-ids",
  "solana-transaction-status",
- "spl-associated-token-account-interface",
- "spl-token-2022-interface",
  "thiserror 2.0.18",
  "tokio",
  "tokio-retry",
@@ -5904,6 +5908,17 @@ name = "utf8parse"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
+
+[[package]]
+name = "uuid"
+version = "1.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf3923a6f5c4c6382e0b653c4117f48d631ea17f38ed86e2a828e6f7412f5239"
+dependencies = [
+ "getrandom 0.4.2",
+ "js-sys",
+ "wasm-bindgen",
+]
 
 [[package]]
 name = "valuable"

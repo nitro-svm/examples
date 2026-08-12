@@ -16,7 +16,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use simulator_api::DiscoveryFilter;
+use simulator_api::{DiscoveryFilter, RerouteVenues, SwapVenue};
 use simulator_client::{
     BacktestClient, CreateSession, DiscoveryStepResult, RerouteNotification, subscribe_reroutes,
 };
@@ -110,12 +110,26 @@ async fn main() -> Result<()> {
                 .disconnect_timeout_secs(900u16)
                 .capacity_wait_timeout_secs(900u16)
                 .reroute_order_flow(true)
+                // The server re-quotes Jupiter order flow alone by default. A venue's share of
+                // the book is contested across every aggregator that routes to it, so name them
+                // all: dropping one drops the legs it carried, not just its label.
+                .reroute_venues(RerouteVenues::new([
+                    SwapVenue::Jupiter,
+                    SwapVenue::Okx,
+                    SwapVenue::Titan,
+                    SwapVenue::Dflow,
+                ]))
                 .discoveries(vec![DiscoveryFilter::ProgramExecuted(cli.program_id)])
                 .build(),
         )
         .await?;
 
-    eprintln!("[ws] session: {}", session.session_id().unwrap_or("?"));
+    eprintln!(
+        "[ws] session: {}",
+        session
+            .session_id()
+            .map_or_else(|| "?".to_string(), |id| id.to_string())
+    );
 
     let rpc_endpoint = session
         .rpc_endpoint()
@@ -181,7 +195,10 @@ async fn main() -> Result<()> {
     .context("subscribe to reroutes")?;
     eprintln!("[sub] listening for rerouted swaps touching \"{venue_label}\"");
 
-    let timeout = Some(Duration::from_secs(120));
+    // Covers the first step, which waits out session startup: a rerouting session also builds
+    // the metis router's market cache before any batch executes, and that is minutes rather
+    // than the seconds a plain replay needs.
+    let timeout = Some(Duration::from_secs(900));
     let mut pause_count = 0u64;
 
     loop {

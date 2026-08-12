@@ -175,7 +175,12 @@ async fn main() -> Result<()> {
         )
         .await?;
 
-    eprintln!("[ws] session: {}", session.session_id().unwrap_or("?"));
+    eprintln!(
+        "[ws] session: {}",
+        session
+            .session_id()
+            .map_or_else(|| "?".to_string(), |id| id.to_string())
+    );
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
     eprintln!("[ws] ready — scanning for {} batches", cli.program_id);
 
