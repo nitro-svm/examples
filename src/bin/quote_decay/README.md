@@ -4,6 +4,11 @@ A quote is priced against one block but lands several blocks later. In between, 
 
 By default, it replays Jupiter swaps against the next 50 slots--route, size, and signer are held constant, only the landing slot varies. The resulting output-vs-slot curve shows how fast a quote becomes stale for a given pair.
 
+## Background
+![Quote Decay for Select Transactions](./Quote%20Decay%20for%20Select%20Transactions.png)
+
+Some venues may adopt aggressive pricing strategies where they offer one price at quote time to capture taker flow from aggregators but actually use a worse price to execute the fill. The sample code generates data that can be used to construct visuals like the above graph, where the yellow line represents a venue that oscillates between prices for a SOL -> USDC swap.
+
 ## Methodology
 
 **Phase 1 (at `--start-slot`)**: use a `ProgramExecuted` filter on Jupiter V6 to captures the first 5 swaps in the slot: transaction, signer, and the real onchain output.
