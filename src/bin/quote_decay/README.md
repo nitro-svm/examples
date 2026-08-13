@@ -7,7 +7,7 @@ By default, it replays Jupiter swaps against the next 50 slots--route, size, and
 ## Background
 ![Quote Decay for Select Transactions](./Quote%20Decay%20for%20Select%20Transactions.png)
 
-Some venues may adopt aggressive pricing strategies where they offer one price at quote time to capture taker flow from aggregators but actually use a worse price to execute the fill. The sample code generates data that can be used to construct visuals like the above graph, where the yellow line represents a venue that oscillates between prices for a SOL -> USDC swap.
+Some venues may adopt aggressive pricing strategies: they offer one price at quote time to capture taker flow from aggregators but actually use a worse price to execute the fill. The sample code generates data like the graph above, where the yellow line represents a venue that oscillates between prices for a SOL -> USDC swap.
 
 ## Methodology
 
