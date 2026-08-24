@@ -321,6 +321,7 @@ pub(crate) fn get_depth_actions(
             kind: ActionKind::Simulate,
             transactions: repeat_per_slot(q2b_tx, program_id, all_slots.len()),
             account_overrides: q2b_overrides.clone(),
+            feeds_reroute: false,
             return_accounts: vec![q2b_output],
             label: Some(depth_q2b_label(venue, q2b_size)),
         });
@@ -330,6 +331,7 @@ pub(crate) fn get_depth_actions(
             kind: ActionKind::Simulate,
             transactions: repeat_per_slot(b2q_tx, program_id, all_slots.len()),
             account_overrides: b2q_overrides.clone(),
+            feeds_reroute: false,
             return_accounts: vec![*b2q_output],
             label: Some(depth_b2q_label(venue, b2q_size)),
         });
