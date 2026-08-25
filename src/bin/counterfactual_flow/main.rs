@@ -20,33 +20,35 @@ use std::{
     fs,
     future::ready,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
 use clap::Parser;
 use simulator_api::{
-    AccountData, AccountModifications, ActionAnchor, ActionKind, RerouteFilter, RerouteStatsReport,
-    RerouteVenues, ScheduledAction,
+    AccountData, AccountModifications, ActionAnchor, ActionKind, BinaryEncoding, EncodedBinary,
+    RerouteAggregators, RerouteFilter, RerouteStatsReport, ScheduledAction,
 };
 use simulator_client::{
-    AccountDiffNotification, CreateSession, ManagedBacktestSession, RerouteLegNotification,
-    RerouteNotification, subscribe_account_diffs, subscribe_reroutes,
+    AccountDiffNotification, CreateSession, FULL_PERCENT, ManagedBacktestSession,
+    RerouteLegNotification, RerouteNotification,
+    reroute_report::{Report, Target, short_mint},
+    subscribe_account_diffs, subscribe_reroutes,
 };
 use solana_address::Address;
 
 use crate::{
     cli::{
-        CaptureArgs, Cli, Command, CompareArgs, ConnectionArgs, RangeArgs, RunArgs, filter_from,
-        shift_label,
+        CaptureArgs, Cli, Command, CompareArgs, ConnectionArgs, RangeArgs, ReportArgs, RunArgs,
+        filter_from, shift_label,
     },
     jsonl::{
-        CaptureRow, JoinedLeg, RerouteLegRow, RerouteRow, load_capture_rows, wire_transaction,
-        write_capture,
+        CaptureRow, FORMAT_VERSION, HeaderKind, JoinedLeg, RunHeader, RunSummary,
+        load_capture_rows, wire_transaction, write_capture,
     },
     session::{CaptureCollector, create_session, drive_to_completion},
-    venue::{WHOLE_LEG, original_venue_share, resolve_venue_label, venue_share},
+    venue::{original_venue_share, resolve_venue_label, venue_share},
 };
 
 type LegKey = (String, usize);
@@ -130,13 +132,6 @@ impl VenueTally {
     }
 }
 
-fn short_mint(mint: &str) -> String {
-    match mint.len() > 12 {
-        true => format!("{}..{}", &mint[..6], &mint[mint.len() - 4..]),
-        false => mint.to_string(),
-    }
-}
-
 struct RunOutput {
     funnel: Option<RerouteStatsReport>,
     legs: BTreeMap<LegKey, LegRecord>,
@@ -144,24 +139,59 @@ struct RunOutput {
     scheduled: usize,
 }
 
-/// The venue under test.
-#[derive(Clone)]
-struct Venue {
-    /// Metis's display label, how its hops are named in the re-quoted route.
-    label: String,
-    /// The program, which is how its hops are named in the original's route.
-    program: Address,
-}
-
 struct RunConfig {
     range: RangeArgs,
     schedule: Schedule,
     filter: Option<RerouteFilter>,
-    venue: Option<Venue>,
+    venue: Option<Target>,
     jsonl_out: Option<PathBuf>,
     detect_failed_l1_swaps: bool,
     circular_arbs: bool,
-    reroute_venues: Option<RerouteVenues>,
+    reroute_aggregators: Option<RerouteAggregators>,
+    /// The arm, recorded in the file's header.
+    shift: Option<i64>,
+    price_shift_bps: Option<f64>,
+    carrier: &'static str,
+    record_full: bool,
+}
+
+impl RunConfig {
+    fn header(&self) -> RunHeader {
+        RunHeader {
+            format_version: FORMAT_VERSION,
+            kind: HeaderKind::CounterfactualFlowRun,
+            start_slot: self.range.start_slot,
+            end_slot: self.range.start_slot + self.range.slot_count,
+            program_id: self
+                .venue
+                .as_ref()
+                .and_then(Target::program)
+                .map(|program| program.to_string()),
+            label: self
+                .venue
+                .as_ref()
+                .and_then(Target::label)
+                .map(str::to_string),
+            shift: self.shift,
+            price_shift_bps: self.price_shift_bps,
+            override_slots: self.schedule.entries(),
+            carrier: self.carrier.to_string(),
+            slim: !self.record_full,
+            reroute_aggregators: self.reroute_aggregators.as_ref().map(ToString::to_string),
+            filter_pairs: self
+                .filter
+                .iter()
+                .flat_map(|filter| filter.pairs.iter())
+                .map(|pair| {
+                    let (base, quote) = pair.mints();
+                    format!("{base},{quote}")
+                })
+                .collect(),
+            circular_arbs: self.circular_arbs,
+            detect_failed_l1_swaps: self.detect_failed_l1_swaps,
+            replay_account_state: !self.range.no_replay,
+        }
+    }
 }
 
 /// Empty on both counts is the baseline; the carriers are alternatives, never
@@ -207,7 +237,68 @@ async fn main() -> Result<()> {
         Command::Capture(args) => capture(args).await,
         Command::Run(args) => run(args).await.map(|_| ()),
         Command::Compare(args) => compare(args).await,
+        Command::Report(args) => report_recording(args).await,
     }
+}
+
+/// Reads the recording and nothing else. With no selector it measures the venue the run named.
+async fn report_recording(args: ReportArgs) -> Result<()> {
+    let recording = jsonl::read_recording(&args.recording)?;
+    if let Some(header) = &recording.header
+        && header.format_version != FORMAT_VERSION
+    {
+        bail!(
+            "{} is format version {}, this build reads {FORMAT_VERSION}",
+            args.recording.display(),
+            header.format_version
+        );
+    }
+
+    // `--program-id` names both sides: its label matches re-quoted hops, the program L1 ones.
+    let target = match (&args.label, args.program_id) {
+        (None, None) => recording
+            .header
+            .as_ref()
+            .and_then(target_from_header)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} names no venue, so there is no default to measure: \
+                     pass --program-id or --label",
+                    args.recording.display()
+                )
+            })?,
+        (Some(label), program) => Target::new(Some(label.clone()), program),
+        (None, Some(program)) => {
+            Target::new(Some(resolve_venue_label(&program).await?), Some(program))
+        }
+    };
+
+    let report = Report::from_notifications(target, &recording.notifications)?;
+    match args.json {
+        true => println!("{}", report.to_json()),
+        false => println!(
+            "{}",
+            report.render(slot_range(&recording.header).as_deref())
+        ),
+    }
+    Ok(())
+}
+
+/// The venue the run named, which a report with no selector measures.
+fn target_from_header(header: &RunHeader) -> Option<Target> {
+    let program = header
+        .program_id
+        .as_ref()
+        .and_then(|program| program.parse().ok());
+    let label = header.label.clone();
+    (program.is_some() || label.is_some()).then(|| Target::new(label, program))
+}
+
+/// The range the recording knows and the report does not.
+fn slot_range(header: &Option<RunHeader>) -> Option<String> {
+    header
+        .as_ref()
+        .map(|header| format!("slots {}–{}", header.start_slot, header.end_slot))
 }
 
 async fn capture(args: CaptureArgs) -> Result<()> {
@@ -502,27 +593,23 @@ fn schedule_for(args: &RunArgs, shift: i64, price_shift_bps: Option<f64>) -> Res
 }
 
 /// The venue under test, when one was named.
-async fn venue_of(args: &RunArgs) -> Result<Option<Venue>> {
+async fn venue_of(args: &RunArgs) -> Result<Option<Target>> {
     let Some(program) = args.program_id else {
         return Ok(None);
     };
     let label = resolve_venue_label(&program).await?;
     eprintln!("[jup] resolved venue label: {label:?}");
-    Ok(Some(Venue { label, program }))
+    Ok(Some(Target::new(Some(label), Some(program))))
 }
 
 async fn run(args: RunArgs) -> Result<RunOutput> {
     let schedule = shifted_schedule(&args)?;
+    let carrier = carrier_of(&args);
     if let Some(shift) = args.shift() {
         eprintln!(
-            "[{}] {} anchor slots, carried as {}",
+            "[{}] {} anchor slots, carried as {carrier}",
             shift_label(shift),
             schedule.entries(),
-            if args.setup_transactions {
-                "setup transactions"
-            } else {
-                "account bytes"
-            }
         );
     }
     let config = RunConfig {
@@ -533,21 +620,59 @@ async fn run(args: RunArgs) -> Result<RunOutput> {
         jsonl_out: Some(args.out.clone()),
         detect_failed_l1_swaps: !args.skip_l1_failures,
         circular_arbs: args.circular_arbs,
-        reroute_venues: args.reroute_venues.clone(),
+        reroute_aggregators: args.reroute_aggregators.clone(),
+        shift: args.shift(),
+        price_shift_bps: args.price_shift_bps,
+        carrier,
+        record_full: args.record_full,
     };
     let output = run_once(&args.conn, config).await?;
     report_run("run", &output);
     Ok(output)
 }
 
-const fn is_split(share: u8) -> bool {
-    share > 0 && share < WHOLE_LEG
+/// Fields are emptied rather than removed, so every row still reads as a `RerouteNotification`.
+/// The header's `slim` flag is what tells a reader the emptiness was deliberate.
+fn slimmed(notification: &RerouteNotification) -> RerouteNotification {
+    RerouteNotification {
+        logs: Vec::new(),
+        routed_transaction: EncodedBinary::new(String::new(), BinaryEncoding::Base64),
+        ..notification.clone()
+    }
+}
+
+/// `reroute-out.jsonl` and arm `control` give `reroute-out-control.jsonl`, so the two arms of a
+/// comparison sort together.
+fn arm_path(base: &Path, arm: &str) -> PathBuf {
+    let stem = base.file_stem().map_or_else(
+        || base.as_os_str().to_string_lossy(),
+        |s| s.to_string_lossy(),
+    );
+    let named = match base.extension() {
+        Some(extension) => format!("{stem}-{arm}.{}", extension.to_string_lossy()),
+        None => format!("{stem}-{arm}"),
+    };
+    base.with_file_name(named)
+}
+
+/// How the arm reaches the venue: as the captured bytes, as the venue's own update transaction
+/// re-executed at the shifted slot, or not at all.
+fn carrier_of(args: &RunArgs) -> &'static str {
+    match (args.shift().is_some(), args.setup_transactions) {
+        (false, _) => "none",
+        (true, true) => "setup transactions",
+        (true, false) => "account bytes",
+    }
+}
+
+const fn is_split(share: u64) -> bool {
+    share > 0 && share < FULL_PERCENT
 }
 
 /// One leg's contribution to the tally, or `None` when the venue is on neither side of it.
-fn leg_counts(leg: &RerouteLegNotification, venue: &Venue) -> Option<VenueCounts> {
-    let after = venue_share(leg, &venue.label);
-    let before = original_venue_share(leg, &venue.program);
+fn leg_counts(leg: &RerouteLegNotification, venue: &Target) -> Option<VenueCounts> {
+    let after = venue_share(leg, venue);
+    let before = original_venue_share(leg, venue);
     let ran_before = before.is_some_and(|share| share > 0);
     (after > 0 || ran_before).then(|| VenueCounts {
         legs: u64::from(after > 0),
@@ -562,7 +687,8 @@ fn leg_counts(leg: &RerouteLegNotification, venue: &Venue) -> Option<VenueCounts
 /// Everything the reroute subscription accumulates, behind one lock.
 #[derive(Default)]
 struct RerouteCollector {
-    venue: Option<Venue>,
+    venue: Option<Target>,
+    record_full: bool,
     legs: BTreeMap<LegKey, LegRecord>,
     tally: VenueTally,
     jsonl: Option<io::BufWriter<fs::File>>,
@@ -609,20 +735,22 @@ impl RerouteCollector {
         }
     }
 
+    /// The wire type itself, with the unread fields emptied unless the run asked to keep them.
+    /// A projection here would silently drop whatever it did not name.
     fn write_jsonl_row(&mut self, notification: &RerouteNotification) {
+        if self.record_full {
+            self.write_line(|| serde_json::to_string(notification));
+            return;
+        }
+        let slim = slimmed(notification);
+        self.write_line(|| serde_json::to_string(&slim));
+    }
+
+    fn write_line(&mut self, render: impl FnOnce() -> serde_json::Result<String>) {
         let Some(jsonl) = &mut self.jsonl else {
             return;
         };
-        let row = RerouteRow {
-            slot: notification.slot,
-            original_signature: &notification.original_signature,
-            legs: notification.legs.iter().map(RerouteLegRow::from).collect(),
-            err: notification.err.as_deref(),
-            compute_units: notification.compute_units_consumed,
-            realized_out: notification.realized_output_amount,
-            original_realized_out: notification.original_realized_output_amount,
-        };
-        let written = serde_json::to_string(&row)
+        let written = render()
             .map_err(io::Error::from)
             .and_then(|line| writeln!(jsonl, "{line}"));
         if let Err(error) = written {
@@ -636,6 +764,8 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     let slot_count = config.range.slot_count;
     let venue = config.venue.clone();
     let jsonl_out = config.jsonl_out.clone();
+    let record_full = config.record_full;
+    let header = config.header();
     let create = create_session(config)?;
     let mut session =
         ManagedBacktestSession::start(conn.websocket_url(), conn.api_key.clone(), create).await?;
@@ -643,11 +773,15 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     let jsonl = jsonl_out
         .map(|path| fs::File::create(path).map(io::BufWriter::new))
         .transpose()?;
-    let collector = Arc::new(Mutex::new(RerouteCollector {
+    let mut collected = RerouteCollector {
         venue,
         jsonl,
+        record_full,
         ..RerouteCollector::default()
-    }));
+    };
+    // Written before the session can push a notification, so a truncated run still names its arm.
+    collected.write_line(|| serde_json::to_string(&header));
+    let collector = Arc::new(Mutex::new(collected));
     let sink = collector.clone();
     let handle = subscribe_reroutes(
         &conn.rpc_url(&session.session_info().rpc_endpoint),
@@ -667,6 +801,12 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     session.shutdown().await;
 
     let mut collected = std::mem::take(&mut *collector.lock().expect("reroute collector"));
+    // A run that died before this point leaves no trailer, which is how a reader knows its
+    // totals do not cover the whole range.
+    if let Some(report) = &funnel {
+        let summary = RunSummary::from_report(report);
+        collected.write_line(|| serde_json::to_string(&summary));
+    }
     if let Some(error) = collected.write_error {
         return Err(error.into());
     }
@@ -756,25 +896,44 @@ async fn compare(args: CompareArgs) -> Result<()> {
     })?;
     let label = shift_label(shift);
     let venue = venue_of(&args.run).await?;
-    let make_config = |schedule| RunConfig {
+    // Each arm records to its own file, so `report` can read either one afterwards.
+    let make_config = |schedule, shift, price_shift_bps, carrier, arm: &str| RunConfig {
         range: args.run.range.clone(),
         schedule,
         filter: filter_from(&args.run),
         venue: venue.clone(),
-        jsonl_out: None,
+        jsonl_out: Some(arm_path(&args.run.out, arm)),
         detect_failed_l1_swaps: !args.run.skip_l1_failures,
         circular_arbs: args.run.circular_arbs,
-        reroute_venues: args.run.reroute_venues.clone(),
+        reroute_aggregators: args.run.reroute_aggregators.clone(),
+        shift,
+        price_shift_bps,
+        carrier,
+        record_full: args.run.record_full,
     };
 
     let schedule = shifted_schedule(&args.run)?;
 
     eprintln!("[control] running the reroute (no override)...");
-    let baseline = run_once(&args.run.conn, make_config(Schedule::default())).await?;
+    let baseline = run_once(
+        &args.run.conn,
+        make_config(Schedule::default(), None, None, "none", "control"),
+    )
+    .await?;
     report_run("control", &baseline);
 
     eprintln!("[modified] running with {label}...");
-    let modified = run_once(&args.run.conn, make_config(schedule)).await?;
+    let modified = run_once(
+        &args.run.conn,
+        make_config(
+            schedule,
+            Some(shift),
+            args.run.price_shift_bps,
+            carrier_of(&args.run),
+            "modified",
+        ),
+    )
+    .await?;
     report_run("modified", &modified);
 
     let (joined, zero_baseline) = join_legs(shift, &baseline.legs, &modified.legs);
