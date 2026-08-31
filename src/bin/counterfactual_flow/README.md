@@ -3,7 +3,7 @@
 Change a venue's quote and measure the taker flow it wins or loses.
 
 The change is an **account override**: the venue's own captured state, modified, visible only to
-the router. Metis re-quotes every historical swap against it; nothing is committed, so other
+the router. It re-quotes every historical swap against that state; nothing is committed, so other
 venues and taker flow are unchanged.
 
 ## How it works
@@ -11,6 +11,8 @@ venues and taker flow are unchanged.
 1. `capture` records the account's state at each slot it changed.
 2. `run` posts those states back, optionally modified, and reports what the venue captured.
 3. `compare` runs the null control and one arm in a single invocation and diffs them leg by leg.
+4. `report` reads a run's output back and reports what crossed the venue, on L1 and after the
+   re-quote, in swaps and in dollars.
 
 Two modifications are supported:
 
@@ -62,8 +64,8 @@ captured <n> states (<n> with a transaction) to capture.jsonl
 An account that never wrote in the range is an error, not an empty file
 (`account <A> never appeared in [<start>, <end>]`).
 
-Steps 2 and 3 take the server's default venue set (Jupiter alone), which is the population every
-number in [Results](#results) is measured over.
+Steps 2 and 3 take the default venue set (Jupiter alone), which is the population every number
+in [Results](#results) is measured over.
 
 ### A time shift carried as the venue's own transaction
 
@@ -91,15 +93,14 @@ so make sure to build account bundles if you want fast replay. List what is avai
 curl -s https://simulator.termina.technology/available-ranges | jq
 ```
 
-The server replays the 10,000-slot range used here in 5–8 minutes, and the
-`--setup-transactions` variant costs about 20% more (due to executing more transactions).
-`compare` runs two sessions back to back, so double it. A session waits up to 15 minutes 
-for capacity before failing, so a slow start is not a hang.
+The 10,000-slot range used here replays in 5–8 minutes, and `--setup-transactions` costs about
+20% more. `compare` runs two sessions back to back, so double it. A session waits up to 15
+minutes for capacity before failing, so a slow start is not a hang.
 
 ### Finding the pool
 
-`POOL` is the venue's own pool for the pair. Read it out of Metis's chosen routes on a probe run
-— no `--capture`, so nothing is overridden:
+`POOL` is the venue's own pool for the pair. Read it out of the router's chosen routes on a probe
+run — no `--capture`, so nothing is overridden:
 
 ```sh
 cargo run --bin counterfactual_flow -- run $RANGE --program-id $PROGRAM \
@@ -139,12 +140,12 @@ replayed slot emits a `[slot] <n>` line, so redirect stderr to a file rather tha
 ```
 
 - **detected** — swaps found in the range on the admitted venues, before
-  `--filter-pair`. Filter misses, arbitrage cycles and swaps Metis could not quote all drop out
+  `--filter-pair`. Filter misses, arbitrage cycles and swaps the router could not quote all drop out
   between here and **rerouted**
-- **rerouted** — swaps re-quoted through Metis and queued for simulation.
+- **rerouted** — swaps re-quoted through the router and queued for simulation.
 - **simulated** — routed transactions simulated against the frozen state.
 - **succeeded** — simulations that ran without reverting. Everything below counts quotes, not fills.
-- **requote-fail** — detected swaps Metis could not route at all.
+- **requote-fail** — detected swaps the router could not route at all.
 - **re-quoted legs seen** — the population. Every count below is a share of it.
 - **venue on L1 legs** — legs whose original L1 route ran through `--program-id`, matched on the
   program id.
@@ -159,8 +160,9 @@ replayed slot emits a `[slot] <n>` line, so redirect stderr to a file rather tha
 
 The per-direction lines carry the same fields for one `(input, output)` mint pair, busiest first.
 A direction appears only where the venue was on one side of it, so the lines do not add up to the
-direction's whole flow. Their mints are abbreviated to the first six and last four characters
-(`So1111..1112`), so grepping them for a full mint finds nothing.
+direction's whole flow. Mints show as their symbol where the range knows one, and otherwise
+abbreviated to the first six and last four characters (`USD1tt..EmuB`), so grepping either form
+for a full mint finds nothing.
 
 Lines that appear only when they apply:
 
@@ -185,6 +187,14 @@ Lines that appear only when they apply:
   override in force` — the denominator is the anchor-slot count above. A failed action leaves 
   the venue on an older shifted state, not on its unmodified one, and the arm is diluted 
   towards that older shift rather than towards baseline.
+
+## `report`
+
+What crossed the venue, on L1 and after the re-quote, read back from a run's output:
+
+```sh
+cargo run --bin counterfactual_flow -- report reroute-out.jsonl
+```
 
 ## `compare`
 
@@ -249,10 +259,9 @@ The L1 row is measured per arm and lands at 560–568 every time. It should: the
 what the router picks, not what the original did. An L1 row that moves with the arm means
 something is counting the treatment into the baseline.
 
-It is not the venue's whole L1 footprint. The client only receives notifications for swaps the
-server re-quoted, so the row counts L1 legs among those. On this range the venue was on 841 L1
-SOL/USDC legs: 561 re-quoted, 271 skipped, 9 the router could not quote. The skipped third never
-reaches the client at all, so read every row here as a share of the re-quoted population — the
+It is not the venue's whole L1 footprint: only re-quoted swaps are reported, so the row counts L1
+legs among those. On this range the venue was on 841 L1 SOL/USDC legs — 561 re-quoted, 271
+skipped, 9 the router could not quote. Read every row as a share of the re-quoted population: the
 ratios hold because both sides are over it, but the levels understate L1 by a third.
 
 **Quoting lower is not winning.** 0.4 bps — inside the venue's own 0.7–1.4 bps spread — costs 77%

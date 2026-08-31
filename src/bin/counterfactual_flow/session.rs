@@ -22,7 +22,7 @@ pub(crate) fn create_session(config: RunConfig) -> Result<CreateBacktestSessionR
         .reroute_order_flow(true)
         .detect_failed_l1_swaps(config.detect_failed_l1_swaps)
         .reroute_circular_arbs(config.circular_arbs)
-        .maybe_reroute_venues(config.reroute_venues)
+        .maybe_reroute_aggregators(config.reroute_aggregators)
         .maybe_reroute_filter(config.filter)
         .actions(config.schedule.setup.into_iter().collect())
         .replay_account_state(!config.range.no_replay)

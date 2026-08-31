@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use simulator_api::{MintPair, RerouteFilter, RerouteVenues};
+use simulator_api::{MintPair, RerouteAggregators, RerouteFilter};
 use solana_address::Address;
 
 #[derive(Parser)]
@@ -22,6 +22,29 @@ pub(crate) enum Command {
     /// Compare the parameter change against the null control: the same capture, same carrier,
     /// posted unmodified at each state's own slot.
     Compare(CompareArgs),
+    /// Report what flowed through a venue or pool in a recorded run, on L1 and after the
+    /// re-quote. Reads the file only, so it re-runs per pool for free.
+    Report(ReportArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct ReportArgs {
+    /// The recording written by `run` or `compare`.
+    pub(crate) recording: PathBuf,
+
+    /// The venue under test, resolved to its route label. Defaults to the venue the run named,
+    /// so a report of that run needs no selector at all.
+    #[arg(long)]
+    pub(crate) program_id: Option<Address>,
+
+    /// The route label, when you would rather give it than have `--program-id` resolve it.
+    /// Enough on its own: both columns fall back to it when no program is given.
+    #[arg(long)]
+    pub(crate) label: Option<String>,
+
+    /// Emit the report as JSON instead of a table.
+    #[arg(long, default_value_t = false)]
+    pub(crate) json: bool,
 }
 
 #[derive(Args, Clone)]
@@ -151,9 +174,10 @@ pub(crate) struct RunArgs {
     #[arg(long, default_value_t = false)]
     pub(crate) circular_arbs: bool,
 
-    /// Venues whose swaps to re-quote, comma-separated (server default: jupiter alone).
-    #[arg(long)]
-    pub(crate) reroute_venues: Option<RerouteVenues>,
+    /// Aggregators whose swaps to re-quote, comma-separated (server default: jupiter alone).
+    /// Spelled `--reroute-venues` on the command line, the name it shipped under.
+    #[arg(long = "reroute-venues")]
+    pub(crate) reroute_aggregators: Option<RerouteAggregators>,
 
     /// Carry the shift as the venue's own update transaction, simulated at the shifted slot,
     /// instead of as bytes. Needs a `--no-replay` capture.
@@ -170,6 +194,12 @@ pub(crate) struct RunArgs {
     /// worse for one and better for the other.
     #[arg(long, allow_negative_numbers = true)]
     pub(crate) price_shift_bps: Option<f64>,
+
+    /// Keep the simulation logs and the routed transaction in the recording. Off by default,
+    /// since no report reads them and they dominate the file size. Turn it on when a specific
+    /// fill will need explaining afterwards.
+    #[arg(long, default_value_t = false)]
+    pub(crate) record_full: bool,
 
     /// Reroute notifications JSONL output.
     #[arg(long, default_value = "reroute-out.jsonl")]

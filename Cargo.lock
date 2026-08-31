@@ -3493,9 +3493,9 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simulator-api"
-version = "0.19.0"
+version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bfe8962285d4171d0a603e947e78a64d1d91fdc52d55bd36934fb1864e3f792"
+checksum = "5afaa586a2dcf37e3839cbf21b8b86adb928562e78cf836503c0f6ec83ef00fe"
 dependencies = [
  "base64 0.22.1",
  "bon",
@@ -3515,9 +3515,9 @@ dependencies = [
 
 [[package]]
 name = "simulator-client"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "760224214cb80a219a211deebc779ec46d2cdae181afa627e6d7ac518f984933"
+checksum = "71e02dee4c404a212e89607368acccae21d4814caa2d99eaf143f6d3bff38ac8"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",

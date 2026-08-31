@@ -50,7 +50,7 @@ fn a_report_keeps_each_direction_apart() {
     );
 }
 use rstest::rstest;
-use simulator_api::{BinaryEncoding, EncodedBinary};
+use simulator_api::{BinaryEncoding, EncodedBinary, route_plan::RoutePlan};
 
 fn account_key() -> Address {
     Address::from([9; 32])
@@ -225,8 +225,9 @@ fn shift_prefers_lag_and_labels_by_direction() {
         filter_pair: Vec::new(),
         skip_l1_failures: false,
         circular_arbs: false,
-        reroute_venues: None,
+        reroute_aggregators: None,
         setup_transactions: false,
+        record_full: false,
         price_field: Vec::new(),
         price_shift_bps: None,
         out: PathBuf::from("out.jsonl"),
@@ -335,4 +336,139 @@ fn summary_percentiles_over_abs_deltas() {
     assert_eq!(stats.median_abs_bps, 100.0);
     assert_eq!(stats.p90_abs_bps, 200.0);
     assert_eq!(stats.mean_abs_bps, 87.5);
+}
+
+/// Both arms of one comparison land beside each other, neither overwriting the other.
+#[rstest]
+#[case::keeps_the_extension("reroute-out.jsonl", "control", "reroute-out-control.jsonl")]
+#[case::without_one("reroute-out", "modified", "reroute-out-modified")]
+#[case::keeps_the_directory("runs/arm.jsonl", "control", "runs/arm-control.jsonl")]
+fn an_arm_path_suffixes_the_stem(#[case] base: &str, #[case] arm: &str, #[case] expected: &str) {
+    assert_eq!(arm_path(Path::new(base), arm), PathBuf::from(expected));
+}
+
+/// The header round-trips, and stays distinguishable from the notifications after it.
+#[test]
+fn a_run_header_round_trips_and_names_itself() {
+    let config = RunConfig {
+        range: RangeArgs {
+            start_slot: 100,
+            slot_count: 50,
+            no_replay: true,
+        },
+        schedule: Schedule::default(),
+        filter: None,
+        venue: None,
+        jsonl_out: None,
+        detect_failed_l1_swaps: false,
+        circular_arbs: true,
+        reroute_aggregators: None,
+        shift: Some(-10),
+        price_shift_bps: None,
+        carrier: "account bytes",
+        record_full: false,
+    };
+
+    let line = serde_json::to_string(&config.header()).expect("header encodes");
+    let read_back: RunHeader = serde_json::from_str(&line).expect("header decodes");
+
+    assert_eq!(read_back.format_version, FORMAT_VERSION);
+    assert_eq!(read_back.kind, HeaderKind::CounterfactualFlowRun);
+    assert_eq!((read_back.start_slot, read_back.end_slot), (100, 150));
+    assert_eq!(read_back.shift, Some(-10));
+    assert_eq!(read_back.carrier, "account bytes");
+    // Slim is the default, and the header says so rather than leaving it to be inferred.
+    assert!(read_back.slim);
+    // `--no-replay` is the negative of what the session is asked for.
+    assert!(!read_back.replay_account_state);
+    assert!(read_back.circular_arbs);
+
+    // A notification must not parse as a header, or a reader would take the first row as one.
+    assert!(serde_json::from_str::<RunHeader>(r#"{"slot":1,"legs":[]}"#).is_err());
+}
+
+/// Slim drops the two fields the analysis never reads, and nothing else. It empties rather than
+/// removes them so every row still reads back as the wire type — which is the property the whole
+/// format rests on.
+#[test]
+fn a_slim_row_keeps_everything_the_analysis_reads_and_still_round_trips() {
+    let wire = serde_json::json!({
+        "context": {"slot": 42},
+        "slot": 42,
+        "batchIndex": 3,
+        "originalSignature": "sig",
+        "legs": [{
+            "inputMint": "in", "outputMint": "out", "amount": 1_000, "swapMode": "ExactIn",
+            "originalQuotedOut": 990, "metisQuotedOut": 1_010, "routeSummary": "SolFi",
+            "routePlan": [], "originalRoutePlan": [],
+        }],
+        "routedTransaction": {"data": "bGFyZ2UgYmxvYg==", "encoding": "base64"},
+        "err": serde_json::Value::Null,
+        "logs": ["Program log: one", "Program log: two"],
+        "computeUnitsConsumed": 123_456,
+        "fee": 5_000,
+        "realizedOutputAmount": 1_009,
+        "originalRealizedOutputAmount": 991,
+    });
+    let full: RerouteNotification = serde_json::from_value(wire).expect("wire decodes");
+
+    let slim = slimmed(&full);
+    assert!(slim.logs.is_empty());
+    assert!(slim.routed_transaction.data.is_empty());
+
+    // Everything the report reads survives.
+    assert_eq!(slim.batch_index, 3);
+    assert_eq!(slim.original_signature, "sig");
+    assert_eq!(slim.legs[0].swap_mode, "ExactIn");
+    assert_eq!(slim.legs[0].route_summary, "SolFi");
+    assert!(
+        slim.legs[0]
+            .route_plan
+            .as_ref()
+            .is_some_and(RoutePlan::is_empty)
+    );
+    assert!(
+        slim.legs[0]
+            .original_route_plan
+            .as_ref()
+            .is_some_and(RoutePlan::is_empty)
+    );
+    assert_eq!(slim.original_realized_output_amount, Some(991));
+    assert_eq!(slim.realized_output_amount, Some(1_009));
+
+    // And the row still reads back as the wire type, which removing the keys would break.
+    let line = serde_json::to_string(&slim).expect("slim encodes");
+    let read_back: RerouteNotification = serde_json::from_str(&line).expect("slim decodes");
+    assert_eq!(read_back.legs[0].amount, 1_000);
+}
+
+/// A recording whose header names no venue has no default, and must say so rather than guess.
+#[test]
+fn no_selector_measures_the_venue_the_run_named() {
+    let header = |venue: &str| -> RunHeader {
+        serde_json::from_str(&format!(
+            r#"{{"formatVersion":1,"kind":"counterfactualFlowRun","startSlot":1,"endSlot":2,
+                 {venue}"shift":null,"overrideSlots":0,"carrier":"none","slim":true,
+                 "rerouteVenues":null,"filterPairs":[],"circularArbs":false,
+                 "detectFailedL1Swaps":true,"replayAccountState":true}}"#
+        ))
+        .expect("header decodes")
+    };
+
+    let named =
+        header(r#""programId":"QuaNtZsgYRe5Z9Bk4LZ4cTD9tbkVoyCNf1R2BN9bBDv","label":"Quantum","#);
+    let target = target_from_header(&named).expect("the run named a venue");
+    assert_eq!(target.label(), Some("Quantum"));
+    assert!(
+        target.program().is_some(),
+        "both keys, so both columns match"
+    );
+
+    assert!(target_from_header(&header("")).is_none());
+    // The range is the recording's to supply; the report cannot know it.
+    assert_eq!(
+        slot_range(&Some(named)).as_deref(),
+        Some("slots 1–2"),
+        "the subtitle names the range the run covered"
+    );
 }

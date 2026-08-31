@@ -1,4 +1,4 @@
-//! The JSONL row types and the encoding they read and write, split out so `main` reads as the counterfactual and not its plumbing.
+//! The JSONL row types and the encoding they read and write.
 
 use std::{
     fs,
@@ -9,8 +9,8 @@ use std::{
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
-use simulator_api::AccountData;
-use simulator_client::RerouteLegNotification;
+use simulator_api::{AccountData, RerouteStatsReport};
+use simulator_client::RerouteNotification;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
     compiled_instruction::CompiledInstruction,
@@ -35,44 +35,89 @@ pub(crate) struct CaptureRow {
     pub(crate) transaction: Option<String>,
 }
 
-/// One line of the `run` reroute-notification JSONL.
-#[derive(Serialize)]
+/// The version a writer stamps and a reader accepts.
+pub(crate) const FORMAT_VERSION: u32 = 1;
+
+/// The first line of a recording. Every line after it is a
+/// [`simulator_client::RerouteNotification`] written verbatim, so a reader cannot drift from the
+/// wire type. `kind` lets a reader tell a frame from a notification by content, not position.
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RerouteRow<'a> {
-    pub(crate) slot: u64,
-    pub(crate) original_signature: &'a str,
-    pub(crate) legs: Vec<RerouteLegRow<'a>>,
-    pub(crate) err: Option<&'a str>,
-    pub(crate) compute_units: u64,
-    pub(crate) realized_out: Option<u64>,
-    pub(crate) original_realized_out: Option<u64>,
+pub(crate) struct RunHeader {
+    pub(crate) format_version: u32,
+    pub(crate) kind: HeaderKind,
+    pub(crate) start_slot: u64,
+    pub(crate) end_slot: u64,
+    /// The venue the run was about, which a report with no selector measures.
+    #[serde(default)]
+    pub(crate) program_id: Option<String>,
+    #[serde(default)]
+    pub(crate) label: Option<String>,
+    /// The arm's time shift, as `--lag`/`--lead` gave it. `None` posts no override at all.
+    pub(crate) shift: Option<i64>,
+    /// The re-price the arm applied. Without it a re-priced run and the null control record
+    /// identical headers, since both post at each state's own slot.
+    #[serde(default)]
+    pub(crate) price_shift_bps: Option<f64>,
+    /// Anchor slots the arm posts at; far below the range means the venue barely moved.
+    pub(crate) override_slots: usize,
+    pub(crate) carrier: String,
+    /// `logs` and `routedTransaction` were emptied rather than kept, so a reader reports them
+    /// absent by choice rather than inferring a run that streamed nothing.
+    pub(crate) slim: bool,
+    /// Serialized as `rerouteVenues`, the key already written into recorded runs.
+    #[serde(rename = "rerouteVenues")]
+    pub(crate) reroute_aggregators: Option<String>,
+    pub(crate) filter_pairs: Vec<String>,
+    pub(crate) circular_arbs: bool,
+    pub(crate) detect_failed_l1_swaps: bool,
+    pub(crate) replay_account_state: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct RerouteLegRow<'a> {
-    input_mint: &'a str,
-    output_mint: &'a str,
-    amount: u64,
-    original_quoted_out: u64,
-    metis_quoted_out: u64,
-    /// Metis's chosen route. The per-hop `ammKey`s are how you find the pool to capture
-    /// and override.
-    route_plan: Option<&'a str>,
-    /// The route the original took on L1, so a reader can see what the re-quote displaced.
-    original_route_plan: Option<&'a str>,
+pub(crate) enum HeaderKind {
+    CounterfactualFlowRun,
 }
 
-impl<'a> From<&'a RerouteLegNotification> for RerouteLegRow<'a> {
-    fn from(leg: &'a RerouteLegNotification) -> Self {
+/// The run's funnel. A trailer because it is only known at the end, so a run that died mid-range
+/// writes none and its totals are never read as covering the whole range.
+///
+/// Named field by field rather than flattening [`RerouteStatsReport`]: a counter reaching this
+/// struct is a decision. Leave one out unless it says something about the venue under test.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RunSummary {
+    pub(crate) kind: SummaryKind,
+    pub(crate) swaps_detected: u64,
+    /// Excluded before quoting: an arbitrage cycle, a pair the filter does not name. Without it
+    /// the gap to `swaps_rerouted` reads as routing failures.
+    pub(crate) swaps_filtered: u64,
+    pub(crate) swaps_rerouted: u64,
+    pub(crate) swaps_simulated: u64,
+    pub(crate) swaps_succeeded: u64,
+    pub(crate) requote_failures: u64,
+    /// Failed to post any state, leaving those slots on an older override.
+    pub(crate) override_setup_failures: u64,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum SummaryKind {
+    CounterfactualFlowSummary,
+}
+
+impl RunSummary {
+    pub(crate) fn from_report(report: &RerouteStatsReport) -> Self {
         Self {
-            input_mint: &leg.input_mint,
-            output_mint: &leg.output_mint,
-            amount: leg.amount,
-            original_quoted_out: leg.original_quoted_out,
-            metis_quoted_out: leg.metis_quoted_out,
-            route_plan: leg.route_plan.as_deref(),
-            original_route_plan: leg.original_route_plan.as_deref(),
+            kind: SummaryKind::CounterfactualFlowSummary,
+            swaps_detected: report.swaps_detected,
+            swaps_filtered: report.swaps_filtered,
+            swaps_rerouted: report.swaps_rerouted,
+            swaps_simulated: report.swaps_simulated,
+            swaps_succeeded: report.swaps_succeeded,
+            requote_failures: report.requote_failures,
+            override_setup_failures: report.override_setup_failures,
         }
     }
 }
@@ -91,6 +136,56 @@ pub(crate) struct JoinedLeg {
     pub(crate) base_quoted_out: u64,
     pub(crate) quoted_out: u64,
     pub(crate) delta_bps: f64,
+}
+
+/// Everything one recording holds. A run that died mid-range writes no header or trailer, which
+/// a reader has to be able to say rather than reporting a partial range as a whole one.
+pub(crate) struct Recording {
+    pub(crate) header: Option<RunHeader>,
+    pub(crate) notifications: Vec<RerouteNotification>,
+    pub(crate) summary: Option<RunSummary>,
+}
+
+/// Rows are classified by content, so a concatenated or headless file still reads. An
+/// unrecognized line is an error, since dropping one would understate every total.
+pub(crate) fn read_recording(path: &Path) -> Result<Recording> {
+    let input = io::BufReader::new(
+        fs::File::open(path).with_context(|| format!("opening {}", path.display()))?,
+    );
+    let mut recording = Recording {
+        header: None,
+        notifications: Vec::new(),
+        summary: None,
+    };
+    for (index, line) in input.lines().enumerate() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let at = || format!("{} line {}", path.display(), index + 1);
+        // Only frames carry `kind`, so this decides the grammar before anything parses the line.
+        if !line.contains("\"kind\"") {
+            recording
+                .notifications
+                .push(serde_json::from_str(&line).with_context(at)?);
+            continue;
+        }
+        // A frame that will not parse is version skew, not a notification.
+        match serde_json::from_str::<RunHeader>(&line) {
+            Ok(header) => recording.header = Some(header),
+            Err(header_error) => match serde_json::from_str::<RunSummary>(&line) {
+                Ok(summary) => recording.summary = Some(summary),
+                Err(_) => {
+                    return Err(anyhow::Error::new(header_error).context(format!(
+                        "{}: unreadable header or trailer; this build reads format version \
+                         {FORMAT_VERSION}",
+                        at()
+                    )));
+                }
+            },
+        }
+    }
+    Ok(recording)
 }
 
 pub(crate) fn write_capture(path: &Path, rows: &[CaptureRow]) -> Result<()> {
@@ -116,10 +211,9 @@ pub(crate) fn load_capture_rows(path: &Path) -> Result<Vec<CaptureRow>> {
         .collect()
 }
 
-/// Rebuild the signed wire encoding from the JSON the transaction subscription pushes, with the
-/// signature the account diffs name it by. Legacy and v0 serialize differently, and a v0 message
-/// with no lookups is indistinguishable from legacy, so `version` decides — except that address
-/// table lookups only exist in v0, so their presence outranks a missing or stale `version`.
+/// Rebuild the signed wire encoding from the JSON the transaction subscription pushes. A v0
+/// message with no lookups is indistinguishable from legacy, so `version` decides — but lookups
+/// exist only in v0, so their presence outranks a missing or stale `version`.
 pub(crate) fn wire_transaction(
     encoded: &EncodedTransactionWithStatusMeta,
 ) -> Option<(String, String)> {
