@@ -15,6 +15,10 @@ These examples address real use cases and feature requests, but the protocols us
 
 When developing a quoting strategy, it's difficult to determine a taker's theoretical size and response to a parameter change. This example rewrites the venue's own oracle, curve, or fee account and reroutes the historical order flow through Jupiter Metis to determine the impact of the change.
 
+## [Counterfactual Capital](./src/bin/counterfactual_capital)
+
+A venue that already knows its historical quotes were uncompetitive learns nothing from being shown them again; the useful question is what would have to change. This example scales a venue's inventory and its quoting curve as account overrides, rebuilds every historical swap on the pair against that state, and reports the flow each version would have filled and at what margin. Capital and curve are separate knobs because they fail in different places: the vaults decide whether a fill can be paid, the curve decides whether it is offered at all, and on a venue that quotes from a curve only one of them moves the answer.
+
 ## [Measuring Spread and Depth](./src/bin/amm_liquidity)
 
 Prop AMMs price dynamically via a liquidity curve rather than resting orders on a book, so spread and depth can only be measured by quoting the venue at a range of sizes.

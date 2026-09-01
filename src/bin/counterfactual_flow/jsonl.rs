@@ -1,15 +1,11 @@
 //! The JSONL row types and the encoding they read and write.
 
-use std::{
-    fs,
-    io::{self, BufRead, Write},
-    path::Path,
-};
+use std::{fs, io, io::BufRead, path::Path};
 
 use anyhow::{Context, Result};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
-use simulator_api::{AccountData, RerouteStatsReport};
+use simulator_api::RerouteStatsReport;
 use simulator_client::RerouteNotification;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
@@ -20,20 +16,6 @@ use solana_pubkey::Pubkey;
 use solana_signature::Signature;
 use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
 use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatusMeta, UiMessage};
-
-/// One line of the `capture` JSONL.
-#[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct CaptureRow {
-    pub(crate) slot: u64,
-    pub(crate) account: AccountData,
-    /// The transaction that produced this state, when the diff named one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) signature: Option<String>,
-    /// That transaction, base64-encoded — the wire bytes a setup transaction replays.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) transaction: Option<String>,
-}
 
 /// The version a writer stamps and a reader accepts.
 pub(crate) const FORMAT_VERSION: u32 = 1;
@@ -186,29 +168,6 @@ pub(crate) fn read_recording(path: &Path) -> Result<Recording> {
         }
     }
     Ok(recording)
-}
-
-pub(crate) fn write_capture(path: &Path, rows: &[CaptureRow]) -> Result<()> {
-    let mut out = io::BufWriter::new(fs::File::create(path)?);
-    for row in rows {
-        writeln!(out, "{}", serde_json::to_string(row)?)?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-pub(crate) fn load_capture_rows(path: &Path) -> Result<Vec<CaptureRow>> {
-    let input = io::BufReader::new(
-        fs::File::open(path).with_context(|| format!("opening capture {}", path.display()))?,
-    );
-    input
-        .lines()
-        .enumerate()
-        .map(|(index, line)| {
-            serde_json::from_str(&line?)
-                .with_context(|| format!("parsing {} line {}", path.display(), index + 1))
-        })
-        .collect()
 }
 
 /// Rebuild the signed wire encoding from the JSON the transaction subscription pushes. A v0

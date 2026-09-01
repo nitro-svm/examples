@@ -182,9 +182,10 @@ pub(crate) struct CompareArgs {
     #[command(flatten)]
     pub(crate) run: RunArgs,
 
-    /// Per-leg delta report JSONL path.
-    #[arg(long, default_value = "compare-report.jsonl")]
-    pub(crate) report: PathBuf,
+    /// Per-leg delta report JSONL path. Defaults beside the two arm recordings, as
+    /// `<--out stem>-report.<ext>`, so a comparison's three files stay together.
+    #[arg(long)]
+    pub(crate) report: Option<PathBuf>,
 }
 
 fn parse_pair(value: &str) -> Result<MintPair, String> {

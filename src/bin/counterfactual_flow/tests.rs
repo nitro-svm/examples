@@ -2,9 +2,13 @@
 //! per-direction split, the shift schedule, and the price rewrite.
 
 use super::*;
+use simulator_api::{AccountData, AccountModifications, ActionAnchor, ScheduledAction};
+use solana_address::Address;
+
 use crate::{
     cli::{ConnectionArgs, RangeArgs, RunArgs, shift_label},
-    jsonl::CaptureRow,
+    report::{VenueCounts, VenueTally, delta_bps, slimmed, slot_range, target_from_header},
+    schedule::{build_setup_action, build_shift_actions, reprice},
 };
 /// The totals are folded from the per-direction map, so a book whose two sides moved opposite
 /// ways must still report each side — summing them is what hid the collapse.
@@ -96,45 +100,6 @@ fn conn(url: &str) -> ConnectionArgs {
 }
 
 #[test]
-fn websocket_url_defaults_to_tls_and_honours_an_explicit_scheme() {
-    for (url, expected) in [
-        ("sim.example.com", "wss://sim.example.com/backtest"),
-        ("ws://localhost:8900", "ws://localhost:8900/backtest"),
-        (
-            "ws://localhost:8900/backtest",
-            "ws://localhost:8900/backtest",
-        ),
-        ("wss://sim.example.com/", "wss://sim.example.com/backtest"),
-    ] {
-        assert_eq!(conn(url).websocket_url(), expected, "{url}");
-    }
-}
-
-#[test]
-fn rpc_url_follows_the_websocket_scheme_and_passes_absolute_endpoints_through() {
-    for (url, endpoint, expected) in [
-        (
-            "sim.example.com",
-            "/backtest/s1",
-            "https://sim.example.com/backtest/s1",
-        ),
-        (
-            "ws://localhost:8900",
-            "backtest/s1",
-            "http://localhost:8900/backtest/s1",
-        ),
-        (
-            "ws://localhost:8900/backtest",
-            "backtest/s1",
-            "http://localhost:8900/backtest/s1",
-        ),
-        ("sim.example.com", "https://other/rpc", "https://other/rpc"),
-    ] {
-        assert_eq!(conn(url).rpc_url(endpoint), expected, "{url} + {endpoint}");
-    }
-}
-
-#[test]
 fn positive_shift_runs_each_capture_forward_by_k() {
     let captured = captured_at(&[10, 12, 14]);
     let actions = build_shift_actions(2, account_key(), &captured, 10, 15);
@@ -159,6 +124,7 @@ fn rows_at(slots: &[u64]) -> Vec<CaptureRow> {
     slots
         .iter()
         .map(|slot| CaptureRow {
+            address: None,
             slot: *slot,
             account: state(*slot),
             signature: Some(format!("sig{slot}")),

@@ -1,17 +1,13 @@
 //! Scaling a venue's inventory: the SPL token accounts a venue quotes against, rewritten to hold
 //! a multiple of what they held, as an account override the direct-fill probe prices against.
-//!
-//! Kept apart from the session plumbing because it is the one piece with an on-wire layout to get
-//! right, and the one piece worth unit-testing without a simulator.
 
 use anyhow::{Result, bail, ensure};
 use simulator_api::{AccountData, BinaryEncoding, EncodedBinary};
 use solana_account::Account;
 
 /// SPL token program, and its 2022 successor. A venue's vault is owned by one of them; anything
-/// else reaching [`scale`] is a mis-specified vault rather than an account to patch.
-pub(crate) const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-pub(crate) const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
+/// else reaching [`scale`] is a mis-specified vault.
+pub(crate) use backtest_example::utils::parse::{TOKEN_2022_PROGRAM, TOKEN_PROGRAM};
 
 /// The base token-account layout, which a 2022 account with extensions extends rather than
 /// rearranges — so every offset below holds for both, and a shorter buffer is not a token account.
@@ -24,7 +20,15 @@ const IS_NATIVE_TAG: std::ops::Range<usize> = 109..113;
 /// The rent-exempt reserve `is_native` carries when set: the lamports that are NOT the balance.
 const NATIVE_RESERVE: std::ops::Range<usize> = 113..121;
 
-/// One vault, before and after scaling.
+/// The balance a token account holds, or `None` when the buffer is too short to be one.
+pub(crate) fn amount(vault: &Account) -> Option<u64> {
+    vault
+        .data
+        .get(AMOUNT)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u64::from_le_bytes)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct ScaledVault {
     pub(crate) before: u64,
@@ -41,11 +45,6 @@ pub(crate) struct ScaledVault {
 /// A native vault's lamports are raised by the same delta: the token program treats a wrapped-SOL
 /// account's lamports above its rent-exempt reserve as the balance, so scaling `amount` alone
 /// leaves the two disagreeing and every probe against it reverts.
-///
-/// Saturation is an error rather than a warning. A vault that clamps at `u64::MAX` is not holding
-/// the multiple it was asked for, so the arm is not the arm it claims to be — and it flattens the
-/// top of the curve for arithmetic reasons, which is exactly the reading the curve is meant to
-/// support.
 pub(crate) fn scale(vault: &Account, multiple: f64) -> Result<ScaledVault> {
     ensure!(
         multiple.is_finite() && multiple > 0.0,
@@ -74,8 +73,8 @@ pub(crate) fn scale(vault: &Account, multiple: f64) -> Result<ScaledVault> {
     let after = scaled.round() as u64;
 
     let native = u32::from_le_bytes(vault.data[IS_NATIVE_TAG].try_into()?) != 0;
-    // The reserve is the account's own floor, not a function of the new amount, so it is read
-    // rather than recomputed: a recomputed rent-exemption would silently move the balance.
+    // The reserve is read rather than recomputed: a recomputed rent-exemption would silently move
+    // the balance.
     let lamports = match native {
         true => u64::from_le_bytes(vault.data[NATIVE_RESERVE].try_into()?).saturating_add(after),
         false => vault.lamports,
@@ -131,10 +130,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case(1.0, 1_000)]
-    #[case(2.0, 2_000)]
-    #[case(0.1, 100)]
-    #[case(25.0, 25_000)]
+    #[case::identity(1.0, 1_000)]
+    #[case::doubled(2.0, 2_000)]
+    #[case::cut_to_a_tenth(0.1, 100)]
+    #[case::scaled_up(25.0, 25_000)]
     fn a_multiple_scales_the_amount(#[case] multiple: f64, #[case] expected: u64) {
         let scaled = scale(&vault(1_000, None, TOKEN_PROGRAM), multiple).expect("scales");
         assert_eq!(scaled.after, expected);
@@ -154,7 +153,6 @@ mod tests {
         let scaled = scale(&vault(1_000, Some(2_039_280), TOKEN_PROGRAM), 5.0).expect("scales");
         assert!(scaled.native);
         assert_eq!(scaled.after, 5_000);
-        // The reserve is preserved and the balance is added on top of it, not folded into it.
         assert_eq!(scaled.lamports, 2_039_280 + 5_000);
     }
 
@@ -182,19 +180,16 @@ mod tests {
 
     #[test]
     fn an_account_owned_by_something_other_than_a_token_program_is_rejected() {
-        let error = scale(
-            &vault(1_000, None, "11111111111111111111111111111111"),
-            2.0,
-        )
-        .expect_err("a non-token account must not be patched as one");
+        let error = scale(&vault(1_000, None, "11111111111111111111111111111111"), 2.0)
+            .expect_err("a non-token account must not be patched as one");
         assert!(error.to_string().contains("not a token program"), "{error}");
     }
 
     #[rstest]
-    #[case(0.0)]
-    #[case(-1.0)]
-    #[case(f64::NAN)]
-    #[case(f64::INFINITY)]
+    #[case::zero(0.0)]
+    #[case::negative(-1.0)]
+    #[case::not_a_number(f64::NAN)]
+    #[case::infinite(f64::INFINITY)]
     fn a_multiple_that_is_not_a_positive_number_is_rejected(#[case] multiple: f64) {
         assert!(scale(&vault(1_000, None, TOKEN_PROGRAM), multiple).is_err());
     }

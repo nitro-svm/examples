@@ -8,7 +8,7 @@ use solana_account::Account;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use super::chain::{get_account_info, get_mint_token_program};
+use super::chain::get_mint_token_program;
 use super::parse::{TITAN_PROGRAM, WSOL_MINT, derive_ata};
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";

@@ -26,7 +26,8 @@ cargo run --bin counterfactual_flow -- capture $RANGE --account $POOL --out capt
 ```
 
 ### Run
-Replay the range with a modified version of the pool, that's only visible to the router.
+Replay the range with a modified version of the pool, that's only visible to the router. Pass the
+same `--account` the capture was taken for; a mismatch is refused.
 
 Shift oracle updates by -0.4 bps. Since there's no IDL, use byte offsets (839, 895) to apply the update.
 ```sh
@@ -41,8 +42,10 @@ Instead of running a control and experiment as two separate sessions: use `compa
 ```sh
 cargo run --bin counterfactual_flow -- compare $RANGE $ARGS --capture capture.jsonl \
   --price-field 839 --price-field 895 --price-shift-bps -0.4 \
-  --report compare-report.jsonl
+  --out compare.jsonl
 ```
+Both arms and the per-leg report are named from `--out`: `compare-control.jsonl`,
+`compare-modified.jsonl`, `compare-report.jsonl`.
 
 ### Report
 Read a run's output and report what crossed the venue, on L1 and after the requote, in swaps and in dollars.
