@@ -1,5 +1,4 @@
-//! Driving the simulator: one arm's session request, the loop that pumps it to completion, and
-//! reading the venue's own inventory at the slot the arm starts from.
+//! Driving the simulator: one arm's session request, the loop that pumps it to completion, and the venue's inventory at the slot the arm starts from.
 
 use std::collections::BTreeMap;
 
@@ -20,15 +19,13 @@ pub(crate) struct Arm {
     pub(crate) slot_count: u64,
     pub(crate) no_replay: bool,
     pub(crate) spec: DirectFillParams,
-    /// Empty for the arm that runs the venue's own book unmodified.
-    pub(crate) overrides: BTreeMap<Address, AccountData>,
+    /// One entry per slot the venue's state changed in, scaled so the venue follows its real
+    /// trajectory at a different size. Empty for the capture pass.
+    pub(crate) overrides: Vec<(u64, BTreeMap<Address, AccountData>)>,
 }
 
-/// Every aggregator, named rather than defaulted.
-///
-/// `is_candidate` drops a transaction whose router is outside this set before the direct-fill
-/// census runs at all, and the API's own default is Jupiter alone — so leaving it unset would
-/// bound the population for a reason that has nothing to do with the venue under test.
+/// The API defaults to Jupiter alone, and a transaction whose router is outside this set is
+/// dropped before the direct-fill census runs at all.
 fn all_aggregators() -> RerouteAggregators {
     RerouteAggregators::new([
         SwapAggregator::Jupiter,
@@ -38,11 +35,9 @@ fn all_aggregators() -> RerouteAggregators {
     ])
 }
 
-/// The session an arm runs in.
-///
-/// Re-quoting is off: direct fill prices the venue itself, and the router a re-quote would need is
-/// a sidecar this run never starts. The inventory rides as a single override anchored at
-/// `start_slot`, which the schedule carries forward for the rest of the range.
+/// Re-quoting is off: direct fill prices the venue itself, and the router a re-quote needs is a
+/// sidecar this run never starts. Posting only the changed slots reproduces the whole trajectory,
+/// since `OverrideSchedule::active_at` folds every entry up to a slot and lets the latest win.
 pub(crate) fn create_session(arm: Arm) -> Result<CreateBacktestSessionRequest> {
     let create = CreateSession::builder()
         .start_slot(arm.start_slot)
@@ -56,20 +51,39 @@ pub(crate) fn create_session(arm: Arm) -> Result<CreateBacktestSessionRequest> {
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)
         .build();
-    let create = match arm.overrides.is_empty() {
-        true => create,
-        false => create.add_override(arm.start_slot, AccountModifications(arm.overrides)),
-    };
+    let create = arm
+        .overrides
+        .into_iter()
+        .fold(create, |create, (slot, accounts)| {
+            create.add_override(slot, AccountModifications(accounts))
+        });
     create
         .into_request()
         .context("building the backtest session request")
 }
 
-/// Pump the session to completion and hand back the direct-fill census.
-pub(crate) async fn drive_to_completion(
+/// Every chain read has to happen at this pause: the session is only positioned at its start slot
+/// once it says so, and its RPC endpoint stops serving the moment the session completes.
+pub(crate) async fn wait_for_first_pause(session: &mut ManagedBacktestSession) -> Result<()> {
+    loop {
+        match session.next_event().await? {
+            ManagedEvent::ReadyForContinue => return Ok(()),
+            ManagedEvent::Completed { .. } => {
+                bail!("the session finished its range before it was ready to advance")
+            }
+            ManagedEvent::Error(error) => bail!("session error: {error}"),
+            _ => {}
+        }
+    }
+}
+
+/// The caller has already consumed the first pause.
+pub(crate) async fn advance_to_completion(
     session: &mut ManagedBacktestSession,
     slot_count: u64,
 ) -> Result<RerouteStatsReport> {
+    let advance = Continue::builder().advance_count(slot_count).build();
+    session.send_continue(advance.into_params()).await?;
     loop {
         match session.next_event().await? {
             ManagedEvent::ReadyForContinue => {
@@ -90,30 +104,32 @@ pub(crate) async fn drive_to_completion(
     }
 }
 
-/// The venue's inventory as it stood at the slot the session starts from.
-///
-/// Read through the session's own RPC rather than a mainnet endpoint: the multiple has to be
-/// relative to what the venue held during the replayed range, not to what it holds today, or the
-/// control arm is already a counterfactual and every difference is measured off the wrong base.
-pub(crate) async fn read_vaults(
+/// Read through the session's own RPC rather than a mainnet endpoint: every arm is a multiple of
+/// what the venue held *during the replayed range*, not of what it holds today.
+pub(crate) async fn read_accounts(
     rpc_url: &str,
-    vaults: &[Address],
+    addresses: &[Address],
 ) -> Result<Vec<(Address, Account)>> {
-    let keys = vaults
+    let keys = addresses
         .iter()
-        .map(|vault| vault.to_string().parse::<Pubkey>().map_err(anyhow::Error::new))
+        .map(|address| {
+            address
+                .to_string()
+                .parse::<Pubkey>()
+                .map_err(anyhow::Error::new)
+        })
         .collect::<Result<Vec<_>>>()?;
     let fetched = RpcClient::new(rpc_url.to_string())
         .get_multiple_accounts(&keys)
         .await
-        .context("reading the venue's vaults at the session's start slot")?;
-    vaults
+        .context("reading the venue's accounts at the session's start slot")?;
+    addresses
         .iter()
         .zip(fetched)
-        .map(|(vault, account)| {
+        .map(|(address, account)| {
             account
-                .map(|account| (*vault, account))
-                .with_context(|| format!("vault {vault} does not exist at the start slot"))
+                .map(|account| (*address, account))
+                .with_context(|| format!("{address} does not exist at the start slot"))
         })
         .collect()
 }

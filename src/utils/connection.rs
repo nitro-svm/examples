@@ -7,7 +7,7 @@ use clap::Args;
 pub struct ConnectionArgs {
     /// Simulator URL: a bare host for the hosted deployment, or an explicit
     /// `ws://host:port` for a locally run stack.
-    #[arg(long, default_value = "staging.simulator.termina.technology")]
+    #[arg(long, default_value = "simulator.termina.technology")]
     pub url: String,
 
     /// API key sent as the `X-API-Key` header.

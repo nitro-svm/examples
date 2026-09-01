@@ -1,15 +1,12 @@
 //! Scaling a venue's inventory: the SPL token accounts a venue quotes against, rewritten to hold
 //! a multiple of what they held, as an account override the direct-fill probe prices against.
-//!
-//! Kept apart from the session plumbing because it is the one piece with an on-wire layout to get
-//! right, and the one piece worth unit-testing without a simulator.
 
 use anyhow::{Result, bail, ensure};
 use simulator_api::{AccountData, BinaryEncoding, EncodedBinary};
 use solana_account::Account;
 
 /// SPL token program, and its 2022 successor. A venue's vault is owned by one of them; anything
-/// else reaching [`scale`] is a mis-specified vault rather than an account to patch.
+/// else reaching [`scale`] is a mis-specified vault.
 pub(crate) const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub(crate) const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 
@@ -24,7 +21,6 @@ const IS_NATIVE_TAG: std::ops::Range<usize> = 109..113;
 /// The rent-exempt reserve `is_native` carries when set: the lamports that are NOT the balance.
 const NATIVE_RESERVE: std::ops::Range<usize> = 113..121;
 
-/// One vault, before and after scaling.
 #[derive(Debug, Clone)]
 pub(crate) struct ScaledVault {
     pub(crate) before: u64,
@@ -41,11 +37,6 @@ pub(crate) struct ScaledVault {
 /// A native vault's lamports are raised by the same delta: the token program treats a wrapped-SOL
 /// account's lamports above its rent-exempt reserve as the balance, so scaling `amount` alone
 /// leaves the two disagreeing and every probe against it reverts.
-///
-/// Saturation is an error rather than a warning. A vault that clamps at `u64::MAX` is not holding
-/// the multiple it was asked for, so the arm is not the arm it claims to be — and it flattens the
-/// top of the curve for arithmetic reasons, which is exactly the reading the curve is meant to
-/// support.
 pub(crate) fn scale(vault: &Account, multiple: f64) -> Result<ScaledVault> {
     ensure!(
         multiple.is_finite() && multiple > 0.0,
@@ -74,8 +65,8 @@ pub(crate) fn scale(vault: &Account, multiple: f64) -> Result<ScaledVault> {
     let after = scaled.round() as u64;
 
     let native = u32::from_le_bytes(vault.data[IS_NATIVE_TAG].try_into()?) != 0;
-    // The reserve is the account's own floor, not a function of the new amount, so it is read
-    // rather than recomputed: a recomputed rent-exemption would silently move the balance.
+    // The reserve is read rather than recomputed: a recomputed rent-exemption would silently move
+    // the balance.
     let lamports = match native {
         true => u64::from_le_bytes(vault.data[NATIVE_RESERVE].try_into()?).saturating_add(after),
         false => vault.lamports,
@@ -154,7 +145,6 @@ mod tests {
         let scaled = scale(&vault(1_000, Some(2_039_280), TOKEN_PROGRAM), 5.0).expect("scales");
         assert!(scaled.native);
         assert_eq!(scaled.after, 5_000);
-        // The reserve is preserved and the balance is added on top of it, not folded into it.
         assert_eq!(scaled.lamports, 2_039_280 + 5_000);
     }
 

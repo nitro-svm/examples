@@ -1,0 +1,49 @@
+{
+  "directFill": {
+    "aggregator": "titan",
+    "venue": "Tempest",
+    "pair": [
+      "So11111111111111111111111111111111111111112",
+      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    ],
+    "slippageBps": 50,
+    "market": {
+      "mints": [
+        "So11111111111111111111111111111111111111112",
+        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      ],
+      "accounts": [
+        { "address": "D5YqVMoSxnqeZAKAUUE1Dm3bmjtdxQ5DCF356ozqN9cM", "writable": true },
+        { "address": "FQmFVQ7i8GCLqwE7EriUA4WQCvyCKxAeY4XUr55ZD6D7", "writable": true },
+        { "address": "EW9diL91VgHY5i9qYScz53W3PihQPSnPoMtAKCo1Bs7J", "writable": true },
+        { "address": "3nnVbsCfN1mwUk2XSLCnjzY3bDDTdzpnKjvRmd8nESS2", "writable": true },
+        { "address": "4kHHmecPiRNJtAQug2cHFChovM4wqdBesWQckrXBWinD", "writable": true },
+        { "address": "6vNWbfi3HwDtoANb13CszPwEdAiyaUyZQ4A5A3hw4pqt", "writable": true },
+        { "address": "So11111111111111111111111111111111111111112", "writable": false },
+        { "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "writable": false },
+        { "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "writable": false },
+        { "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "writable": false },
+        { "address": "FUQcTWJjXtRxk6XHQBS6gqZ6VCgYeQkGs1H7inC2YKVe", "writable": false },
+        { "address": "Sysvar1nstructions1111111111111111111111111", "writable": false },
+        { "address": "2G71FYychcDbuNvMmVcFzU8J9N3giFvgp3a5PS2LmgZm", "writable": false }
+      ]
+    }
+  },
+  "inventory": {
+    "vaults": [
+      "4kHHmecPiRNJtAQug2cHFChovM4wqdBesWQckrXBWinD",
+      "6vNWbfi3HwDtoANb13CszPwEdAiyaUyZQ4A5A3hw4pqt"
+    ],
+    "state": {
+      "account": "FQmFVQ7i8GCLqwE7EriUA4WQCvyCKxAeY4XUr55ZD6D7",
+      "discriminator": "tempest1",
+      "len": 2385,
+      "maxTiers": 32,
+      "balanceMirrors": [2321, 2329],
+      "ladders": [
+        { "count": 209, "entries": 225, "stride": 32, "width": 16 },
+        { "count": 1265, "entries": 1281, "stride": 32, "width": 16 }
+      ]
+    }
+  }
+}
