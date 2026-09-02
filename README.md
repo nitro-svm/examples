@@ -13,11 +13,11 @@ These examples address real use cases and feature requests, but the protocols us
 
 ## [Counterfactual Flow](./src/bin/counterfactual_flow)
 
-When developing a quoting strategy, it's difficult to determine a taker's theoretical size and response to a parameter change. This example rewrites the venue's own oracle, curve, or fee account — re-priced at each state's own slot, or the same state posted early or late — re-quotes the historical order flow through Jupiter Metis to determine the impact of the change. Jupiter's flow by default; the other aggregators on request (DFlow, Titan, OKX). More details in the example's README.
+When developing a quoting strategy, it's difficult to determine a taker's theoretical size and response to a parameter change. This example rewrites the venue's own oracle, curve, or fee account and reroutes the historical order flow through Jupiter Metis to determine the impact of the change.
 
 ## [Measuring Spread and Depth](./src/bin/amm_liquidity)
 
-Prop AMMs price dynamically via a liquidity curve rather than resting orders on a book, so spread and depth can only be measured by quoting the venue at a range of sizes. 
+Prop AMMs price dynamically via a liquidity curve rather than resting orders on a book, so spread and depth can only be measured by quoting the venue at a range of sizes.
 This example sweeps sizes for the specified pair slot-by-slot and reports the derived spread and depth curve for the venue of interest.
 
 ## [Comparing Quotes](./src/bin/quote_compare)
