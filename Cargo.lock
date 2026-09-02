@@ -489,6 +489,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "serde_with",
  "simulator-api",
  "simulator-client",
  "solana-account 4.3.1",
@@ -3493,9 +3494,9 @@ checksum = "e320a6c5ad31d271ad523dcf3ad13e2767ad8b1cb8f047f75a8aeaf8da139da2"
 
 [[package]]
 name = "simulator-api"
-version = "0.20.0"
+version = "0.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5afaa586a2dcf37e3839cbf21b8b86adb928562e78cf836503c0f6ec83ef00fe"
+checksum = "559107d99a2bf6ae6c13df535f9c225b1dff007933999fa4a783a47df8795472"
 dependencies = [
  "base64 0.22.1",
  "bon",
@@ -3515,9 +3516,9 @@ dependencies = [
 
 [[package]]
 name = "simulator-client"
-version = "0.21.0"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71e02dee4c404a212e89607368acccae21d4814caa2d99eaf143f6d3bff38ac8"
+checksum = "523265988a8ad938f9bcfcb2c60a7ca7f0fcec638170b69c7345c8f73f4b27b6"
 dependencies = [
  "base64 0.22.1",
  "bincode 2.0.1",

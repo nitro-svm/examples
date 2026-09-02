@@ -12,7 +12,7 @@ use backtest_example::utils::{
 };
 
 use super::depth::{DEPTH_SIGNER_LAMPORTS, Depth, DepthStore, get_depth_actions};
-use super::spread::{Spread, SpreadStore, get_spread_action};
+use super::spread::{Spread, SpreadStore};
 use crate::Template;
 
 /// Read the SPL token `amount` from a returned `UiAccount` JSON value.

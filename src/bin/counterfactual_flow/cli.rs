@@ -47,49 +47,9 @@ pub(crate) struct ReportArgs {
     pub(crate) json: bool,
 }
 
-#[derive(Args, Clone)]
-pub(crate) struct ConnectionArgs {
-    /// Simulator URL: a bare host for the hosted deployment, or an explicit
-    /// `ws://host:port` for a locally run stack.
-    #[arg(long, default_value = "staging.simulator.termina.technology")]
-    pub(crate) url: String,
-
-    /// API key sent as the `X-API-Key` header.
-    #[arg(long, env = "SIMULATOR_API_KEY")]
-    pub(crate) api_key: String,
-}
-
-impl ConnectionArgs {
-    /// A bare host is the hosted deployment over TLS; an explicit `ws(s)://` is used as
-    /// given, so a local stack (plaintext) is reachable as `ws://localhost:8900`.
-    pub(crate) fn websocket_url(&self) -> String {
-        let base = self.url.trim_end_matches('/');
-        let base = match base.split_once("://") {
-            Some(("ws" | "wss", _)) => base.to_string(),
-            _ => format!("wss://{base}"),
-        };
-        if base.ends_with("/backtest") {
-            base
-        } else {
-            format!("{base}/backtest")
-        }
-    }
-
-    /// Deployments report the session's RPC endpoint either absolute or as a path. A
-    /// plaintext websocket implies a plaintext RPC endpoint on the same host.
-    pub(crate) fn rpc_url(&self, endpoint: &str) -> String {
-        if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-            return endpoint.to_string();
-        }
-        let (scheme, host) = match self.url.trim_end_matches('/').split_once("://") {
-            Some(("ws", host)) => ("http", host),
-            Some((_, host)) => ("https", host),
-            None => ("https", self.url.trim_end_matches('/')),
-        };
-        let host = host.trim_end_matches("/backtest");
-        format!("{scheme}://{host}/{}", endpoint.trim_start_matches('/'))
-    }
-}
+/// Shared with the other examples: one `--url` has to yield both the websocket and the
+/// session's RPC endpoint, and the local-stack `ws://` case is easy to get subtly wrong.
+pub(crate) use backtest_example::utils::connection::ConnectionArgs;
 
 #[derive(Args, Clone)]
 pub(crate) struct RangeArgs {
@@ -222,9 +182,10 @@ pub(crate) struct CompareArgs {
     #[command(flatten)]
     pub(crate) run: RunArgs,
 
-    /// Per-leg delta report JSONL path.
-    #[arg(long, default_value = "compare-report.jsonl")]
-    pub(crate) report: PathBuf,
+    /// Per-leg delta report JSONL path. Defaults beside the two arm recordings, as
+    /// `<--out stem>-report.<ext>`, so a comparison's three files stay together.
+    #[arg(long)]
+    pub(crate) report: Option<PathBuf>,
 }
 
 fn parse_pair(value: &str) -> Result<MintPair, String> {

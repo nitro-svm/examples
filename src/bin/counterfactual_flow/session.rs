@@ -2,15 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result, bail};
-use simulator_api::{AccountData, CreateBacktestSessionRequest, RerouteStatsReport};
+use anyhow::{Context, Result};
+use simulator_api::{AccountData, CreateBacktestSessionRequest};
 use simulator_client::{
-    AccountDiffNotification, Continue, CreateSession, ManagedBacktestSession, ManagedEvent,
-    UiAccountConversionError, account_data_from_ui,
+    AccountDiffNotification, CreateSession, UiAccountConversionError, account_data_from_ui,
 };
-use solana_transaction_status::EncodedConfirmedTransactionWithStatusMeta;
 
-use crate::{RunConfig, jsonl::CaptureRow};
+use backtest_example::utils::capture::CaptureRow;
+
+use crate::RunConfig;
 
 /// Every option the counterfactual turns on. The captured bytes ride as per-slot account
 /// overrides; the setup carrier rides as a scheduled action instead. Both are visible only to
@@ -26,7 +26,6 @@ pub(crate) fn create_session(config: RunConfig) -> Result<CreateBacktestSessionR
         .maybe_reroute_filter(config.filter)
         .actions(config.schedule.setup.into_iter().collect())
         .replay_account_state(!config.range.no_replay)
-        .disconnect_timeout_secs(900u16)
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)
         .build();
@@ -39,29 +38,6 @@ pub(crate) fn create_session(config: RunConfig) -> Result<CreateBacktestSessionR
         })
         .into_request()
         .context("building the backtest session request")
-}
-
-/// `on_transaction` sees nothing unless the caller subscribed.
-pub(crate) async fn drive_to_completion(
-    session: &mut ManagedBacktestSession,
-    slot_count: u64,
-    mut on_transaction: impl FnMut(EncodedConfirmedTransactionWithStatusMeta),
-) -> Result<Option<RerouteStatsReport>> {
-    loop {
-        match session.next_event().await? {
-            ManagedEvent::ReadyForContinue => {
-                let advance = Continue::builder().advance_count(slot_count).build();
-                session.send_continue(advance.into_params()).await?;
-            }
-            ManagedEvent::Slot(slot) => eprintln!("[slot] {slot}"),
-            ManagedEvent::Transaction(transaction) => on_transaction(*transaction),
-            ManagedEvent::Completed { summary, .. } => {
-                return Ok(summary.and_then(|summary| summary.reroute_stats.map(|stats| *stats)));
-            }
-            ManagedEvent::Error(error) => bail!("session error: {error}"),
-            _ => {}
-        }
-    }
 }
 
 /// Everything the account-diff subscription accumulates, behind one lock.
@@ -96,6 +72,7 @@ impl CaptureCollector {
     fn record_initial(&mut self, slot: u64, account: AccountData) {
         self.rows.entry(slot).or_insert(CaptureRow {
             slot,
+            address: None,
             account,
             signature: None,
             transaction: None,
@@ -107,6 +84,7 @@ impl CaptureCollector {
             slot,
             CaptureRow {
                 slot,
+                address: None,
                 account,
                 signature,
                 transaction: None,
