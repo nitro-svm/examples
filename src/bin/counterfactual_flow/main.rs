@@ -854,7 +854,7 @@ fn report_run(label: &str, output: &RunOutput) {
             total.improvements
         );
         eprintln!(
-            "[{label}] won/lost read only as a difference against the `--lag 0` control, which itself reports the venue losing most of its L1 legs with nothing changed — an absolute lost is not attributable"
+            "[{label}] won/lost are differential: read against the `--lag 0` control, not against zero"
         );
         if total.split > 0 {
             eprintln!(
