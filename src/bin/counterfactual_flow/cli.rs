@@ -19,8 +19,7 @@ pub(crate) enum Command {
     Capture(CaptureArgs),
     /// Run one session, optionally with the parameter change applied.
     Run(RunArgs),
-    /// Compare the parameter change against the null control: the same capture, same carrier,
-    /// posted unmodified at each state's own slot.
+    /// Compare the parameter change against the control: the same range with no override.
     Compare(CompareArgs),
     /// Report what flowed through a venue or pool in a recorded run, on L1 and after the
     /// re-quote. Reads the file only, so it re-runs per pool for free.
@@ -97,20 +96,9 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub(crate) account: Address,
 
-    /// Capture JSONL produced by `capture`; required with `--lag`/`--lead`/`--price-shift-bps`.
+    /// Capture JSONL produced by `capture`; required with `--price-shift-bps`.
     #[arg(long)]
     pub(crate) capture: Option<PathBuf>,
-
-    /// Post slot `s-K`'s state at slot `s`: the venue updating K slots slower. `0` posts each
-    /// state at its own slot — the control every arm is read against. Omitted, the run posts a
-    /// schedule only if `--price-shift-bps` asks for one, and is otherwise a plain baseline.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(0..), conflicts_with = "lead")]
-    pub(crate) lag: Option<u64>,
-
-    /// Post slot `s+K`'s state at slot `s`: the venue updating K slots sooner. Needs
-    /// `--setup-transactions` on a venue that stamps its last-update slot.
-    #[arg(long, value_parser = clap::value_parser!(u64).range(0..))]
-    pub(crate) lead: Option<u64>,
 
     /// The venue under test. Its Jupiter/Metis route label is resolved automatically
     /// via `program-id-to-label` and used to match rerouted legs, since
@@ -139,11 +127,6 @@ pub(crate) struct RunArgs {
     #[arg(long = "reroute-venues")]
     pub(crate) reroute_aggregators: Option<RerouteAggregators>,
 
-    /// Carry the shift as the venue's own update transaction, simulated at the shifted slot,
-    /// instead of as bytes. Needs a `--no-replay` capture.
-    #[arg(long, default_value_t = false)]
-    pub(crate) setup_transactions: bool,
-
     /// Byte offset of a little-endian fixed-point price. Repeat for every field the venue stores
     /// the price in: moving only some leaves the pool inconsistent and its quotes rejected.
     #[arg(long)]
@@ -164,17 +147,6 @@ pub(crate) struct RunArgs {
     /// Reroute notifications JSONL output.
     #[arg(long, default_value = "reroute-out.jsonl")]
     pub(crate) out: PathBuf,
-}
-
-impl RunArgs {
-    /// Signed slot offset the schedule posts from: `--lag K` is `-K`, `--lead K` is `+K`.
-    pub(crate) fn shift(&self) -> Option<i64> {
-        self.lag
-            .map(|lag| -(lag as i64))
-            .or_else(|| self.lead.map(i64::try_from).transpose().ok().flatten())
-            // Re-pricing with no lag still posts a schedule, at the state's own slot.
-            .or_else(|| self.price_shift_bps.map(|_| 0))
-    }
 }
 
 #[derive(Args)]
@@ -200,12 +172,4 @@ pub(crate) fn filter_from(args: &RunArgs) -> Option<RerouteFilter> {
     (!args.filter_pair.is_empty()).then(|| RerouteFilter {
         pairs: args.filter_pair.iter().copied().collect(),
     })
-}
-
-pub(crate) fn shift_label(shift: i64) -> String {
-    match shift {
-        ..0 => format!("lag {}", -shift),
-        0 => "null shift".to_string(),
-        _ => format!("lead {shift}"),
-    }
 }

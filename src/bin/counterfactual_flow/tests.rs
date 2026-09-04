@@ -1,14 +1,14 @@
 //! Unit tests for the parts of `run` that decide what a number means: the venue tally's
-//! per-direction split, the shift schedule, and the price rewrite.
+//! per-direction split, the override schedule, and the price rewrite.
 
 use super::*;
-use simulator_api::{AccountData, AccountModifications, ActionAnchor, ScheduledAction};
+use simulator_api::{AccountData, AccountModifications};
 use solana_address::Address;
 
 use crate::{
-    cli::{ConnectionArgs, RangeArgs, RunArgs, shift_label},
+    cli::RangeArgs,
     report::{VenueCounts, VenueTally, delta_bps, slimmed, slot_range, target_from_header},
-    schedule::{build_setup_action, build_shift_actions, reprice},
+    schedule::{build_overrides, reprice},
 };
 /// The totals are folded from the per-direction map, so a book whose two sides moved opposite
 /// ways must still report each side — summing them is what hid the collapse.
@@ -92,119 +92,24 @@ fn schedule_of(actions: &[(u64, AccountModifications)]) -> Vec<(u64, u64)> {
         .collect()
 }
 
-fn conn(url: &str) -> ConnectionArgs {
-    ConnectionArgs {
-        url: url.to_string(),
-        api_key: String::new(),
-    }
+#[test]
+fn each_capture_is_published_at_its_own_slot() {
+    let captured = captured_at(&[10, 12, 14]);
+    let actions = build_overrides(account_key(), &captured, 10, 15);
+    assert_eq!(schedule_of(&actions), vec![(10, 10), (12, 12), (14, 14)]);
 }
 
+/// Captures outside `[start, end]` belong to another run's range and must not be posted.
 #[test]
-fn positive_shift_runs_each_capture_forward_by_k() {
-    let captured = captured_at(&[10, 12, 14]);
-    let actions = build_shift_actions(2, account_key(), &captured, 10, 15);
-    // Slot 10 sees the slot-12 capture, 12 sees 14; the tail carries the last capture.
-    assert_eq!(schedule_of(&actions), vec![(10, 12), (12, 14), (14, 14)]);
-}
-
-#[test]
-fn negative_shift_lags_each_capture_behind_by_k() {
-    let captured = captured_at(&[10, 12, 14]);
-    let actions = build_shift_actions(-2, account_key(), &captured, 10, 15);
-    // Slot 12 sees the slot-10 capture, 14 sees 12; slot 10 has nothing older to post.
-    assert_eq!(schedule_of(&actions), vec![(12, 10), (14, 12)]);
+fn captures_outside_the_range_are_dropped() {
+    let captured = captured_at(&[8, 10, 12, 20]);
+    let actions = build_overrides(account_key(), &captured, 10, 15);
+    assert_eq!(schedule_of(&actions), vec![(10, 10), (12, 12)]);
 }
 
 #[test]
 fn empty_capture_builds_nothing() {
-    assert!(build_shift_actions(1, account_key(), &BTreeMap::new(), 10, 15).is_empty());
-}
-
-fn rows_at(slots: &[u64]) -> Vec<CaptureRow> {
-    slots
-        .iter()
-        .map(|slot| CaptureRow {
-            address: None,
-            slot: *slot,
-            account: state(*slot),
-            signature: Some(format!("sig{slot}")),
-            transaction: Some(format!("tx{slot}")),
-        })
-        .collect()
-}
-
-/// (anchor slot, transaction) pairs the action fires, in wire order.
-fn setup_schedule_of(action: &ScheduledAction) -> Vec<(u64, &str)> {
-    let ActionAnchor::BeforeSlot { slots } = &action.anchor else {
-        panic!("setup actions anchor before a slot");
-    };
-    slots
-        .iter()
-        .copied()
-        .zip(action.transactions.iter().map(String::as_str))
-        .collect()
-}
-
-#[rstest]
-// Each update runs K slots after it really did; slot 14's lands past the range.
-#[case::lag(-2, vec![(12, "tx10"), (14, "tx12")])]
-// And K slots before; slot 10's would land before the range starts.
-#[case::lead(2, vec![(10, "tx12"), (12, "tx14")])]
-fn setup_transactions_anchor_the_shift_in_the_opposite_direction(
-    #[case] shift: i64,
-    #[case] expected: Vec<(u64, &str)>,
-) {
-    let rows = rows_at(&[10, 12, 14]);
-    let action = build_setup_action(shift, account_key(), &rows, 10, 15).expect("action");
-    assert_eq!(setup_schedule_of(&action), expected);
-    assert!(action.feeds_reroute);
-    assert_eq!(action.return_accounts, vec![account_key()]);
-}
-
-#[test]
-fn setup_transactions_skip_captures_with_no_transaction() {
-    let mut rows = rows_at(&[10, 12]);
-    rows[0].transaction = None;
-    let action = build_setup_action(-2, account_key(), &rows, 10, 15).expect("action");
-    assert_eq!(setup_schedule_of(&action), vec![(14, "tx12")]);
-}
-
-#[test]
-fn setup_transactions_build_nothing_without_a_resolved_capture() {
-    assert!(build_setup_action(-2, account_key(), &[], 10, 15).is_none());
-}
-
-#[test]
-fn shift_prefers_lag_and_labels_by_direction() {
-    let args = |lag, lead| RunArgs {
-        conn: conn("sim.example.com"),
-        range: RangeArgs {
-            start_slot: 1,
-            slot_count: 1,
-            no_replay: true,
-        },
-        account: account_key(),
-        capture: None,
-        lag,
-        lead,
-        program_id: None,
-        filter_pair: Vec::new(),
-        skip_l1_failures: false,
-        circular_arbs: false,
-        reroute_aggregators: None,
-        setup_transactions: false,
-        record_full: false,
-        price_field: Vec::new(),
-        price_shift_bps: None,
-        out: PathBuf::from("out.jsonl"),
-    };
-    assert_eq!(args(Some(10), None).shift(), Some(-10));
-    assert_eq!(args(None, Some(10)).shift(), Some(10));
-    assert_eq!(args(None, None).shift(), None);
-    assert_eq!(args(Some(0), None).shift(), Some(0));
-    assert_eq!(shift_label(-10), "lag 10");
-    assert_eq!(shift_label(0), "null shift");
-    assert_eq!(shift_label(10), "lead 10");
+    assert!(build_overrides(account_key(), &BTreeMap::new(), 10, 15).is_empty());
 }
 
 fn priced(fields: &[(usize, i64)]) -> AccountData {
@@ -286,10 +191,9 @@ fn join_legs_pairs_common_keys_and_excludes_zero_baselines() {
         (("sig3".into(), 0), leg(999)),
         (("sig4".into(), 0), leg(7)),
     ]);
-    let (joined, zero_baseline) = join_legs(-4, &base, &modified);
+    let (joined, zero_baseline) = join_legs(&base, &modified);
     assert_eq!(joined.len(), 1);
     assert_eq!(joined[0].delta_bps, 1000.0);
-    assert_eq!(joined[0].shift, -4);
     assert_eq!(zero_baseline, 1);
 }
 
@@ -329,9 +233,7 @@ fn a_run_header_round_trips_and_names_itself() {
         detect_failed_l1_swaps: false,
         circular_arbs: true,
         reroute_aggregators: None,
-        shift: Some(-10),
-        price_shift_bps: None,
-        carrier: "account bytes",
+        price_shift_bps: Some(-0.4),
         record_full: false,
     };
 
@@ -341,8 +243,7 @@ fn a_run_header_round_trips_and_names_itself() {
     assert_eq!(read_back.format_version, FORMAT_VERSION);
     assert_eq!(read_back.kind, HeaderKind::CounterfactualFlowRun);
     assert_eq!((read_back.start_slot, read_back.end_slot), (100, 150));
-    assert_eq!(read_back.shift, Some(-10));
-    assert_eq!(read_back.carrier, "account bytes");
+    assert_eq!(read_back.price_shift_bps, Some(-0.4));
     // Slim is the default, and the header says so rather than leaving it to be inferred.
     assert!(read_back.slim);
     // `--no-replay` is the negative of what the session is asked for.
@@ -414,7 +315,7 @@ fn no_selector_measures_the_venue_the_run_named() {
     let header = |venue: &str| -> RunHeader {
         serde_json::from_str(&format!(
             r#"{{"formatVersion":1,"kind":"counterfactualFlowRun","startSlot":1,"endSlot":2,
-                 {venue}"shift":null,"overrideSlots":0,"carrier":"none","slim":true,
+                 {venue}"overrideSlots":0,"slim":true,
                  "rerouteVenues":null,"filterPairs":[],"circularArbs":false,
                  "detectFailedL1Swaps":true,"replayAccountState":true}}"#
         ))
