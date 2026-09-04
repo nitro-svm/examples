@@ -1,0 +1,81 @@
+{
+  "aggregator": "titan",
+  "venue": "Whirlpools",
+  "pair": [
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+  ],
+  "slippageBps": 50,
+  "market": {
+    "mints": [
+      "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "So11111111111111111111111111111111111111112"
+    ],
+    "accounts": [
+      {
+        "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "writable": false
+      },
+      {
+        "address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+        "writable": false
+      },
+      {
+        "address": "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+        "writable": false
+      },
+      {
+        "address": "D5YqVMoSxnqeZAKAUUE1Dm3bmjtdxQ5DCF356ozqN9cM",
+        "writable": true
+      },
+      {
+        "address": "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE",
+        "writable": true
+      },
+      {
+        "address": "So11111111111111111111111111111111111111112",
+        "writable": false
+      },
+      {
+        "address": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+        "writable": false
+      },
+      {
+        "address": "EW9diL91VgHY5i9qYScz53W3PihQPSnPoMtAKCo1Bs7J",
+        "writable": true
+      },
+      {
+        "address": "EUuUbDcafPrmVTD5M6qoJAoyyNbihBhugADAxRMn5he9",
+        "writable": true
+      },
+      {
+        "address": "3nnVbsCfN1mwUk2XSLCnjzY3bDDTdzpnKjvRmd8nESS2",
+        "writable": true
+      },
+      {
+        "address": "2WLWEuKDgkDUccTpbwYp1GToYktiSB1cXvreHUwiSUVP",
+        "writable": true
+      },
+      {
+        "address": "HME5BJtcqSa2Y1sLPXrftqZ9HRwKV4bGhnw41qw5Leka",
+        "writable": true
+      },
+      {
+        "address": "ChxrcGgr1UNLhgE6bge26EQRwDzbv9Q6co5ea12no6JP",
+        "writable": true
+      },
+      {
+        "address": "2s4eJvC4t2oscWNFDw4sZShL3SfB3Zifmr6R8Qayp7mU",
+        "writable": true
+      },
+      {
+        "address": "FoKYKtRpD25TKzBMndysKpgPqbj8AdLXjfpYHXn9PGTX",
+        "writable": true
+      },
+      {
+        "address": "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
+        "writable": false
+      }
+    ]
+  }
+}
