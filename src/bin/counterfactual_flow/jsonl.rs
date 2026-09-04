@@ -35,15 +35,11 @@ pub(crate) struct RunHeader {
     pub(crate) program_id: Option<String>,
     #[serde(default)]
     pub(crate) label: Option<String>,
-    /// The arm's time shift, as `--lag`/`--lead` gave it. `None` posts no override at all.
-    pub(crate) shift: Option<i64>,
-    /// The re-price the arm applied. Without it a re-priced run and the null control record
-    /// identical headers, since both post at each state's own slot.
+    /// The re-price the arm applied. `None` posts no override at all.
     #[serde(default)]
     pub(crate) price_shift_bps: Option<f64>,
     /// Anchor slots the arm posts at; far below the range means the venue barely moved.
     pub(crate) override_slots: usize,
-    pub(crate) carrier: String,
     /// `logs` and `routedTransaction` were emptied rather than kept, so a reader reports them
     /// absent by choice rather than inferring a run that streamed nothing.
     pub(crate) slim: bool,
@@ -108,7 +104,6 @@ impl RunSummary {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct JoinedLeg {
-    pub(crate) shift: i64,
     pub(crate) original_signature: String,
     pub(crate) leg_index: usize,
     pub(crate) input_mint: String,

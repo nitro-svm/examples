@@ -12,9 +12,8 @@ use backtest_example::utils::capture::CaptureRow;
 
 use crate::RunConfig;
 
-/// Every option the counterfactual turns on. The captured bytes ride as per-slot account
-/// overrides; the setup carrier rides as a scheduled action instead. Both are visible only to
-/// the router.
+/// Every option the counterfactual turns on. The re-priced bytes ride as per-slot account
+/// overrides, visible only to the router.
 pub(crate) fn create_session(config: RunConfig) -> Result<CreateBacktestSessionRequest> {
     let create = CreateSession::builder()
         .start_slot(config.range.start_slot)
@@ -24,7 +23,6 @@ pub(crate) fn create_session(config: RunConfig) -> Result<CreateBacktestSessionR
         .reroute_circular_arbs(config.circular_arbs)
         .maybe_reroute_aggregators(config.reroute_aggregators)
         .maybe_reroute_filter(config.filter)
-        .actions(config.schedule.setup.into_iter().collect())
         .replay_account_state(!config.range.no_replay)
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)

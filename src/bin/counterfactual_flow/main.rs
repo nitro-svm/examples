@@ -1,11 +1,7 @@
 //! Change a venue's state and measure the taker flow it wins or loses.
 //!
-//! `capture` records the account's per-slot states; `run` posts them back modified, visible only
-//! to the router. `--price-shift-bps` re-prices, `--lag`/`--lead` shifts in time.
-//!
-//! `--setup-transactions` carries a time shift as the venue's own update transaction re-executed
-//! at the shifted slot. A venue that stamps its last-update slot needs this for `--lead`, since a
-//! future snapshot is rejected; it requires a `--no-replay` capture.
+//! `capture` records the account's per-slot states; `run` posts them back re-priced by
+//! `--price-shift-bps`, visible only to the router.
 
 mod cli;
 mod jsonl;
@@ -42,14 +38,13 @@ use simulator_client::{
 use crate::{
     cli::{
         CaptureArgs, Cli, Command, CompareArgs, ConnectionArgs, RangeArgs, RunArgs, filter_from,
-        shift_label,
     },
     jsonl::{FORMAT_VERSION, HeaderKind, RunHeader, RunSummary, wire_transaction},
     report::{
         LegRecord, RerouteCollector, VenueReport, delta_summary, join_legs, report_recording,
         report_run,
     },
-    schedule::{Schedule, shifted_schedule},
+    schedule::{Schedule, build_schedule},
     session::{CaptureCollector, create_session},
     venue::resolve_venue_label,
 };
@@ -73,9 +68,7 @@ struct RunConfig {
     circular_arbs: bool,
     reroute_aggregators: Option<RerouteAggregators>,
     /// The arm, recorded in the file's header.
-    shift: Option<i64>,
     price_shift_bps: Option<f64>,
-    carrier: &'static str,
     record_full: bool,
 }
 
@@ -96,10 +89,8 @@ impl RunConfig {
                 .as_ref()
                 .and_then(Target::label)
                 .map(str::to_string),
-            shift: self.shift,
             price_shift_bps: self.price_shift_bps,
             override_slots: self.schedule.entries(),
-            carrier: self.carrier.to_string(),
             slim: !self.record_full,
             reroute_aggregators: self.reroute_aggregators.as_ref().map(ToString::to_string),
             filter_pairs: self
@@ -230,14 +221,9 @@ async fn venue_of(args: &RunArgs) -> Result<Option<Target>> {
 }
 
 async fn run(args: RunArgs) -> Result<RunOutput> {
-    let schedule = shifted_schedule(&args)?;
-    let carrier = carrier_of(&args);
-    if let Some(shift) = args.shift() {
-        eprintln!(
-            "[{}] {} anchor slots, carried as {carrier}",
-            shift_label(shift),
-            schedule.entries(),
-        );
+    let schedule = build_schedule(&args)?;
+    if let Some(bps) = args.price_shift_bps {
+        eprintln!("[{bps:+} bps] {} anchor slots", schedule.entries(),);
     }
     let config = RunConfig {
         range: args.range.clone(),
@@ -248,9 +234,7 @@ async fn run(args: RunArgs) -> Result<RunOutput> {
         detect_failed_l1_swaps: !args.skip_l1_failures,
         circular_arbs: args.circular_arbs,
         reroute_aggregators: args.reroute_aggregators.clone(),
-        shift: args.shift(),
         price_shift_bps: args.price_shift_bps,
-        carrier,
         record_full: args.record_full,
     };
     let output = run_once(&args.conn, config).await?;
@@ -270,16 +254,6 @@ fn arm_path(base: &Path, arm: &str) -> PathBuf {
         None => format!("{stem}-{arm}"),
     };
     base.with_file_name(named)
-}
-
-/// How the arm reaches the venue: as the captured bytes, as the venue's own update transaction
-/// re-executed at the shifted slot, or not at all.
-fn carrier_of(args: &RunArgs) -> &'static str {
-    match (args.shift().is_some(), args.setup_transactions) {
-        (false, _) => "none",
-        (true, true) => "setup transactions",
-        (true, false) => "account bytes",
-    }
 }
 
 pub(crate) const fn is_split(share: u64) -> bool {
@@ -355,16 +329,16 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
 }
 
 async fn compare(args: CompareArgs) -> Result<()> {
-    let shift = args.run.shift().ok_or_else(|| {
+    let price_shift_bps = args.run.price_shift_bps.ok_or_else(|| {
         anyhow!(
-            "--lag/--lead/--price-shift-bps is required for compare; its reference arm is the \
-             null control, the same capture posted unmodified at each state's own slot"
+            "--price-shift-bps is required for compare; its reference arm is the control, \
+             the same range with no override"
         )
     })?;
-    let label = shift_label(shift);
+    let label = format!("{price_shift_bps:+} bps");
     let venue = venue_of(&args.run).await?;
     // Each arm records to its own file, so `report` can read either one afterwards.
-    let make_config = |schedule, shift, price_shift_bps, carrier, arm: &str| RunConfig {
+    let make_config = |schedule, price_shift_bps, arm: &str| RunConfig {
         range: args.run.range.clone(),
         schedule,
         filter: filter_from(&args.run),
@@ -373,18 +347,16 @@ async fn compare(args: CompareArgs) -> Result<()> {
         detect_failed_l1_swaps: !args.run.skip_l1_failures,
         circular_arbs: args.run.circular_arbs,
         reroute_aggregators: args.run.reroute_aggregators.clone(),
-        shift,
         price_shift_bps,
-        carrier,
         record_full: args.run.record_full,
     };
 
-    let schedule = shifted_schedule(&args.run)?;
+    let schedule = build_schedule(&args.run)?;
 
     eprintln!("[control] running the reroute (no override)...");
     let baseline = run_once(
         &args.run.conn,
-        make_config(Schedule::default(), None, None, "none", "control"),
+        make_config(Schedule::default(), None, "control"),
     )
     .await?;
     report_run("control", &baseline);
@@ -392,18 +364,12 @@ async fn compare(args: CompareArgs) -> Result<()> {
     eprintln!("[modified] running with {label}...");
     let modified = run_once(
         &args.run.conn,
-        make_config(
-            schedule,
-            Some(shift),
-            args.run.price_shift_bps,
-            carrier_of(&args.run),
-            "modified",
-        ),
+        make_config(schedule, Some(price_shift_bps), "modified"),
     )
     .await?;
     report_run("modified", &modified);
 
-    let (joined, zero_baseline) = join_legs(shift, &baseline.legs, &modified.legs);
+    let (joined, zero_baseline) = join_legs(&baseline.legs, &modified.legs);
     let report_path = args
         .report
         .clone()
@@ -417,7 +383,7 @@ async fn compare(args: CompareArgs) -> Result<()> {
     let deltas = joined.iter().map(|row| row.delta_bps).collect::<Vec<_>>();
     let stats = delta_summary(&deltas);
     let moved = deltas.iter().filter(|delta| **delta != 0.0).count();
-    println!("=== {label} vs the null control ===");
+    println!("=== {label} vs the control ===");
     println!(
         "legs matched: {} ({moved} moved){}",
         stats.matched,

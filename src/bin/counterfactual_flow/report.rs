@@ -216,7 +216,7 @@ pub(crate) fn report_run(label: &str, output: &RunOutput) {
             total.improvements
         );
         eprintln!(
-            "[{label}] won/lost are differential: read against the `--lag 0` control, not against zero"
+            "[{label}] won/lost are differential: read against the control, not against zero"
         );
         if total.split > 0 {
             eprintln!(
@@ -252,7 +252,6 @@ pub(crate) fn report_run(label: &str, output: &RunOutput) {
 /// Joins legs present in both runs; returns the rows plus the count of matched legs
 /// excluded for a zero baseline quote.
 pub(crate) fn join_legs(
-    shift: i64,
     base: &BTreeMap<LegKey, LegRecord>,
     modified: &BTreeMap<LegKey, LegRecord>,
 ) -> (Vec<JoinedLeg>, usize) {
@@ -264,7 +263,6 @@ pub(crate) fn join_legs(
         .iter()
         .filter_map(|(key, base, modified)| {
             delta_bps(base.metis_quoted_out, modified.metis_quoted_out).map(|delta_bps| JoinedLeg {
-                shift,
                 original_signature: key.0.clone(),
                 leg_index: key.1,
                 input_mint: base.input_mint.clone(),
