@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use simulator_api::DirectFillParams;
+use simulator_api::DirectFillTemplate;
 use solana_address::Address;
 
 /// Where one ladder lives inside the venue's state account.
@@ -64,7 +64,7 @@ pub(crate) struct Inventory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Plan {
-    pub(crate) direct_fill: DirectFillParams,
+    pub(crate) direct_fill: DirectFillTemplate,
     pub(crate) inventory: Inventory,
 }
 
@@ -97,7 +97,7 @@ impl Plan {
         for account in self.overridden() {
             let named = self
                 .direct_fill
-                .market
+                .instruction
                 .accounts
                 .iter()
                 .find(|entry| entry.address == account)

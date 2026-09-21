@@ -31,8 +31,8 @@ use clap::Parser;
 use simulator_api::{RerouteAggregators, RerouteFilter, RerouteStatsReport};
 use simulator_client::{
     AccountDiffNotification, CreateSession, FULL_PERCENT, ManagedBacktestSession, ManagedEvent,
-    RerouteNotification, backtest_ws_url, reroute_report::Target, subscribe_account_diffs,
-    subscribe_reroutes,
+    ReplacementNotification, backtest_ws_url, reroute_report::Target, subscribe_account_diffs,
+    subscribe_replacements,
 };
 
 use crate::{
@@ -285,12 +285,16 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     collected.write_line(|| serde_json::to_string(&header));
     let collector = Arc::new(Mutex::new(collected));
     let sink = collector.clone();
-    let handle = subscribe_reroutes(
+    let handle = subscribe_replacements(
         &session.session_info().rpc_endpoint,
-        move |notification: RerouteNotification| {
-            let mut collector = sink.lock().expect("reroute collector");
-            collector.record_legs(&notification);
-            collector.tally_venue(&notification);
+        move |notification: ReplacementNotification| {
+            let mut collector = sink.lock().expect("replacement collector");
+            // One stream now carries three mechanisms; only a requote has legs to tally. The
+            // row itself is recorded whatever its kind, so the file stays the whole stream.
+            if let ReplacementNotification::Requote(requote) = &notification {
+                collector.record_legs(requote);
+                collector.tally_venue(requote);
+            }
             collector.write_jsonl_row(&notification);
             ready(())
         },

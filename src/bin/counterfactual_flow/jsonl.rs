@@ -2,11 +2,11 @@
 
 use std::{fs, io, io::BufRead, path::Path};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use simulator_api::RerouteStatsReport;
-use simulator_client::RerouteNotification;
+use simulator_client::ReplacementNotification;
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
     compiled_instruction::CompiledInstruction,
@@ -17,12 +17,19 @@ use solana_signature::Signature;
 use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
 use solana_transaction_status::{EncodedTransaction, EncodedTransactionWithStatusMeta, UiMessage};
 
-/// The version a writer stamps and a reader accepts.
-pub(crate) const FORMAT_VERSION: u32 = 1;
+/// The version a writer stamps and a reader accepts. Version 2 carries
+/// [`ReplacementNotification`] rows, which are tagged on `kind` and come in three shapes; version
+/// 1's rows were the untagged reroute notification and do not read here.
+pub(crate) const FORMAT_VERSION: u32 = 2;
+
+/// `kind` values the two frames stamp. Every row carries a `kind` now — a notification's names
+/// its replacement variant — so these are what tell a frame from a notification.
+const HEADER_KIND: &str = "counterfactualFlowRun";
+const SUMMARY_KIND: &str = "counterfactualFlowSummary";
 
 /// The first line of a recording. Every line after it is a
-/// [`simulator_client::RerouteNotification`] written verbatim, so a reader cannot drift from the
-/// wire type. `kind` lets a reader tell a frame from a notification by content, not position.
+/// [`simulator_client::ReplacementNotification`] written verbatim, so a reader cannot drift from
+/// the wire type. `kind` lets a reader tell a frame from a notification by content, not position.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RunHeader {
@@ -119,7 +126,7 @@ pub(crate) struct JoinedLeg {
 /// a reader has to be able to say rather than reporting a partial range as a whole one.
 pub(crate) struct Recording {
     pub(crate) header: Option<RunHeader>,
-    pub(crate) notifications: Vec<RerouteNotification>,
+    pub(crate) notifications: Vec<ReplacementNotification>,
     pub(crate) summary: Option<RunSummary>,
 }
 
@@ -140,29 +147,33 @@ pub(crate) fn read_recording(path: &Path) -> Result<Recording> {
             continue;
         }
         let at = || format!("{} line {}", path.display(), index + 1);
-        // Only frames carry `kind`, so this decides the grammar before anything parses the line.
-        if !line.contains("\"kind\"") {
-            recording
-                .notifications
-                .push(serde_json::from_str(&line).with_context(at)?);
-            continue;
-        }
+        // A notification is tagged on `kind` too, so the discriminator is the value, not the
+        // presence. A row carrying none is a version-1 notification, which no longer reads.
+        let kind = serde_json::from_str::<RowKind>(&line)
+            .map(|row| row.kind)
+            .map_err(|_| {
+                anyhow!(
+                    "{}: no `kind`; this build reads format version {FORMAT_VERSION}, whose \
+                     rows are all tagged",
+                    at()
+                )
+            })?;
         // A frame that will not parse is version skew, not a notification.
-        match serde_json::from_str::<RunHeader>(&line) {
-            Ok(header) => recording.header = Some(header),
-            Err(header_error) => match serde_json::from_str::<RunSummary>(&line) {
-                Ok(summary) => recording.summary = Some(summary),
-                Err(_) => {
-                    return Err(anyhow::Error::new(header_error).context(format!(
-                        "{}: unreadable header or trailer; this build reads format version \
-                         {FORMAT_VERSION}",
-                        at()
-                    )));
-                }
-            },
+        match kind.as_str() {
+            HEADER_KIND => recording.header = Some(serde_json::from_str(&line).with_context(at)?),
+            SUMMARY_KIND => recording.summary = Some(serde_json::from_str(&line).with_context(at)?),
+            _ => recording
+                .notifications
+                .push(serde_json::from_str(&line).with_context(at)?),
         }
     }
     Ok(recording)
+}
+
+/// Just enough of any row to tell which of the three grammars it is.
+#[derive(Deserialize)]
+struct RowKind {
+    kind: String,
 }
 
 /// Rebuild the signed wire encoding from the JSON the transaction subscription pushes. A v0

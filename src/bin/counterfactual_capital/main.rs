@@ -23,7 +23,7 @@ use backtest_example::utils;
 
 use crate::{
     cli::{ArmSpec, Cli},
-    jsonl::{ArmRow, TierRow, VaultRow},
+    jsonl::{ArmRow, TierRow, UNSIMULATABLE, VaultRow},
     plan::Plan,
     session::Arm,
 };
@@ -86,10 +86,10 @@ async fn main() -> Result<()> {
     let arms = args.arms()?;
 
     eprintln!(
-        "[venue] {} via {}, pair {}",
-        plan.direct_fill.venue,
-        plan.direct_fill.aggregator.as_str(),
-        plan.direct_fill.pair
+        "[venue] {}, pair {} -> {}",
+        plan.direct_fill.label,
+        plan.direct_fill.input_mint,
+        plan.direct_fill.output_mint
     );
     eprintln!(
         "[range] {} + {} slots, {}",
@@ -464,10 +464,13 @@ fn row(arm: ArmSpec, frozen: bool, posted: Option<&Posted>, stats: RerouteStatsR
         tiers: posted.map(|p| p.tiers.clone()).unwrap_or_default(),
         ceiling: posted.and_then(|p| p.ceiling).map(|top| top.to_string()),
         matched: stats.direct_fill_matched,
-        built: stats.direct_fill_built,
+        // Every matched hop lands in exactly one outcome bucket, so the ones that ran are all of
+        // them bar the ones that could not be compiled or run.
+        built: stats
+            .direct_fill_matched
+            .saturating_sub(stats.direct_fill_outcomes.get(UNSIMULATABLE).copied().unwrap_or(0)),
         scored: stats.direct_fill_scored,
         bps_total: stats.direct_fill_bps_total,
-        rejections: stats.direct_fill_rejections,
         outcomes: stats.direct_fill_outcomes,
     }
 }

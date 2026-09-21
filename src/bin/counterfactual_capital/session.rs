@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context, Result};
 use simulator_api::{
-    AccountData, AccountModifications, CreateBacktestSessionRequest, DirectFillParams,
+    AccountData, AccountModifications, CreateBacktestSessionRequest, DirectFillTemplate,
     RerouteAggregators, SwapAggregator,
 };
 use simulator_client::CreateSession;
@@ -17,7 +17,7 @@ pub(crate) struct Arm {
     pub(crate) start_slot: u64,
     pub(crate) slot_count: u64,
     pub(crate) no_replay: bool,
-    pub(crate) spec: DirectFillParams,
+    pub(crate) spec: DirectFillTemplate,
     /// One entry per slot the venue's state changed in, scaled so the venue follows its real
     /// trajectory at a different size. Empty for the capture pass.
     pub(crate) overrides: Vec<(u64, BTreeMap<Address, AccountData>)>,
@@ -44,7 +44,7 @@ pub(crate) fn create_session(arm: Arm) -> Result<CreateBacktestSessionRequest> {
         .reroute_order_flow(true)
         .reroute_requote(false)
         .reroute_aggregators(all_aggregators())
-        .reroute_direct_fill(Box::new(arm.spec))
+        .reroute_direct_fill(vec![arm.spec])
         .replay_account_state(!arm.no_replay)
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)

@@ -55,13 +55,14 @@ pub(crate) struct ArmRow {
     pub(crate) ceiling: Option<String>,
     /// Hops whose pair the book named.
     pub(crate) matched: u64,
-    /// Of those, the ones the encoder could build. The denominator for `fill_rate`.
+    /// Of those, the ones that actually ran. A template is the instruction, so nothing is
+    /// "built" any more: what this still excludes are the hops that could not be compiled or
+    /// run at all. The denominator for `fill_rate`.
     pub(crate) built: u64,
     /// Probes that filled and could be scored against the hop they replace.
     pub(crate) scored: u64,
     /// Sum of per-probe bps; divide by `scored` for the mean.
     pub(crate) bps_total: i64,
-    pub(crate) rejections: BTreeMap<String, u64>,
     pub(crate) outcomes: BTreeMap<String, u64>,
 }
 
@@ -101,6 +102,10 @@ impl ArmRow {
 /// The outcome key a probe that filled is recorded under.
 pub(crate) const FILLED: &str = "filled";
 
+/// The outcome key for a probe that could not be compiled or run — the template-model successor
+/// to a hop the old encoder refused to build.
+pub(crate) const UNSIMULATABLE: &str = "unsimulatable";
+
 pub(crate) fn write_rows(path: &Path, rows: &[ArmRow], diagnostic: Option<&ArmRow>) -> Result<()> {
     let body = rows
         .iter()
@@ -136,7 +141,6 @@ mod tests {
             built,
             scored,
             bps_total,
-            rejections: BTreeMap::new(),
             outcomes: BTreeMap::new(),
         }
     }

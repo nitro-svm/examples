@@ -259,13 +259,20 @@ fn a_run_header_round_trips_and_names_itself() {
 /// format rests on.
 #[test]
 fn a_slim_row_keeps_everything_the_analysis_reads_and_still_round_trips() {
+    const SIGNATURE: &str =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const IN_MINT: &str = "So11111111111111111111111111111111111111112";
+    const OUT_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
     let wire = serde_json::json!({
+        "kind": "requote",
         "context": {"slot": 42},
         "slot": 42,
         "batchIndex": 3,
-        "originalSignature": "sig",
+        "originalSignature": SIGNATURE,
+        "outcome": "filled",
         "legs": [{
-            "inputMint": "in", "outputMint": "out", "amount": 1_000, "swapMode": "ExactIn",
+            "inputMint": IN_MINT, "outputMint": OUT_MINT, "amount": 1_000, "swapMode": "ExactIn",
             "originalQuotedOut": 990, "metisQuotedOut": 1_010, "routeSummary": "SolFi",
             "routePlan": [], "originalRoutePlan": [],
         }],
@@ -277,35 +284,43 @@ fn a_slim_row_keeps_everything_the_analysis_reads_and_still_round_trips() {
         "realizedOutputAmount": 1_009,
         "originalRealizedOutputAmount": 991,
     });
-    let full: RerouteNotification = serde_json::from_value(wire).expect("wire decodes");
+    let full: ReplacementNotification = serde_json::from_value(wire).expect("wire decodes");
 
     let slim = slimmed(&full);
-    assert!(slim.logs.is_empty());
-    assert!(slim.routed_transaction.data.is_empty());
+    let ReplacementNotification::Requote(requote) = &slim else {
+        panic!("slimming a requote yields a requote");
+    };
+    assert!(requote.logs.is_empty());
+    assert!(requote.routed_transaction.data.is_empty());
 
     // Everything the report reads survives.
-    assert_eq!(slim.batch_index, 3);
-    assert_eq!(slim.original_signature, "sig");
-    assert_eq!(slim.legs[0].swap_mode, "ExactIn");
-    assert_eq!(slim.legs[0].route_summary, "SolFi");
+    assert_eq!(requote.core.batch_index, 3);
+    assert_eq!(requote.core.original_signature.to_string(), SIGNATURE);
+    assert_eq!(requote.legs[0].swap_mode, "ExactIn");
+    assert_eq!(requote.legs[0].route_summary, "SolFi");
     assert!(
-        slim.legs[0]
+        requote.legs[0]
             .route_plan
             .as_ref()
             .is_some_and(RoutePlan::is_empty)
     );
     assert!(
-        slim.legs[0]
+        requote.legs[0]
             .original_route_plan
             .as_ref()
             .is_some_and(RoutePlan::is_empty)
     );
-    assert_eq!(slim.original_realized_output_amount, Some(991));
-    assert_eq!(slim.realized_output_amount, Some(1_009));
+    assert_eq!(requote.original_realized_output_amount, Some(991));
+    assert_eq!(requote.realized_output_amount, Some(1_009));
 
-    // And the row still reads back as the wire type, which removing the keys would break.
+    // And the row still reads back as the wire type, which removing the keys — or the `kind`
+    // tag the enum is discriminated on — would break.
     let line = serde_json::to_string(&slim).expect("slim encodes");
-    let read_back: RerouteNotification = serde_json::from_str(&line).expect("slim decodes");
+    let ReplacementNotification::Requote(read_back) =
+        serde_json::from_str::<ReplacementNotification>(&line).expect("slim decodes")
+    else {
+        panic!("the row reads back as the requote it was written from");
+    };
     assert_eq!(read_back.legs[0].amount, 1_000);
 }
 

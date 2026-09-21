@@ -53,10 +53,9 @@ pub(crate) fn baseline(venue: &Venue) {
 /// What the run would do, without opening a session; the plan is validated before this prints.
 pub(crate) fn dry_run(arms: &[ArmSpec], plan: &Plan) -> Result<()> {
     println!(
-        "{} arms against {} via {}:",
+        "{} arms against {}:",
         arms.len(),
-        plan.direct_fill.venue,
-        plan.direct_fill.aggregator.as_str()
+        plan.direct_fill.label
     );
     for arm in arms {
         println!(

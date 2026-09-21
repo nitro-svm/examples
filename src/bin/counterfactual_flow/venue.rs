@@ -77,8 +77,8 @@ mod tests {
         route_summary: &str,
     ) -> RerouteLegNotification {
         RerouteLegNotification {
-            input_mint: "in".to_string(),
-            output_mint: "out".to_string(),
+            input_mint: Address::new_from_array([1; 32]),
+            output_mint: Address::new_from_array([2; 32]),
             amount: 1,
             swap_mode: "ExactIn".to_string(),
             original_quoted_out: 1,

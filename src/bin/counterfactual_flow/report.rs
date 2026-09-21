@@ -10,8 +10,8 @@ use std::{
 use anyhow::{Result, anyhow, bail};
 use simulator_api::{BinaryEncoding, EncodedBinary};
 use simulator_client::{
-    RerouteLegNotification, RerouteNotification,
-    reroute_report::{Report, Target, short_mint},
+    ReplacementNotification, RequoteNotification, RerouteLegNotification,
+    reroute_report::{self, Target, short_mint},
 };
 
 use crate::{
@@ -140,7 +140,7 @@ pub(crate) async fn report_recording(args: ReportArgs) -> Result<()> {
         }
     };
 
-    let report = Report::from_notifications(target, &recording.notifications)?;
+    let report = reroute_report::from_notifications(target, &recording.notifications)?;
     match args.json {
         true => println!("{}", report.to_json()),
         false => println!(
@@ -305,7 +305,7 @@ pub(crate) fn delta_bps(base: u64, variant: u64) -> Option<f64> {
     (base != 0).then(|| (variant as f64 - base as f64) / base as f64 * 10_000.0)
 }
 
-/// Everything the reroute subscription accumulates, behind one lock.
+/// Everything the replacement subscription accumulates, behind one lock.
 #[derive(Default)]
 pub(crate) struct RerouteCollector {
     pub(crate) venue: Option<Target>,
@@ -317,14 +317,14 @@ pub(crate) struct RerouteCollector {
 }
 
 impl RerouteCollector {
-    pub(crate) fn record_legs(&mut self, notification: &RerouteNotification) {
+    pub(crate) fn record_legs(&mut self, notification: &RequoteNotification) {
         self.legs
             .extend(notification.legs.iter().enumerate().map(|(index, leg)| {
                 (
-                    (notification.original_signature.clone(), index),
+                    (notification.core.original_signature.to_string(), index),
                     LegRecord {
-                        input_mint: leg.input_mint.clone(),
-                        output_mint: leg.output_mint.clone(),
+                        input_mint: leg.input_mint.to_string(),
+                        output_mint: leg.output_mint.to_string(),
                         amount: leg.amount,
                         metis_quoted_out: leg.metis_quoted_out,
                         original_quoted_out: leg.original_quoted_out,
@@ -335,7 +335,7 @@ impl RerouteCollector {
 
     /// Both sides over the same legs, so won and lost are differences on one population rather
     /// than two counts from different runs.
-    pub(crate) fn tally_venue(&mut self, notification: &RerouteNotification) {
+    pub(crate) fn tally_venue(&mut self, notification: &RequoteNotification) {
         let Some(venue) = &self.venue else { return };
         let mut matched = 0;
         for (leg, counts) in notification
@@ -343,7 +343,7 @@ impl RerouteCollector {
             .iter()
             .filter_map(|leg| Some((leg, leg_counts(leg, venue)?)))
         {
-            let direction = (leg.input_mint.clone(), leg.output_mint.clone());
+            let direction = (leg.input_mint.to_string(), leg.output_mint.to_string());
             self.tally
                 .by_direction
                 .entry(direction)
@@ -357,8 +357,9 @@ impl RerouteCollector {
     }
 
     /// The wire type itself, with the unread fields emptied unless the run asked to keep them.
-    /// A projection here would silently drop whatever it did not name.
-    pub(crate) fn write_jsonl_row(&mut self, notification: &RerouteNotification) {
+    /// A projection here would silently drop whatever it did not name — including the `kind`
+    /// tag, without which the row does not read back as a notification at all.
+    pub(crate) fn write_jsonl_row(&mut self, notification: &ReplacementNotification) {
         if self.record_full {
             self.write_line(|| serde_json::to_string(notification));
             return;
@@ -380,12 +381,19 @@ impl RerouteCollector {
     }
 }
 
-/// Fields are emptied rather than removed, so every row still reads as a `RerouteNotification`.
-/// The header's `slim` flag is what tells a reader the emptiness was deliberate.
-pub(crate) fn slimmed(notification: &RerouteNotification) -> RerouteNotification {
-    RerouteNotification {
-        logs: Vec::new(),
-        routed_transaction: EncodedBinary::new(String::new(), BinaryEncoding::Base64),
-        ..notification.clone()
+/// Fields are emptied rather than removed, so every row still reads as a
+/// [`ReplacementNotification`]. The header's `slim` flag is what tells a reader the emptiness was
+/// deliberate. Only a requote carries logs and a routed transaction; the other variants are
+/// already slim and pass through untouched.
+pub(crate) fn slimmed(notification: &ReplacementNotification) -> ReplacementNotification {
+    match notification {
+        ReplacementNotification::Requote(requote) => {
+            ReplacementNotification::Requote(RequoteNotification {
+                logs: Vec::new(),
+                routed_transaction: EncodedBinary::new(String::new(), BinaryEncoding::Base64),
+                ..requote.clone()
+            })
+        }
+        other => other.clone(),
     }
 }
