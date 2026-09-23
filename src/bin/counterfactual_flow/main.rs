@@ -26,6 +26,7 @@ use anyhow::{Result, anyhow, ensure};
 use backtest_example::utils::{
     self,
     capture::{CaptureRow, write_capture},
+    progress::{Counter, Progress},
 };
 use clap::Parser;
 use simulator_api::{RerouteAggregators, RerouteFilter, RerouteStatsReport};
@@ -41,8 +42,8 @@ use crate::{
     },
     jsonl::{FORMAT_VERSION, HeaderKind, RunHeader, RunSummary, wire_transaction},
     report::{
-        LegRecord, RerouteCollector, VenueReport, delta_summary, join_legs, report_recording,
-        report_run,
+        LegRecord, RerouteCollector, VenueReport, delta_summary, join_legs, render_arms,
+        report_recording, report_run, report_table, table_for,
     },
     schedule::{Schedule, build_schedule},
     session::{CaptureCollector, create_session},
@@ -121,6 +122,7 @@ async fn main() -> Result<()> {
         Command::Run(args) => run(args).await.map(|_| ()),
         Command::Compare(args) => compare(args).await,
         Command::Report(args) => report_recording(args).await,
+        Command::Table(args) => report_table(args).await,
     }
 }
 
@@ -157,17 +159,23 @@ async fn capture(args: CaptureArgs) -> Result<()> {
 
     let mut wire = HashMap::new();
     let mut undecodable = 0u64;
-    utils::session::drive_to_completion(&mut session, args.range.slot_count, |event| match event {
-        ManagedEvent::Slot(slot) => eprintln!("[slot] {slot}"),
-        ManagedEvent::Transaction(transaction) => {
+    let recorded = Counter::default();
+    let mut progress = Progress::new(
+        args.range.start_slot,
+        args.range.slot_count,
+        vec![("txns", recorded.clone())],
+    );
+    progress.session(session.session_info().session_id);
+    utils::session::drive_to_completion(&mut session, &mut progress, |event| {
+        if let ManagedEvent::Transaction(transaction) = event {
             match wire_transaction(&transaction.transaction) {
                 Some((signature, encoded)) => {
+                    recorded.bump();
                     wire.insert(signature, encoded);
                 }
                 None => undecodable += 1,
             }
         }
-        _ => {}
     })
     .await?;
     handle.stop.send(true).ok();
@@ -197,13 +205,8 @@ async fn capture(args: CaptureArgs) -> Result<()> {
         args.range.start_slot,
         args.range.start_slot + args.range.slot_count
     );
-    let resolved = rows.iter().filter(|row| row.transaction.is_some()).count();
     write_capture(&args.out, &rows)?;
-    println!(
-        "captured {} states ({resolved} with a transaction) to {}",
-        rows.len(),
-        args.out.display()
-    );
+    println!("captured {} states to {}", rows.len(), args.out.display());
     if undecodable > 0 {
         eprintln!("[capture] {undecodable} streamed transactions could not be re-encoded");
     }
@@ -225,11 +228,12 @@ async fn run(args: RunArgs) -> Result<RunOutput> {
     if let Some(bps) = args.price_shift_bps {
         eprintln!("[{bps:+} bps] {} anchor slots", schedule.entries(),);
     }
+    let venue = venue_of(&args).await?;
     let config = RunConfig {
         range: args.range.clone(),
         schedule,
         filter: filter_from(&args),
-        venue: venue_of(&args).await?,
+        venue: venue.clone(),
         jsonl_out: Some(args.out.clone()),
         detect_failed_l1_swaps: !args.skip_l1_failures,
         circular_arbs: args.circular_arbs,
@@ -239,6 +243,14 @@ async fn run(args: RunArgs) -> Result<RunOutput> {
     };
     let output = run_once(&args.conn, config).await?;
     report_run("run", &output);
+    // Read back rather than tallied in flight, so this is the same table `table` would render
+    // from the same file. A failure here costs the summary, never the recording.
+    match venue.as_ref().map(|venue| table_for(&args.out, venue)) {
+        Some(Ok(table)) => println!("{table}"),
+        Some(Err(error)) => eprintln!("[run] no table: {error}"),
+        // No --program-id names no venue to measure, so there is no table to draw.
+        None => {}
+    }
     Ok(output)
 }
 
@@ -263,6 +275,7 @@ pub(crate) const fn is_split(share: u64) -> bool {
 async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput> {
     let scheduled = config.schedule.entries();
     let slot_count = config.range.slot_count;
+    let start_slot = config.range.start_slot;
     let venue = config.venue.clone();
     let jsonl_out = config.jsonl_out.clone();
     let record_full = config.record_full;
@@ -285,6 +298,11 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     collected.write_line(|| serde_json::to_string(&header));
     let collector = Arc::new(Mutex::new(collected));
     let sink = collector.clone();
+    // The two numbers a venue audience actually watches: how much flow was re-quoted, and how much
+    // of it came back through them.
+    let requotes = Counter::default();
+    let venue_legs = Counter::default();
+    let (seen, won) = (requotes.clone(), venue_legs.clone());
     let handle = subscribe_replacements(
         &session.session_info().rpc_endpoint,
         move |notification: ReplacementNotification| {
@@ -293,7 +311,8 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
             // row itself is recorded whatever its kind, so the file stays the whole stream.
             if let ReplacementNotification::Requote(requote) = &notification {
                 collector.record_legs(requote);
-                collector.tally_venue(requote);
+                won.add(collector.tally_venue(requote));
+                seen.bump();
             }
             collector.write_jsonl_row(&notification);
             ready(())
@@ -301,12 +320,13 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     )
     .await?;
 
-    let funnel = utils::session::drive_to_completion(&mut session, slot_count, |event| {
-        if let ManagedEvent::Slot(slot) = event {
-            eprintln!("[slot] {slot}");
-        }
-    })
-    .await?;
+    let mut progress = Progress::new(
+        start_slot,
+        slot_count,
+        vec![("requotes", requotes), ("venue legs", venue_legs)],
+    );
+    progress.session(session.session_info().session_id);
+    let funnel = utils::session::drive_to_completion(&mut session, &mut progress, |_| {}).await?;
     handle.stop.send(true).ok();
     handle.join_handle.await??;
     session.shutdown().await;
@@ -407,6 +427,18 @@ async fn compare(args: CompareArgs) -> Result<()> {
         );
     }
     println!("report written to {}", report_path.display());
+    // The venue's own capture in dollars is what a comparison is asked for; printing it here
+    // saves reaching for `report` twice and reading the two arms against each other by eye.
+    if let Some(target) = &venue {
+        match render_arms(
+            &arm_path(&args.run.out, "control"),
+            &arm_path(&args.run.out, "modified"),
+            target,
+        ) {
+            Ok(arms) => println!("{arms}"),
+            Err(error) => eprintln!("[note] could not render the arms: {error}"),
+        }
+    }
     // Quoting is not deterministic run to run: re-run both sides and trust only the
     // legs that move consistently. See the README.
     eprintln!("[note] single-run deltas include router noise; repeat both runs before attributing");

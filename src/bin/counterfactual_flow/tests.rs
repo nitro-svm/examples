@@ -7,9 +7,13 @@ use solana_address::Address;
 
 use crate::{
     cli::RangeArgs,
-    report::{VenueCounts, VenueTally, delta_bps, slimmed, slot_range, target_from_header},
+    report::{
+        VenueCounts, VenueTally, delta_bps, l1_baseline, marginal_line, money, original_record,
+        slimmed, slot_range, target_from_header,
+    },
     schedule::{build_overrides, reprice},
 };
+
 /// The totals are folded from the per-direction map, so a book whose two sides moved opposite
 /// ways must still report each side — summing them is what hid the collapse.
 #[test]
@@ -259,8 +263,7 @@ fn a_run_header_round_trips_and_names_itself() {
 /// format rests on.
 #[test]
 fn a_slim_row_keeps_everything_the_analysis_reads_and_still_round_trips() {
-    const SIGNATURE: &str =
-        "1111111111111111111111111111111111111111111111111111111111111111";
+    const SIGNATURE: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const IN_MINT: &str = "So11111111111111111111111111111111111111112";
     const OUT_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
@@ -350,7 +353,123 @@ fn no_selector_measures_the_venue_the_run_named() {
     // The range is the recording's to supply; the report cannot know it.
     assert_eq!(
         slot_range(&Some(named)).as_deref(),
-        Some("slots 1–2"),
-        "the subtitle names the range the run covered"
+        Some("slots 1–2 (2 slots)"),
+        "the subtitle names the range the run covered, and how much of it there is"
+    );
+}
+
+#[test]
+fn slot_range_states_the_count() {
+    let header: RunHeader = serde_json::from_str(
+        r#"{"formatVersion":1,"kind":"counterfactualFlowRun",
+             "startSlot":449059373,"endSlot":449061373,"overrideSlots":0,"slim":true,
+             "rerouteVenues":null,"filterPairs":[],"circularArbs":false,
+             "detectFailedL1Swaps":true,"replayAccountState":true}"#,
+    )
+    .expect("header decodes");
+    let rendered = crate::report::slot_range(&Some(header)).expect("a header renders a range");
+    assert!(rendered.contains("2001 slots"), "{rendered}");
+}
+
+#[rstest]
+#[case::units(0.0, "$0")]
+#[case::under_a_thousand(999.4, "$999")]
+#[case::thousands_boundary(1_000.0, "$1.0k")]
+#[case::thousands(66_420.0, "$66.4k")]
+#[case::millions_boundary(1_000_000.0, "$1.00M")]
+#[case::millions(1_158_900.0, "$1.16M")]
+fn money_switches_units_at_each_thousand(#[case] usd: f64, #[case] expected: &str) {
+    assert_eq!(money(usd), expected);
+}
+
+#[test]
+fn a_marginal_line_drops_an_unbounded_multiplier() {
+    assert!(marginal_line(0.0, 1_000.0).contains("+$1.0k"));
+    assert!(!marginal_line(0.0, 1_000.0).contains('x'));
+    assert!(marginal_line(1_000.0, 500.0).contains("-$500"));
+}
+
+#[test]
+fn the_l1_baseline_counts_originals_not_re_quotes() {
+    const PROGRAM: &str = "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi";
+    let original = |sig: &str, hops: &str| -> ReplacementNotification {
+        serde_json::from_str(&format!(
+            r#"{{"kind":"original","context":{{"slot":1}},"slot":1,"batchIndex":0,
+                "originalSignature":"{sig}","originalFailed":false,"outcome":"filled",
+                "computeUnitsConsumed":0,"fee":0{hops}}}"#
+        ))
+        .expect("the row shape the recording writes")
+    };
+    let hop = |program: &str| {
+        format!(
+            r#","l1RoutePlan":[{{"leg":0,"percent":100,"program":"{program}","bps":null,
+               "swapInfo":{{"label":"x","ammKey":null,
+               "inputMint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","inAmount":"1",
+               "outputMint":"So11111111111111111111111111111111111111112","outAmount":"1"}}}}]"#
+        )
+    };
+    const A: &str =
+        "3NrmoUNnTgP2fNAkG4zH8i7JaEWseGDysD9Tac4cMcbSpSmEKpSzMVsm9eJZQM6nvNC66yWZ58Enji1zFP69wYEr";
+    const B: &str =
+        "2PktWKNFnTqqGYD2dMJFvpocEvFgQchKLhUc5k5DDMojReyJ3pxUzxj4iYgAySAHLe6drkF2PLboy8DQbn5km5mp";
+
+    let venue = Target::new(None, Some(PROGRAM.parse().expect("a program address")));
+    let baseline = l1_baseline(
+        &[
+            original(A, &hop(PROGRAM)),
+            original(B, &hop("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc")),
+            original(A, ""),
+        ],
+        &venue,
+        &[],
+    );
+
+    assert_eq!(baseline.transactions, 1);
+    assert_eq!(baseline.legs, 1);
+    assert_eq!(baseline.unresolved, 1, "no route is neither filled nor not");
+}
+
+#[test]
+fn an_original_maps_l1_to_land_time_and_the_replay_to_quote_time() {
+    let hop = |program: &str, percent: u64, amount: &str| {
+        format!(
+            r#"{{"leg":0,"percent":{percent},"program":"{program}","bps":null,
+               "swapInfo":{{"label":"x","ammKey":null,
+               "inputMint":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","inAmount":"{amount}",
+               "outputMint":"So11111111111111111111111111111111111111112","outAmount":"1"}}}}"#
+        )
+    };
+    const SIG: &str =
+        "3NrmoUNnTgP2fNAkG4zH8i7JaEWseGDysD9Tac4cMcbSpSmEKpSzMVsm9eJZQM6nvNC66yWZ58Enji1zFP69wYEr";
+    const BISON: &str = "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi";
+    const WHIRL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
+
+    let notification = serde_json::from_str(&format!(
+        r#"{{"kind":"original","context":{{"slot":1}},"slot":1,"batchIndex":0,
+            "originalSignature":"{SIG}","originalFailed":false,"outcome":"filled",
+            "computeUnitsConsumed":0,"fee":0,
+            "l1RoutePlan":[{},{}],
+            "routePlan":[{}]}}"#,
+        hop(BISON, 60, "600"),
+        hop(WHIRL, 40, "400"),
+        hop(WHIRL, 100, "1000"),
+    ))
+    .expect("the row shape the recording writes");
+    let ReplacementNotification::Original(original) = notification else {
+        panic!("built an original");
+    };
+
+    let record = original_record(&original).expect("a route with both ends resolves");
+
+    assert_eq!(record.amount, 1_000, "a split enters through both hops");
+    assert_eq!(
+        record.original_route_plan.map(|plan| plan.hops().len()),
+        Some(2),
+        "land time is the L1 plan"
+    );
+    assert_eq!(
+        record.route_plan.map(|plan| plan.hops().len()),
+        Some(1),
+        "quote time is the replay's own plan"
     );
 }

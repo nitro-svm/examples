@@ -24,6 +24,26 @@ pub(crate) enum Command {
     /// Report what flowed through a venue or pool in a recorded run, on L1 and after the
     /// re-quote. Reads the file only, so it re-runs per pool for free.
     Report(ReportArgs),
+
+    /// The findings table: L1 and quote-time baselines from the originals, then one column per
+    /// arm. The first recording supplies the baselines; every recording supplies an arm.
+    Table(TableArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct TableArgs {
+    /// Recordings to read, control first. Each contributes an arm column, labelled by the price
+    /// shift its header names.
+    #[arg(required = true)]
+    pub(crate) recordings: Vec<PathBuf>,
+
+    /// The venue under test, when the recordings name none.
+    #[arg(long)]
+    pub(crate) program_id: Option<Address>,
+
+    /// The route label, when you would rather give it than have `--program-id` resolve it.
+    #[arg(long)]
+    pub(crate) label: Option<String>,
 }
 
 #[derive(Args)]
@@ -41,6 +61,11 @@ pub(crate) struct ReportArgs {
     #[arg(long)]
     pub(crate) label: Option<String>,
 
+    /// The control arm to read this recording against: renders both arms and what the change
+    /// itself bought, from files a `compare` already wrote. Without it the recording stands alone.
+    #[arg(long)]
+    pub(crate) against: Option<PathBuf>,
+
     /// Emit the report as JSON instead of a table.
     #[arg(long, default_value_t = false)]
     pub(crate) json: bool,
@@ -52,8 +77,10 @@ pub(crate) use backtest_example::utils::connection::ConnectionArgs;
 
 #[derive(Args, Clone)]
 pub(crate) struct RangeArgs {
-    /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 433838452)]
+    /// First slot (inclusive) to replay. Defaults to the start of the range a recorded `.adlt`
+    /// covers — replay matches the start slot exactly, so a default pointing anywhere else
+    /// silently costs the run its replay.
+    #[arg(long, default_value_t = 449059373)]
     pub(crate) start_slot: u64,
 
     /// Slots to cover, as the inclusive range `[start, start + count]`.

@@ -2,21 +2,22 @@
 //! arm-against-arm comparison.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     io::{self, Write},
+    path::Path,
 };
 
-use anyhow::{Result, anyhow, bail};
-use simulator_api::{BinaryEncoding, EncodedBinary};
+use anyhow::{Result, anyhow, bail, ensure};
+use simulator_api::{BinaryEncoding, EncodedBinary, route_plan::RoutePlan};
 use simulator_client::{
-    ReplacementNotification, RequoteNotification, RerouteLegNotification,
-    reroute_report::{self, Target, short_mint},
+    OriginalNotification, ReplacementNotification, RequoteNotification, RerouteLegNotification,
+    reroute_report::{self, LegRecord as FlowRecord, Report, SwapMode, Target, short_mint},
 };
 
 use crate::{
     LegKey, RunOutput,
-    cli::ReportArgs,
+    cli::{ReportArgs, TableArgs},
     is_split,
     jsonl::{FORMAT_VERSION, JoinedLeg, RunHeader, read_recording},
     venue::{original_venue_share, resolve_venue_label, venue_share},
@@ -140,13 +141,55 @@ pub(crate) async fn report_recording(args: ReportArgs) -> Result<()> {
         }
     };
 
+    if let Some(control) = &args.against {
+        ensure!(
+            !args.json,
+            "--against renders the two arms as a table; it has no JSON form"
+        );
+        println!("{}", render_arms(control, &args.recording, &target)?);
+        return Ok(());
+    }
+
+    let pairs = recording
+        .header
+        .as_ref()
+        .map(|header| header.filter_pairs.clone())
+        .unwrap_or_default();
+    let baseline = l1_baseline(&recording.notifications, &target, &pairs);
     let report = reroute_report::from_notifications(target, &recording.notifications)?;
     match args.json {
         true => println!("{}", report.to_json()),
-        false => println!(
-            "{}",
-            report.render(slot_range(&recording.header).as_deref())
-        ),
+        false => {
+            println!(
+                "{}",
+                report.render(slot_range(&recording.header).as_deref())
+            );
+            let covered = report
+                .to_json()
+                .get("total")
+                .and_then(|total| total.get("l1"))
+                .and_then(|l1| l1.get("swaps"))
+                .and_then(serde_json::Value::as_u64);
+            let coverage = covered
+                .filter(|_| baseline.legs > 0)
+                .map(|covered| {
+                    format!(
+                        "; the table's L1 column covers {covered} of them ({:.0}%)",
+                        100.0 * covered as f64 / baseline.legs as f64
+                    )
+                })
+                .unwrap_or_default();
+            println!(
+                "  venue on L1, over every original replayed: {} swaps in {} transactions{}{}\n",
+                baseline.legs,
+                baseline.transactions,
+                match baseline.unresolved {
+                    0 => String::new(),
+                    n => format!(" ({n} with no recovered route)"),
+                },
+                coverage
+            );
+        }
     }
     Ok(())
 }
@@ -161,11 +204,405 @@ pub(crate) fn target_from_header(header: &RunHeader) -> Option<Target> {
     (program.is_some() || label.is_some()).then(|| Target::new(label, program))
 }
 
-/// The range the recording knows and the report does not.
+/// The range the recording knows and the report does not. The slot count carries the sense of
+/// scale a bare pair of slot numbers does not.
 pub(crate) fn slot_range(header: &Option<RunHeader>) -> Option<String> {
-    header
-        .as_ref()
-        .map(|header| format!("slots {}–{}", header.start_slot, header.end_slot))
+    header.as_ref().map(|header| {
+        let slots = header
+            .end_slot
+            .saturating_sub(header.start_slot)
+            .saturating_add(1);
+        format!(
+            "slots {}–{} ({slots} slots)",
+            header.start_slot, header.end_slot
+        )
+    })
+}
+
+/// Both arms of a comparison, rendered together: the venue's own capture is the question a
+/// comparison is asked, and reading it means the two arms side by side rather than two separate
+/// `report` invocations.
+pub(crate) fn render_arms(control: &Path, modified: &Path, target: &Target) -> Result<String> {
+    let arm = |path: &Path| -> Result<(String, Option<f64>, L1Baseline, BTreeSet<String>)> {
+        let recording = read_recording(path)?;
+        let report = reroute_report::from_notifications(target.clone(), &recording.notifications)?;
+        let requoted = requoted_usd(&report.to_json());
+        Ok((
+            report.render(slot_range(&recording.header).as_deref()),
+            requoted,
+            l1_baseline(
+                &recording.notifications,
+                target,
+                &recording
+                    .header
+                    .as_ref()
+                    .map(|header| header.filter_pairs.clone())
+                    .unwrap_or_default(),
+            ),
+            requoted_signatures(&recording.notifications),
+        ))
+    };
+    let (control_arm, control_usd, control_l1, control_sigs) = arm(control)?;
+    let (modified_arm, modified_usd, modified_l1, modified_sigs) = arm(modified)?;
+    let marginal = control_usd
+        .zip(modified_usd)
+        .map(|(control, modified)| marginal_line(control, modified))
+        .unwrap_or_default();
+    let footing = footing_line(control_l1, modified_l1, &control_sigs, &modified_sigs);
+    Ok(format!(
+        "\n  \u{2500}\u{2500} control \u{2500}\u{2500}{control_arm}\n  \u{2500}\u{2500} modified \u{2500}\u{2500}{modified_arm}{marginal}{footing}"
+    ))
+}
+
+/// What the two arms actually share. The L1 baseline has to match or the arms replayed different
+/// chains; the re-quoted sets do not, and the marginal above is blind to the difference.
+fn footing_line(
+    control: L1Baseline,
+    modified: L1Baseline,
+    control_sigs: &BTreeSet<String>,
+    modified_sigs: &BTreeSet<String>,
+) -> String {
+    let union = control_sigs.union(modified_sigs).count();
+    let shared = control_sigs.intersection(modified_sigs).count();
+    let drift = union.saturating_sub(shared);
+    let footing = match control == modified {
+        true => format!(
+            "  venue on L1: {} swaps in {} transactions, identical in both arms",
+            control.legs, control.transactions
+        ),
+        false => format!(
+            "  venue on L1 DIFFERS between arms: {} vs {} swaps — the arms did not replay the \
+             same chain",
+            control.legs, modified.legs
+        ),
+    };
+    let coverage = match drift {
+        0 => "  both arms re-quoted the same swaps".to_string(),
+        _ => format!(
+            "  {shared} of {union} re-quoted swaps are common to both arms; {drift} ({:.2}%) are \
+             not, and the marginal above cannot see them",
+            100.0 * drift as f64 / union.max(1) as f64
+        ),
+    };
+    format!("\n{footing}\n{coverage}\n")
+}
+
+fn requoted_usd(json: &serde_json::Value) -> Option<f64> {
+    json.get("total")?.get("requoted")?.get("usd")?.as_f64()
+}
+
+pub(crate) fn marginal_line(control: f64, modified: f64) -> String {
+    let delta = modified - control;
+    let ratio = modified / control;
+    let times = match ratio.is_finite() {
+        true => format!(" ({ratio:.2}x)"),
+        false => String::new(),
+    };
+    format!(
+        "\n  the change alone: re-quoted {} -> {}, {}{}{times}\n",
+        money(control),
+        money(modified),
+        if delta >= 0.0 { "+" } else { "-" },
+        money(delta.abs()),
+    )
+}
+
+pub(crate) fn money(usd: f64) -> String {
+    match usd {
+        usd if usd >= 1e6 => format!("${:.2}M", usd / 1e6),
+        usd if usd >= 1e3 => format!("${:.1}k", usd / 1e3),
+        usd => format!("${usd:.0}"),
+    }
+}
+
+pub(crate) fn original_record(notification: &OriginalNotification) -> Option<FlowRecord> {
+    let plan = notification.l1_route_plan.as_ref()?;
+    let hops = plan.hops();
+    let input_mint = hops.first()?.swap_info.input_mint.as_deref()?;
+    let output_mint = hops.last()?.swap_info.output_mint.as_deref()?;
+    let amount = hops
+        .iter()
+        .filter(|hop| hop.swap_info.input_mint.as_deref() == Some(input_mint))
+        .filter_map(|hop| hop.swap_info.in_amount.as_deref()?.parse::<u64>().ok())
+        .sum();
+    Some(FlowRecord {
+        original_signature: notification.core.original_signature.to_string(),
+        input_mint: input_mint.parse().ok()?,
+        output_mint: output_mint.parse().ok()?,
+        amount,
+        swap_mode: SwapMode::ExactIn,
+        failed: notification.core.error.is_some(),
+        original_failed: notification.core.original_failed,
+        realized_output_amount: notification.simulated_output_amount,
+        original_realized_output_amount: notification.comparison.l1_fill,
+        route_plan: notification.route_plan.clone(),
+        original_route_plan: notification.l1_route_plan.clone(),
+        realized_route_plan: None,
+        template: None,
+        quoted_output_amount: None,
+        new_output_amount: None,
+        error_category: None,
+        output_bps: None,
+    })
+}
+
+pub(crate) fn originals_report(
+    notifications: &[ReplacementNotification],
+    target: &Target,
+    pairs: &[String],
+) -> Result<(Report, usize)> {
+    let wanted = pairs
+        .iter()
+        .filter_map(|pair| pair.split_once(','))
+        .map(|(base, quote)| (base.to_string(), quote.to_string()))
+        .collect::<Vec<_>>();
+    let records = notifications
+        .iter()
+        .filter_map(|notification| match notification {
+            ReplacementNotification::Original(original) => original_record(original),
+            _ => None,
+        })
+        .filter(|record| {
+            let (input, output) = (
+                record.input_mint.to_string(),
+                record.output_mint.to_string(),
+            );
+            wanted.is_empty()
+                || wanted.iter().any(|(base, quote)| {
+                    (input == *base && output == *quote) || (input == *quote && output == *base)
+                })
+        })
+        .collect::<Vec<_>>();
+    let report = Report::from_records(target.clone(), &records)?;
+    Ok((report, records.len()))
+}
+
+/// The columns one recording contributes: its own arm, and — when `baselines` — the L1 and
+/// quote-time columns the originals carry. Shared with `run`, so a table printed at the end of a
+/// session and one rendered later from the same file are the same numbers by construction.
+pub(crate) fn columns_for(
+    recording: &crate::jsonl::Recording,
+    target: &Target,
+    baselines: bool,
+) -> Result<Vec<Column>> {
+    let mut columns = Vec::new();
+    if baselines {
+        let pairs = recording
+            .header
+            .as_ref()
+            .map(|header| header.filter_pairs.clone())
+            .unwrap_or_default();
+        let (originals, population) = originals_report(&recording.notifications, target, &pairs)?;
+        let total = originals.total();
+        let share = total.share();
+        let mut landed = Column::from_flow("L1 (landed)", &total.l1, share.map(|(l1, _)| l1));
+        landed.detected_swaps = population as u64;
+        let mut quoted = Column::from_flow(
+            "original @ quote",
+            &total.requoted,
+            share.map(|(_, requoted)| requoted),
+        );
+        quoted.detected_swaps = population as u64;
+        columns.push(landed);
+        columns.push(quoted);
+    }
+
+    let arm = reroute_report::from_notifications(target.clone(), &recording.notifications)?;
+    let total = arm.total();
+    let share = total.share();
+    let head = match recording.header.as_ref().and_then(|h| h.price_shift_bps) {
+        None => "control".to_string(),
+        Some(bps) => format!("{bps:+} bps"),
+    };
+    let mut column = Column::from_flow(&head, &total.requoted, share.map(|(_, requoted)| requoted));
+    column.detected_swaps = requoted_signatures(&recording.notifications).len() as u64;
+    columns.push(column);
+    Ok(columns)
+}
+
+/// The table for a recording just written, read back off disk. Reading rather than tallying in
+/// flight keeps one implementation: whatever `table` would say later, the run says now.
+pub(crate) fn table_for(path: &Path, target: &Target) -> Result<String> {
+    let recording = read_recording(path)?;
+    Ok(render_table(&columns_for(&recording, target, true)?))
+}
+
+pub(crate) async fn report_table(args: TableArgs) -> Result<()> {
+    let mut columns = Vec::new();
+    for (index, path) in args.recordings.iter().enumerate() {
+        let recording = read_recording(path)?;
+        let target = match (&args.label, args.program_id) {
+            (None, None) => recording
+                .header
+                .as_ref()
+                .and_then(target_from_header)
+                .ok_or_else(|| anyhow!("{} names no venue", path.display()))?,
+            (Some(label), program) => Target::new(Some(label.clone()), program),
+            (None, Some(program)) => {
+                Target::new(Some(resolve_venue_label(&program).await?), Some(program))
+            }
+        };
+        columns.extend(columns_for(&recording, &target, index == 0)?);
+    }
+    println!("{}", render_table(&columns));
+    Ok(())
+}
+
+pub(crate) struct Column {
+    pub(crate) head: String,
+    pub(crate) detected_swaps: u64,
+    pub(crate) detected_usd: Option<f64>,
+    pub(crate) routed_swaps: u64,
+    pub(crate) routed_usd: f64,
+}
+
+impl Column {
+    fn from_flow(head: &str, flow: &reroute_report::Flow, share_pct: Option<f64>) -> Self {
+        Self {
+            head: head.to_string(),
+            detected_swaps: 0,
+            detected_usd: share_pct
+                .filter(|pct| *pct > 0.0)
+                .map(|pct| flow.usd / (pct / 100.0)),
+            routed_swaps: flow.legs,
+            routed_usd: flow.usd,
+        }
+    }
+
+    fn swap_pct(&self) -> Option<f64> {
+        (self.detected_swaps > 0)
+            .then(|| 100.0 * self.routed_swaps as f64 / self.detected_swaps as f64)
+    }
+
+    fn volume_pct(&self) -> Option<f64> {
+        self.detected_usd
+            .filter(|usd| *usd > 0.0)
+            .map(|usd| 100.0 * self.routed_usd / usd)
+    }
+}
+
+pub(crate) fn render_table(columns: &[Column]) -> String {
+    let width = 18;
+    let cell = |text: String| format!("{text:>width$}");
+    let row = |name: &str, values: Vec<String>| {
+        format!(
+            "  {:<22}{}\n",
+            name,
+            values.into_iter().map(cell).collect::<String>()
+        )
+    };
+    let money = |usd: Option<f64>| usd.map_or_else(|| "—".to_string(), money_from);
+    let pct = |value: Option<f64>| value.map_or_else(|| "—".to_string(), |v| format!("{v:.1}%"));
+    let count = |n: u64| match n {
+        0 => "—".to_string(),
+        n => commas(n),
+    };
+
+    let mut out = String::from("\n");
+    out.push_str(&row("", columns.iter().map(|c| c.head.clone()).collect()));
+    out.push('\n');
+    out.push_str(&row(
+        "detected swaps",
+        columns.iter().map(|c| count(c.detected_swaps)).collect(),
+    ));
+    out.push_str(&row(
+        "detected volume",
+        columns.iter().map(|c| money(c.detected_usd)).collect(),
+    ));
+    out.push_str(&row(
+        "routed swaps",
+        columns.iter().map(|c| count(c.routed_swaps)).collect(),
+    ));
+    out.push_str(&row(
+        "routed volume",
+        columns.iter().map(|c| money(Some(c.routed_usd))).collect(),
+    ));
+    out.push_str(&row(
+        "% swaps to venue",
+        columns.iter().map(|c| pct(c.swap_pct())).collect(),
+    ));
+    out.push_str(&row(
+        "% volume to venue",
+        columns.iter().map(|c| pct(c.volume_pct())).collect(),
+    ));
+    out
+}
+
+fn money_from(usd: f64) -> String {
+    money(usd)
+}
+
+fn commas(n: u64) -> String {
+    let digits = n.to_string();
+    digits
+        .chars()
+        .enumerate()
+        .flat_map(|(i, c)| {
+            let sep = (i > 0 && (digits.len() - i).is_multiple_of(3)).then_some(',');
+            sep.into_iter().chain(std::iter::once(c))
+        })
+        .collect()
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct L1Baseline {
+    pub(crate) transactions: u64,
+    pub(crate) legs: u64,
+    pub(crate) unresolved: u64,
+}
+
+pub(crate) fn l1_baseline(
+    notifications: &[ReplacementNotification],
+    venue: &Target,
+    pairs: &[String],
+) -> L1Baseline {
+    let wanted = pairs
+        .iter()
+        .filter_map(|pair| pair.split_once(','))
+        .map(|(base, quote)| (base.to_string(), quote.to_string()))
+        .collect::<Vec<_>>();
+    let in_filter = |hops: &[simulator_api::route_plan::RouteHop]| {
+        let (Some(first), Some(last)) = (hops.first(), hops.last()) else {
+            return false;
+        };
+        let (Some(input), Some(output)) = (first.input_mint(), last.output_mint()) else {
+            return false;
+        };
+        wanted.iter().any(|(base, quote)| {
+            (input == base && output == quote) || (input == quote && output == base)
+        })
+    };
+    notifications
+        .iter()
+        .filter_map(|notification| match notification {
+            ReplacementNotification::Original(original) => Some(original),
+            _ => None,
+        })
+        .fold(L1Baseline::default(), |mut baseline, original| {
+            let Some(hops) = original.l1_route_plan.as_ref().map(RoutePlan::hops) else {
+                baseline.unresolved += 1;
+                return baseline;
+            };
+            if !wanted.is_empty() && !in_filter(hops) {
+                return baseline;
+            }
+            let legs = hops.iter().filter(|hop| venue.claims_fill(hop)).count() as u64;
+            baseline.transactions += u64::from(legs > 0);
+            baseline.legs += legs;
+            baseline
+        })
+}
+
+pub(crate) fn requoted_signatures(notifications: &[ReplacementNotification]) -> BTreeSet<String> {
+    notifications
+        .iter()
+        .filter_map(|notification| match notification {
+            ReplacementNotification::Requote(requote) => {
+                Some(requote.core.original_signature.to_string())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// One leg's contribution to the tally, or `None` when the venue is on neither side of it.
@@ -335,8 +772,8 @@ impl RerouteCollector {
 
     /// Both sides over the same legs, so won and lost are differences on one population rather
     /// than two counts from different runs.
-    pub(crate) fn tally_venue(&mut self, notification: &RequoteNotification) {
-        let Some(venue) = &self.venue else { return };
+    pub(crate) fn tally_venue(&mut self, notification: &RequoteNotification) -> u64 {
+        let Some(venue) = &self.venue else { return 0 };
         let mut matched = 0;
         for (leg, counts) in notification
             .legs
@@ -354,6 +791,7 @@ impl RerouteCollector {
         if matched > 0 {
             self.tally.txs += 1;
         }
+        matched
     }
 
     /// The wire type itself, with the unread fields emptied unless the run asked to keep them.

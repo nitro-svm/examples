@@ -119,11 +119,10 @@ pub(crate) fn schedule_for(args: &RunArgs, price_shift_bps: f64) -> Result<Sched
         },
     )?;
     eprintln!(
-        "[price] moved {}/{} --price-field(s) by {price_shift_bps:+} bps over {} states, {} writes",
+        "[price] moved {}/{} --price-field(s) by {price_shift_bps:+} bps over {} states",
         written.len(),
         args.price_field.len(),
         rows.len(),
-        written.values().sum::<usize>()
     );
     for offset in args
         .price_field

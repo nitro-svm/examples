@@ -212,32 +212,6 @@ pub fn patch_titan_disable_positive_slippage_fee(
     Ok(new_tx)
 }
 
-/// Fetch an Address Lookup Table account and return its stored addresses.
-/// ALT layout: 56-byte meta header (LOOKUP_TABLE_META_SIZE), then packed 32-byte pubkeys.
-async fn fetch_alt_addresses(alt_pubkey: &str) -> Result<Vec<Pubkey>> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getAccountInfo",
-        "params": [alt_pubkey, {"encoding": "base64"}]
-    });
-    let resp: serde_json::Value = reqwest::Client::new()
-        .post(SOLANA_RPC)
-        .json(&body)
-        .send()
-        .await?
-        .json()
-        .await?;
-    let encoded = resp["result"]["value"]["data"][0]
-        .as_str()
-        .context("alt account data not found")?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-    anyhow::ensure!(bytes.len() >= 56, "alt too short");
-    Ok(bytes[56..]
-        .chunks_exact(32)
-        .map(|c| Pubkey::try_from(c).unwrap())
-        .collect())
-}
-
 pub struct SwapData {
     pub in_amount: u64,
     pub out_amount: u64,
