@@ -14,12 +14,12 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_api::{AccountData, RerouteStatsReport};
-use simulator_client::{ManagedBacktestSession, ManagedEvent, backtest_ws_url};
+use simulator_client::{ManagedBacktestSession, backtest_ws_url};
 use solana_account::Account;
 use solana_address::Address;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 
-use backtest_example::utils;
+use backtest_example::utils::{self, progress::Progress};
 
 use crate::{
     cli::{ArmSpec, Cli},
@@ -28,20 +28,18 @@ use crate::{
     session::Arm,
 };
 
-/// Advance a session whose first pause the caller already consumed, printing slots as they replay.
-/// An arm that advanced and reported no census priced nothing, which is an error rather than a
-/// zero.
+/// Advance a session whose first pause the caller already consumed, showing the range's progress
+/// as it replays. An arm that advanced and reported no census priced nothing, which is an error
+/// rather than a zero.
 async fn advance(
     session: &mut ManagedBacktestSession,
+    start_slot: u64,
     slot_count: u64,
 ) -> Result<RerouteStatsReport> {
-    utils::session::resume_to_completion(session, slot_count, |event| {
-        if let ManagedEvent::Slot(slot) = event {
-            eprintln!("[slot] {slot}");
-        }
-    })
-    .await?
-    .context("the session completed without reroute stats, so the arm priced nothing")
+    let mut progress = Progress::new(start_slot, slot_count, Vec::new());
+    utils::session::resume_to_completion(session, &mut progress, |_| {})
+        .await?
+        .context("the session completed without reroute stats, so the arm priced nothing")
 }
 
 /// `decimals` in the SPL mint layout, after a 36-byte COption mint authority and an 8-byte supply.
@@ -87,9 +85,7 @@ async fn main() -> Result<()> {
 
     eprintln!(
         "[venue] {}, pair {} -> {}",
-        plan.direct_fill.label,
-        plan.direct_fill.input_mint,
-        plan.direct_fill.output_mint
+        plan.direct_fill.label, plan.direct_fill.input_mint, plan.direct_fill.output_mint
     );
     eprintln!(
         "[range] {} + {} slots, {}",
@@ -176,7 +172,7 @@ async fn capture_pass(
 
     let capturing = capture::start(&rpc_url, &watching).await?;
     eprintln!("[arm] unfrozen (the venue priced as it actually moved — the reference)");
-    let stats = advance(&mut open, args.slot_count).await?;
+    let stats = advance(&mut open, args.start_slot, args.slot_count).await?;
     let trajectory = capture::finish(capturing).await?;
     capture::require_changes(&trajectory, &watching)?;
     eprintln!(
@@ -449,7 +445,7 @@ async fn run_arm(
     )
     .await?;
     utils::session::wait_for_first_pause(&mut open).await?;
-    let stats = advance(&mut open, args.slot_count).await?;
+    let stats = advance(&mut open, args.start_slot, args.slot_count).await?;
     open.shutdown().await;
     Ok(row(arm, true, Some(&posted), stats))
 }
@@ -466,9 +462,13 @@ fn row(arm: ArmSpec, frozen: bool, posted: Option<&Posted>, stats: RerouteStatsR
         matched: stats.direct_fill_matched,
         // Every matched hop lands in exactly one outcome bucket, so the ones that ran are all of
         // them bar the ones that could not be compiled or run.
-        built: stats
-            .direct_fill_matched
-            .saturating_sub(stats.direct_fill_outcomes.get(UNSIMULATABLE).copied().unwrap_or(0)),
+        built: stats.direct_fill_matched.saturating_sub(
+            stats
+                .direct_fill_outcomes
+                .get(UNSIMULATABLE)
+                .copied()
+                .unwrap_or(0),
+        ),
         scored: stats.direct_fill_scored,
         bps_total: stats.direct_fill_bps_total,
         outcomes: stats.direct_fill_outcomes,

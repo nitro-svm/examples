@@ -307,7 +307,12 @@ mod tests {
     fn state(vault_amounts: [u64; 2]) -> Account {
         let layout = layout();
         let mut data = vec![0u8; layout.len];
-        data[..8].copy_from_slice(b"temp");
+        let discriminator = layout
+            .discriminator
+            .as_deref()
+            .expect("the fixture layout names a discriminator")
+            .as_bytes();
+        data[..discriminator.len()].copy_from_slice(discriminator);
         for (side, prices) in [PRICES_A, PRICES_B].into_iter().enumerate() {
             let ladder = &layout.ladders[side];
             write_u128(&mut data, ladder.count, ladder.width, 4).expect("in bounds");
@@ -454,10 +459,16 @@ mod tests {
 
     #[test]
     fn an_account_with_the_wrong_discriminator_is_refused() {
+        const FOREIGN: &[u8] = b"panc";
         let mut wrong = state(VAULTS);
-        wrong.data[..8].copy_from_slice(b"pancake1");
+        wrong.data[..FOREIGN.len()].copy_from_slice(FOREIGN);
         let error = read_ladders(&wrong, &layout()).expect_err("a foreign account must be refused");
-        assert!(error.to_string().contains("pancake1"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains(std::str::from_utf8(FOREIGN).expect("ascii")),
+            "{error}"
+        );
     }
 
     #[test]
