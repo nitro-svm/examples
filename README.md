@@ -29,6 +29,11 @@ This example sweeps sizes for the specified pair slot-by-slot and reports the de
 Benchmarking a live quote against a historical fill isn't an apples-to-apples comparison since pools and prices have moved in between. This example pauses the chain immediately before each real Jupiter swap and prices a competing route against the same state, recording what each one would have paid out and the venues that were used.
 This is useful for applications evaluating which router to integrate and also allows routing teams to benchmark directly against others or their own past quotes.
 
+## [Direct Fill Against Your Own Pool](./src/bin/orca_direct_fill)
+
+A venue that isn't actively tuning quotes still leaves money on the table through its passive pools, and the only way to see how much is to price the flow it lost against the state it actually had. This example takes every SOL/USDC fill that landed elsewhere, prices it against the venue's own pool at that same moment, and reports how much flow was winnable, in which size buckets, and by how many bps.
+This gives a venue an actionable read on where its passive liquidity is competitive without running anything in production.
+
 ## [Measuring Quote Decay](./src/bin/quote_decay)
 
 There's always latency between quote and execution, but for a retail user swapping from a UI it can run upwards of 50 slots. Always, but especially in these cases, the swap needs to avoid transient liquidity and spoofing games that may disappear when the transaction actually lands onchain. 

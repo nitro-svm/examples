@@ -7,3 +7,4 @@ pub mod parse;
 pub mod price;
 pub mod session;
 pub mod types;
+pub mod whirlpool;

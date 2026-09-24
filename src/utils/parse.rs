@@ -498,8 +498,8 @@ pub fn patch_titan_template_transaction(
 
     let titan_ix = ixs
         .iter_mut()
-        .find(|ix| ix.program_id_index == titan_idx)
-        .context("titan ix not found")?;
+        .find(|ix| ix.program_id_index == titan_idx && ix.data.first() == Some(&0x2a))
+        .context("swap_route_v3 ix not found")?;
     // v3 layout: [0]=disc(0x2a) [1]=config [2..10]=amount [10..18]=expected_amount_out
     //            [18..20]=slippage_threshold_bps [20]=mints [21..23]=fee_centi_bps
     anyhow::ensure!(titan_ix.data.len() >= 23, "titan ix data too short for v3");
@@ -601,8 +601,8 @@ pub fn repoint_titan_account_via_new_key(
     };
     let titan_ix = ixs
         .iter_mut()
-        .find(|ix| ix.program_id_index == titan_idx)
-        .context("titan ix not found")?;
+        .find(|ix| ix.program_id_index == titan_idx && ix.data.first() == Some(&0x2a))
+        .context("swap_route_v3 ix not found")?;
     *titan_ix
         .accounts
         .get_mut(position)
@@ -881,12 +881,17 @@ pub fn derive_ata_with_program(
     Some(ata)
 }
 
-fn ix_acct(ixs: &[CompiledInstruction], prog: u8, pos: usize) -> Option<u8> {
+/// Titan's `swap_route_v3` instruction, not merely the first one Titan owns: a template
+/// can carry several Titan instructions (a route plus setup/limit-order calls), and only
+/// the route has the account layout and args the patchers rewrite. Selecting by program
+/// id alone silently picks whichever comes first.
+fn titan_route_ix(ixs: &[CompiledInstruction], prog: u8) -> Option<&CompiledInstruction> {
     ixs.iter()
-        .find(|ix| ix.program_id_index == prog)?
-        .accounts
-        .get(pos)
-        .copied()
+        .find(|ix| ix.program_id_index == prog && ix.data.first() == Some(&0x2a))
+}
+
+fn ix_acct(ixs: &[CompiledInstruction], prog: u8, pos: usize) -> Option<u8> {
+    titan_route_ix(ixs, prog)?.accounts.get(pos).copied()
 }
 
 // Positive amount of `mint` received by `signer` in this tx.
