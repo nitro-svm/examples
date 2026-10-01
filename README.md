@@ -19,6 +19,10 @@ When developing a quoting strategy, it's difficult to determine a taker's theore
 
 A venue that already knows its historical quotes were uncompetitive learns nothing from being shown them again; the useful question is what would have to change. This example scales a venue's inventory and its quoting curve as account overrides, rebuilds every historical swap on the pair against that state, and reports the flow each version would have filled and at what margin. Capital and curve are separate knobs because they fail in different places: the vaults decide whether a fill can be paid, the curve decides whether it is offered at all, and on a venue that quotes from a curve only one of them moves the answer.
 
+## [Counterfactual Pools](./src/bin/counterfactual_pools)
+
+Before launching a pool, it's hard to know how much flow the router would actually send it. This example adds a pool that doesn't exist on mainnet as an extra market, reroutes the historical order flow through Jupiter Metis, and reports the legs the new pool would have won and at what price improvement.
+
 ## [Measuring Spread and Depth](./src/bin/amm_liquidity)
 
 Prop AMMs price dynamically via a liquidity curve rather than resting orders on a book, so spread and depth can only be measured by quoting the venue at a range of sizes.
