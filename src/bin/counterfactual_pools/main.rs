@@ -1,7 +1,7 @@
-//! Add a pool that never existed on mainnet and measure the taker flow the router would have sent
-//! it. The pool's accounts are posted as an override at the start slot and offered to Metis as an
-//! extra market, so every historical swap is requoted with the new pool available. With `--oracle`,
-//! the pool's oracle is repriced every slot from Binance.
+//! Add a TaurusFi SNDK/USDC pool that never existed on mainnet and measure the taker flow the router
+//! would have sent it. The pool's accounts are posted at the start slot and offered to Metis as an
+//! extra market, and its oracle is repriced every slot from Binance, so every historical SNDK swap is
+//! requoted with the new pool available.
 
 mod oracle;
 
@@ -10,14 +10,12 @@ use std::{
     fs,
     future::ready,
     io::{BufWriter, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, ensure};
-use backtest_example::utils::{
-    self, connection::ConnectionArgs, pair::parse_pair, range::RangeArgs,
-};
+use anyhow::{Context, Result};
+use backtest_example::utils::{self, connection::ConnectionArgs};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use simulator_api::{
@@ -28,41 +26,32 @@ use simulator_client::{
     RequoteNotification, account_data_from_ui, reroute_report::short_mint, subscribe_diagnostics,
     subscribe_replacements,
 };
-use solana_address::Address;
+use solana_address::{Address, address};
+
+/// 2026-09-29 17:35–18:20 UTC: the start of a recorded account-state bundle, in US market hours.
+const START_SLOT: u64 = 451_710_501;
+const SLOT_COUNT: u64 = 10_000;
+
+const SNDK: Address = address!("SNDKbwMUQvZhnLnxLduradgLHG5KrPuKwpnrkkGRhfH");
+const USDC: Address = address!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+const POOL: Address = address!("HxAgMQYcqXZvNrUGCwJ6o8i8HsBpgRKUwbjGt7PHdU1a");
+const ORACLE: Address = address!("ZPVuSaHzpmtipBrFeLSKajVSQwYp4dJ8Vq6eEyPYWL6");
+/// The pool's slot in its oracle (offset 320 of the pool).
+const ORACLE_ENTRY: usize = 0;
+
+/// The pool, its SNDK vault and its oracle, as `solana account --output json` writes them. USDC
+/// settles from the vault every TaurusFi pool shares, which already exists.
+const FIXTURES: [&str; 3] = [
+    include_str!("fixtures/pool.json"),
+    include_str!("fixtures/vault.json"),
+    include_str!("fixtures/oracle.json"),
+];
 
 #[derive(Parser)]
-#[command(about = "Add a pool that does not exist on mainnet and measure the flow it would win")]
+#[command(about = "Add a TaurusFi SNDK/USDC pool and measure the flow the router would send it")]
 struct Cli {
     #[command(flatten)]
     conn: ConnectionArgs,
-
-    #[command(flatten)]
-    range: RangeArgs,
-
-    /// The new pool's market address, as the router would name it.
-    #[arg(long)]
-    pool: Address,
-
-    /// An account the pool needs, as `solana account <address> --output json` writes it. Repeat
-    /// for the pool itself and every account it reads: vaults, oracles, configs.
-    #[arg(long = "account", value_name = "PATH", required = true)]
-    accounts: Vec<PathBuf>,
-
-    /// The pool's oracle, repriced every slot from `--binance`. Must be one of the `--account` files.
-    #[arg(long, requires = "binance")]
-    oracle: Option<Address>,
-
-    /// Binance USDⓈ-M futures symbol whose 1m closes price the oracle, e.g. `SNDKUSDT`.
-    #[arg(long, requires = "oracle")]
-    binance: Option<String>,
-
-    /// Mainnet RPC, read for the block times that line slots up with Binance minutes.
-    #[arg(long, default_value = "https://api.mainnet-beta.solana.com")]
-    rpc_url: String,
-
-    /// Only requote swaps trading this pair, as `<base>,<quote>`, in both directions.
-    #[arg(long, value_parser = parse_pair)]
-    filter_pair: Vec<MintPair>,
 
     /// One row per leg the router sent through the pool.
     #[arg(long, default_value = "new-pool.jsonl")]
@@ -76,34 +65,63 @@ struct AccountFile {
     account: serde_json::Value,
 }
 
-fn load_account(path: &Path) -> Result<(Address, AccountData)> {
-    let raw = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    let file: AccountFile =
-        serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
-    let address = file.pubkey.parse()?;
-    let account = account_data_from_ui(&file.account)
-        .with_context(|| format!("decoding the account in {}", path.display()))?;
-    // The simulator refuses program overrides: the pool's program must already be deployed.
-    ensure!(
-        !account.executable,
-        "{} is a program; only the pool's own accounts can be added",
-        path.display()
-    );
-    Ok((address, account))
+fn load_account(json: &str) -> Result<(Address, AccountData)> {
+    let file: AccountFile = serde_json::from_str(json)?;
+    Ok((file.pubkey.parse()?, account_data_from_ui(&file.account)?))
 }
 
-/// Slots between router probes of the new pool.
+/// Slots between router probes of the pool.
 const PROBE_EVERY: u64 = 250;
-/// Trade sizes, in USD, the router quotes the new pool at.
+/// Trade sizes, in USD, the router quotes the pool at.
 const PROBE_USD: [u32; 3] = [100, 1_000, 10_000];
 
-/// What the router said when asked to quote the new pool directly.
+/// The router's direct quotes of one pool in one direction.
 #[derive(Default)]
-struct Probes {
+struct Probe {
     quoted: u64,
     failed: u64,
     last_error: Option<String>,
-    sample: Option<serde_json::Value>,
+    /// Output per unit of input at the smallest size quoted.
+    last_rate: Option<f64>,
+}
+
+/// Probe results keyed by pool, then `(input, output)` mint.
+type Probes = BTreeMap<String, BTreeMap<(String, String), Probe>>;
+
+/// Fold one `/diagnostic` sample, whose results hold a `swapInfo` or a `quoteFailure` per direction.
+fn record_probe(probes: &mut Probes, sample: DiagnosticNotification) {
+    let pool = probes.entry(sample.market).or_default();
+    for result in sample
+        .results
+        .as_ref()
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let text = |value: &serde_json::Value, key: &str| {
+            value
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        if let Some(info) = result.get("swapInfo") {
+            let probe = pool
+                .entry((text(info, "inputMint"), text(info, "outputMint")))
+                .or_default();
+            probe.quoted += 1;
+            let amount = |key| text(info, key).parse::<f64>().ok();
+            if let (Some(input), Some(output)) = (amount("inAmount"), amount("outAmount")) {
+                probe.last_rate = Some(output / input);
+            }
+        } else if let Some(failure) = result.get("quoteFailure") {
+            let probe = pool
+                .entry((text(failure, "input_mint"), text(failure, "output_mint")))
+                .or_default();
+            probe.failed += 1;
+            probe.last_error = Some(text(failure, "error"));
+        }
+    }
 }
 
 /// One leg the router sent through the pool.
@@ -191,32 +209,20 @@ async fn main() -> Result<()> {
         .ok();
     let args = Cli::parse();
 
-    let accounts = args
-        .accounts
-        .iter()
-        .map(|path| load_account(path))
+    let accounts = FIXTURES
+        .into_iter()
+        .map(load_account)
         .collect::<Result<BTreeMap<_, _>>>()?;
-    ensure!(
-        accounts.contains_key(&args.pool),
-        "no --account file holds the pool {}",
-        args.pool
-    );
-    eprintln!(
-        "[pool] {} with {} accounts, owned by {}",
-        args.pool,
-        accounts.len(),
-        accounts[&args.pool].owner
-    );
 
     let create = CreateSession::builder()
-        .start_slot(args.range.start_slot)
-        .slot_count(args.range.slot_count)
+        .start_slot(START_SLOT)
+        .slot_count(SLOT_COUNT)
         .reroute_order_flow(true)
         .detect_failed_l1_swaps(true)
-        .reroute_extra_markets(BTreeSet::from([args.pool]))
-        .maybe_reroute_filter((!args.filter_pair.is_empty()).then(|| RerouteFilter {
-            pairs: args.filter_pair.iter().copied().collect(),
-        }))
+        .reroute_extra_markets(BTreeSet::from([POOL]))
+        .reroute_filter(RerouteFilter {
+            pairs: [MintPair::new(SNDK, USDC)].into(),
+        })
         .replay_account_state(true)
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)
@@ -224,30 +230,15 @@ async fn main() -> Result<()> {
             anchor: ActionAnchor::AfterEverySlot {
                 every_n_slots: PROBE_EVERY.try_into()?,
             },
-            markets: vec![args.pool],
+            markets: vec![POOL],
             usd_values: PROBE_USD.to_vec(),
             label: None,
         }])
         .build();
-    let mut overrides = BTreeMap::from([(args.range.start_slot, accounts.clone())]);
-    if let (Some(address), Some(symbol)) = (args.oracle, &args.binance) {
-        let account = accounts
-            .get(&address)
-            .context("--oracle must be one of the --account files")?;
-        let entry = oracle::pool_entry(&accounts[&args.pool])?;
-        let prices = oracle::schedule(
-            account,
-            entry,
-            symbol,
-            &args.rpc_url,
-            args.range.start_slot,
-            args.range.end_slot(),
-        )
-        .await?;
-        eprintln!("[oracle] {address} entry {entry} repriced at {} slots from {symbol}", prices.len());
-        for (slot, state) in prices {
-            overrides.entry(slot).or_default().insert(address, state);
-        }
+    let mut overrides = BTreeMap::from([(START_SLOT, accounts.clone())]);
+    let oracle = accounts.get(&ORACLE).context("the oracle fixture")?;
+    for (slot, state) in oracle::schedule(oracle, ORACLE_ENTRY)? {
+        overrides.entry(slot).or_default().insert(ORACLE, state);
     }
     let create = utils::session::with_overrides(
         create,
@@ -259,7 +250,7 @@ async fn main() -> Result<()> {
 
     let tally = Arc::new(Mutex::new(Tally::default()));
     let sink = tally.clone();
-    let pool = args.pool.to_string();
+    let pool = POOL.to_string();
     let handle = subscribe_replacements(
         &session.session_info().rpc_endpoint,
         move |notification: ReplacementNotification| {
@@ -282,28 +273,15 @@ async fn main() -> Result<()> {
     let probe_handle = subscribe_diagnostics(
         &session.session_info().rpc_endpoint,
         move |sample: DiagnosticNotification| {
-            let mut probes = probe_sink.lock().expect("probes");
-            match (sample.err, sample.results) {
-                (None, Some(results)) => {
-                    probes.quoted += 1;
-                    probes.sample.get_or_insert(results);
-                }
-                (err, _) => {
-                    probes.failed += 1;
-                    probes.last_error = err.or(Some("no results".to_string()));
-                }
-            }
+            record_probe(&mut probe_sink.lock().expect("probes"), sample);
             ready(())
         },
     )
     .await?;
 
-    let funnel = utils::session::drive_to_completion(
-        &mut session,
-        args.range.slot_count,
-        utils::session::log_slot,
-    )
-    .await?;
+    let funnel =
+        utils::session::drive_to_completion(&mut session, SLOT_COUNT, utils::session::log_slot)
+            .await?;
     handle.stop.send(true).ok();
     handle.join_handle.await??;
     probe_handle.stop.send(true).ok();
@@ -343,17 +321,26 @@ async fn main() -> Result<()> {
         );
     }
     let probes = std::mem::take(&mut *probes.lock().expect("probes"));
-    println!(
-        "router probes of the pool: {} quoted, {} failed{}",
-        probes.quoted,
-        probes.failed,
-        probes
-            .last_error
-            .map(|error| format!(" (last error: {error})"))
-            .unwrap_or_default()
-    );
-    if let Some(sample) = probes.sample {
-        println!("first quote: {sample}");
+    for directions in probes.values() {
+        println!("router quotes of the pool:");
+        for ((input, output), probe) in directions {
+            println!(
+                "  {}->{}: {} quoted, {} failed{}{}",
+                short_mint(input),
+                short_mint(output),
+                probe.quoted,
+                probe.failed,
+                probe
+                    .last_rate
+                    .map(|rate| format!(", rate {rate:.6}"))
+                    .unwrap_or_default(),
+                probe
+                    .last_error
+                    .as_ref()
+                    .map(|error| format!(" ({error})"))
+                    .unwrap_or_default()
+            );
+        }
     }
     println!("legs written to {}", args.out.display());
     Ok(())

@@ -1,58 +1,83 @@
-//! Repricing a TaurusFi oracle every slot from a Binance futures price.
+//! The SNDK pool's oracle, repriced every slot from Binance's SNDKUSDT perpetual.
 
-use std::collections::BTreeMap;
-
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result};
 use simulator_api::{AccountData, EncodedBinary};
-use solana_rpc_client::nonblocking::rpc_client::RpcClient;
+
+use crate::{SLOT_COUNT, START_SLOT};
+
+/// Unix milliseconds of the first and last slot's blocks, which every slot's update time is spread
+/// between.
+const START_MS: i64 = 1790703321000;
+const END_MS: i64 = 1790706003000;
+
+/// Binance SNDKUSDT 1m closes over the range, from the slot each minute closed at.
+const PRICES: &[(u64, f64)] = &[
+    (451710501, 1712.22),
+    (451710646, 1713.8),
+    (451710870, 1713.04),
+    (451711094, 1712.54),
+    (451711318, 1712.97),
+    (451711541, 1712.44),
+    (451711765, 1711.98),
+    (451711989, 1713.04),
+    (451712212, 1712.33),
+    (451712436, 1712.7),
+    (451712660, 1712.66),
+    (451712884, 1712.86),
+    (451713107, 1713.6),
+    (451713331, 1714.88),
+    (451713555, 1714.29),
+    (451713778, 1712.33),
+    (451714002, 1712.27),
+    (451714226, 1711.06),
+    (451714450, 1710.71),
+    (451714673, 1710.21),
+    (451714897, 1710.79),
+    (451715121, 1709.59),
+    (451715344, 1709.56),
+    (451715568, 1709.62),
+    (451715792, 1710.04),
+    (451716016, 1712.16),
+    (451716239, 1715.63),
+    (451716463, 1714.83),
+    (451716687, 1715.84),
+    (451716910, 1714.13),
+    (451717134, 1715.38),
+    (451717358, 1714.19),
+    (451717582, 1712.89),
+    (451717805, 1715.17),
+    (451718029, 1715.05),
+    (451718253, 1713.95),
+    (451718476, 1714.81),
+    (451718700, 1712.96),
+    (451718924, 1713.5),
+    (451719148, 1714.73),
+    (451719371, 1715.27),
+    (451719595, 1715.06),
+    (451719819, 1715.09),
+    (451720042, 1716.56),
+    (451720266, 1716.75),
+    (451720490, 1716.33),
+];
 
 /// TaurusFi oracle layout: 48-byte entries led by an f64 price, then the update's slot (twice) and
 /// unix milliseconds.
 const ENTRY_LEN: usize = 48;
 const UPDATE_SLOTS: [usize; 2] = [480, 488];
 const UPDATE_MILLIS: usize = 496;
-/// Offset of the pool's oracle entry index.
-const POOL_ENTRY: usize = 320;
 
-const KLINES_URL: &str = "https://fapi.binance.com/fapi/v1/klines";
-const MINUTE_MS: i64 = 60_000;
-
-/// The pool's entry in its oracle.
-pub fn pool_entry(pool: &AccountData) -> Result<usize> {
-    let data = pool.data.decode()?;
-    let bytes = data
-        .get(POOL_ENTRY..POOL_ENTRY + 8)
-        .context("the pool is too short to name an oracle entry")?;
-    Ok(u64::from_le_bytes(bytes.try_into()?) as usize)
-}
-
-/// One oracle state per slot, priced at the last closed Binance minute.
-pub async fn schedule(
-    oracle: &AccountData,
-    entry: usize,
-    symbol: &str,
-    rpc_url: &str,
-    start: u64,
-    end: u64,
-) -> Result<Vec<(u64, AccountData)>> {
-    let rpc = RpcClient::new(rpc_url.to_string());
-    let (start_ms, end_ms) = (block_millis(&rpc, start).await?, block_millis(&rpc, end).await?);
-    let closes = closes(symbol, start_ms - 2 * MINUTE_MS, end_ms).await?;
+/// One state per slot, with the price at `entry` and a fresh update time so it never reads stale.
+pub fn schedule(oracle: &AccountData, entry: usize) -> Result<Vec<(u64, AccountData)>> {
     let template = oracle.data.decode()?;
-    ensure!(
-        template.len() >= UPDATE_MILLIS + 8 && (entry + 1) * ENTRY_LEN <= UPDATE_SLOTS[0],
-        "the oracle is not a TaurusFi oracle with entry {entry}"
-    );
-
-    (start..=end)
+    (START_SLOT..=START_SLOT + SLOT_COUNT)
         .map(|slot| {
-            // Slots are evenly spaced between the two block times.
+            let (_, price) = PRICES
+                .iter()
+                .rev()
+                .find(|(from, _)| *from <= slot)
+                .context("no price before the range")?;
             let millis =
-                start_ms + (end_ms - start_ms) * (slot - start) as i64 / (end - start).max(1) as i64;
-            let (_, price) = closes
-                .range(..millis)
-                .next_back()
-                .with_context(|| format!("no {symbol} close before slot {slot}"))?;
+                START_MS + (END_MS - START_MS) * (slot - START_SLOT) as i64 / SLOT_COUNT as i64;
             let mut data = template.clone();
             data[entry * ENTRY_LEN..entry * ENTRY_LEN + 8].copy_from_slice(&price.to_le_bytes());
             for at in UPDATE_SLOTS {
@@ -68,49 +93,4 @@ pub async fn schedule(
             ))
         })
         .collect()
-}
-
-/// A skipped slot has no block time, so take the next one that produced a block.
-async fn block_millis(rpc: &RpcClient, slot: u64) -> Result<i64> {
-    for candidate in slot..slot + 32 {
-        if let Ok(seconds) = rpc.get_block_time(candidate).await {
-            return Ok(seconds * 1000);
-        }
-    }
-    anyhow::bail!("no block time near slot {slot}")
-}
-
-/// 1m closes keyed by close time.
-async fn closes(symbol: &str, from_ms: i64, to_ms: i64) -> Result<BTreeMap<i64, f64>> {
-    let mut closes = BTreeMap::new();
-    let mut cursor = from_ms;
-    while cursor < to_ms {
-        let rows: Vec<Vec<serde_json::Value>> = reqwest::Client::new()
-            .get(KLINES_URL)
-            .query(&[
-                ("symbol", symbol.to_string()),
-                ("interval", "1m".to_string()),
-                ("startTime", cursor.to_string()),
-                ("endTime", to_ms.to_string()),
-                ("limit", "1500".to_string()),
-            ])
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .with_context(|| format!("fetching {symbol} klines from Binance"))?
-            .json()
-            .await?;
-        let Some(last) = rows.last() else { break };
-        cursor = last[6].as_i64().context("kline close time")? + 1;
-        for row in &rows {
-            let close_ms = row[6].as_i64().context("kline close time")?;
-            let close = row[4]
-                .as_str()
-                .and_then(|close| close.parse().ok())
-                .context("kline close")?;
-            closes.insert(close_ms, close);
-        }
-    }
-    ensure!(!closes.is_empty(), "Binance returned no {symbol} klines");
-    Ok(closes)
 }
