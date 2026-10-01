@@ -12,10 +12,11 @@ use solana_account::Account;
 use solana_address::Address;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 
+use backtest_example::utils::{self, range::RangeArgs};
+
 /// One arm: the range, the venue book, and the inventory this arm posts before it starts.
 pub(crate) struct Arm {
-    pub(crate) start_slot: u64,
-    pub(crate) slot_count: u64,
+    pub(crate) range: RangeArgs,
     pub(crate) no_replay: bool,
     pub(crate) spec: DirectFillTemplate,
     /// One entry per slot the venue's state changed in, scaled so the venue follows its real
@@ -39,8 +40,8 @@ fn all_aggregators() -> RerouteAggregators {
 /// since `OverrideSchedule::active_at` folds every entry up to a slot and lets the latest win.
 pub(crate) fn create_session(arm: Arm) -> Result<CreateBacktestSessionRequest> {
     let create = CreateSession::builder()
-        .start_slot(arm.start_slot)
-        .slot_count(arm.slot_count)
+        .start_slot(arm.range.start_slot)
+        .slot_count(arm.range.slot_count)
         .reroute_order_flow(true)
         .reroute_requote(false)
         .reroute_aggregators(all_aggregators())
@@ -49,13 +50,11 @@ pub(crate) fn create_session(arm: Arm) -> Result<CreateBacktestSessionRequest> {
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)
         .build();
-    let create = arm
+    let overrides = arm
         .overrides
         .into_iter()
-        .fold(create, |create, (slot, accounts)| {
-            create.add_override(slot, AccountModifications(accounts))
-        });
-    create
+        .map(|(slot, accounts)| (slot, AccountModifications(accounts)));
+    utils::session::with_overrides(create, overrides)
         .into_request()
         .context("building the backtest session request")
 }

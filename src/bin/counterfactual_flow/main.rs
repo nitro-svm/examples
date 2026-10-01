@@ -28,11 +28,10 @@ use backtest_example::utils::{
     capture::{CaptureRow, write_capture},
 };
 use clap::Parser;
-use simulator_api::{RerouteAggregators, RerouteFilter, RerouteStatsReport};
+use simulator_api::{RerouteFilter, RerouteStatsReport};
 use simulator_client::{
-    AccountDiffNotification, CreateSession, FULL_PERCENT, ManagedBacktestSession, ManagedEvent,
-    ReplacementNotification, backtest_ws_url, reroute_report::Target, subscribe_account_diffs,
-    subscribe_replacements,
+    AccountDiffNotification, CreateSession, FULL_PERCENT, ManagedEvent, ReplacementNotification,
+    reroute_report::Target, subscribe_account_diffs, subscribe_replacements,
 };
 
 use crate::{
@@ -64,12 +63,8 @@ struct RunConfig {
     filter: Option<RerouteFilter>,
     venue: Option<Target>,
     jsonl_out: Option<PathBuf>,
-    detect_failed_l1_swaps: bool,
-    circular_arbs: bool,
-    reroute_aggregators: Option<RerouteAggregators>,
     /// The arm, recorded in the file's header.
     price_shift_bps: Option<f64>,
-    record_full: bool,
 }
 
 impl RunConfig {
@@ -78,7 +73,7 @@ impl RunConfig {
             format_version: FORMAT_VERSION,
             kind: HeaderKind::CounterfactualFlowRun,
             start_slot: self.range.start_slot,
-            end_slot: self.range.start_slot + self.range.slot_count,
+            end_slot: self.range.end_slot(),
             program_id: self
                 .venue
                 .as_ref()
@@ -91,8 +86,6 @@ impl RunConfig {
                 .map(str::to_string),
             price_shift_bps: self.price_shift_bps,
             override_slots: self.schedule.entries(),
-            slim: !self.record_full,
-            reroute_aggregators: self.reroute_aggregators.as_ref().map(ToString::to_string),
             filter_pairs: self
                 .filter
                 .iter()
@@ -102,9 +95,6 @@ impl RunConfig {
                     format!("{base},{quote}")
                 })
                 .collect(),
-            circular_arbs: self.circular_arbs,
-            detect_failed_l1_swaps: self.detect_failed_l1_swaps,
-            replay_account_state: !self.range.no_replay,
         }
     }
 }
@@ -125,18 +115,15 @@ async fn main() -> Result<()> {
 }
 
 async fn capture(args: CaptureArgs) -> Result<()> {
-    let conn = &args.conn;
     let create = CreateSession::builder()
         .start_slot(args.range.start_slot)
         .slot_count(args.range.slot_count)
-        .replay_account_state(!args.range.no_replay)
+        .replay_account_state(true)
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)
         .build()
         .into_request()?;
-    let mut session =
-        ManagedBacktestSession::start(backtest_ws_url(&conn.url), conn.api_key.clone(), create)
-            .await?;
+    let mut session = utils::session::start(&args.conn, create).await?;
 
     session.subscribe_transactions(vec![args.account]);
 
@@ -195,7 +182,7 @@ async fn capture(args: CaptureArgs) -> Result<()> {
         "account {} never appeared in [{}, {}]",
         args.account,
         args.range.start_slot,
-        args.range.start_slot + args.range.slot_count
+        args.range.end_slot()
     );
     let resolved = rows.iter().filter(|row| row.transaction.is_some()).count();
     write_capture(&args.out, &rows)?;
@@ -231,11 +218,7 @@ async fn run(args: RunArgs) -> Result<RunOutput> {
         filter: filter_from(&args),
         venue: venue_of(&args).await?,
         jsonl_out: Some(args.out.clone()),
-        detect_failed_l1_swaps: !args.skip_l1_failures,
-        circular_arbs: args.circular_arbs,
-        reroute_aggregators: args.reroute_aggregators.clone(),
         price_shift_bps: args.price_shift_bps,
-        record_full: args.record_full,
     };
     let output = run_once(&args.conn, config).await?;
     report_run("run", &output);
@@ -265,12 +248,9 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     let slot_count = config.range.slot_count;
     let venue = config.venue.clone();
     let jsonl_out = config.jsonl_out.clone();
-    let record_full = config.record_full;
     let header = config.header();
     let create = create_session(config)?;
-    let mut session =
-        ManagedBacktestSession::start(backtest_ws_url(&conn.url), conn.api_key.clone(), create)
-            .await?;
+    let mut session = utils::session::start(conn, create).await?;
 
     let jsonl = jsonl_out
         .map(|path| fs::File::create(path).map(io::BufWriter::new))
@@ -278,7 +258,6 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     let mut collected = RerouteCollector {
         venue,
         jsonl,
-        record_full,
         ..RerouteCollector::default()
     };
     // Written before the session can push a notification, so a truncated run still names its arm.
@@ -301,12 +280,9 @@ async fn run_once(conn: &ConnectionArgs, config: RunConfig) -> Result<RunOutput>
     )
     .await?;
 
-    let funnel = utils::session::drive_to_completion(&mut session, slot_count, |event| {
-        if let ManagedEvent::Slot(slot) = event {
-            eprintln!("[slot] {slot}");
-        }
-    })
-    .await?;
+    let funnel =
+        utils::session::drive_to_completion(&mut session, slot_count, utils::session::log_slot)
+            .await?;
     handle.stop.send(true).ok();
     handle.join_handle.await??;
     session.shutdown().await;
@@ -348,11 +324,7 @@ async fn compare(args: CompareArgs) -> Result<()> {
         filter: filter_from(&args.run),
         venue: venue.clone(),
         jsonl_out: Some(arm_path(&args.run.out, arm)),
-        detect_failed_l1_swaps: !args.run.skip_l1_failures,
-        circular_arbs: args.run.circular_arbs,
-        reroute_aggregators: args.run.reroute_aggregators.clone(),
         price_shift_bps,
-        record_full: args.run.record_full,
     };
 
     let schedule = build_schedule(&args.run)?;

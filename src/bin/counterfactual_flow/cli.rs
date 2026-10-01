@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand};
-use simulator_api::{MintPair, RerouteAggregators, RerouteFilter};
+use simulator_api::{MintPair, RerouteFilter};
 use solana_address::Address;
 
 #[derive(Parser)]
@@ -48,23 +48,9 @@ pub(crate) struct ReportArgs {
 
 /// Shared with the other examples: one `--url` has to yield both the websocket and the
 /// session's RPC endpoint, and the local-stack `ws://` case is easy to get subtly wrong.
-pub(crate) use backtest_example::utils::connection::ConnectionArgs;
-
-#[derive(Args, Clone)]
-pub(crate) struct RangeArgs {
-    /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 433838452)]
-    pub(crate) start_slot: u64,
-
-    /// Slots to cover, as the inclusive range `[start, start + count]`.
-    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u64).range(1..))]
-    pub(crate) slot_count: u64,
-
-    /// Execute transactions instead of replaying recorded account state (replay
-    /// requires a recorded `.adlt` for the range).
-    #[arg(long, default_value_t = false)]
-    pub(crate) no_replay: bool,
-}
+pub(crate) use backtest_example::utils::{
+    connection::ConnectionArgs, pair::parse_pair, range::RangeArgs,
+};
 
 #[derive(Args)]
 pub(crate) struct CaptureArgs {
@@ -112,21 +98,6 @@ pub(crate) struct RunArgs {
     #[arg(long, value_parser = parse_pair)]
     pub(crate) filter_pair: Vec<MintPair>,
 
-    /// Leave swaps whose L1 transaction failed out of the run entirely. They are tracked as
-    /// their own population rather than mixed into the funnel, but excluding them keeps the
-    /// rows to flow that actually filled.
-    #[arg(long, default_value_t = false)]
-    pub(crate) skip_l1_failures: bool,
-
-    /// Also re-quote arbitrage cycles (same input and output mint), stitched leg by leg.
-    #[arg(long, default_value_t = false)]
-    pub(crate) circular_arbs: bool,
-
-    /// Aggregators whose swaps to re-quote, comma-separated (server default: jupiter alone).
-    /// Spelled `--reroute-venues` on the command line, the name it shipped under.
-    #[arg(long = "reroute-venues")]
-    pub(crate) reroute_aggregators: Option<RerouteAggregators>,
-
     /// Byte offset of a little-endian fixed-point price. Repeat for every field the venue stores
     /// the price in: moving only some leaves the pool inconsistent and its quotes rejected.
     #[arg(long)]
@@ -137,12 +108,6 @@ pub(crate) struct RunArgs {
     /// worse for one and better for the other.
     #[arg(long, allow_negative_numbers = true)]
     pub(crate) price_shift_bps: Option<f64>,
-
-    /// Keep the simulation logs and the routed transaction in the recording. Off by default,
-    /// since no report reads them and they dominate the file size. Turn it on when a specific
-    /// fill will need explaining afterwards.
-    #[arg(long, default_value_t = false)]
-    pub(crate) record_full: bool,
 
     /// Reroute notifications JSONL output.
     #[arg(long, default_value = "reroute-out.jsonl")]
@@ -158,14 +123,6 @@ pub(crate) struct CompareArgs {
     /// `<--out stem>-report.<ext>`, so a comparison's three files stay together.
     #[arg(long)]
     pub(crate) report: Option<PathBuf>,
-}
-
-fn parse_pair(value: &str) -> Result<MintPair, String> {
-    let (base, quote) = value
-        .split_once(',')
-        .ok_or("expected two base58 mints separated by a comma")?;
-    let parse = |mint: &str| mint.trim().parse::<Address>().map_err(|e| e.to_string());
-    Ok(MintPair::new(parse(base)?, parse(quote)?))
 }
 
 pub(crate) fn filter_from(args: &RunArgs) -> Option<RerouteFilter> {

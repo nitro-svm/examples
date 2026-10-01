@@ -224,17 +224,12 @@ fn a_run_header_round_trips_and_names_itself() {
         range: RangeArgs {
             start_slot: 100,
             slot_count: 50,
-            no_replay: true,
         },
         schedule: Schedule::default(),
         filter: None,
         venue: None,
         jsonl_out: None,
-        detect_failed_l1_swaps: false,
-        circular_arbs: true,
-        reroute_aggregators: None,
         price_shift_bps: Some(-0.4),
-        record_full: false,
     };
 
     let line = serde_json::to_string(&config.header()).expect("header encodes");
@@ -244,11 +239,6 @@ fn a_run_header_round_trips_and_names_itself() {
     assert_eq!(read_back.kind, HeaderKind::CounterfactualFlowRun);
     assert_eq!((read_back.start_slot, read_back.end_slot), (100, 150));
     assert_eq!(read_back.price_shift_bps, Some(-0.4));
-    // Slim is the default, and the header says so rather than leaving it to be inferred.
-    assert!(read_back.slim);
-    // `--no-replay` is the negative of what the session is asked for.
-    assert!(!read_back.replay_account_state);
-    assert!(read_back.circular_arbs);
 
     // A notification must not parse as a header, or a reader would take the first row as one.
     assert!(serde_json::from_str::<RunHeader>(r#"{"slot":1,"legs":[]}"#).is_err());
@@ -330,9 +320,7 @@ fn no_selector_measures_the_venue_the_run_named() {
     let header = |venue: &str| -> RunHeader {
         serde_json::from_str(&format!(
             r#"{{"formatVersion":1,"kind":"counterfactualFlowRun","startSlot":1,"endSlot":2,
-                 {venue}"overrideSlots":0,"slim":true,
-                 "rerouteVenues":null,"filterPairs":[],"circularArbs":false,
-                 "detectFailedL1Swaps":true,"replayAccountState":true}}"#
+                 {venue}"overrideSlots":0,"filterPairs":[]}}"#
         ))
         .expect("header decodes")
     };

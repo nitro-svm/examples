@@ -8,7 +8,7 @@ use simulator_client::{
     AccountDiffNotification, CreateSession, UiAccountConversionError, account_data_from_ui,
 };
 
-use backtest_example::utils::capture::CaptureRow;
+use backtest_example::utils::{self, capture::CaptureRow};
 
 use crate::RunConfig;
 
@@ -19,21 +19,13 @@ pub(crate) fn create_session(config: RunConfig) -> Result<CreateBacktestSessionR
         .start_slot(config.range.start_slot)
         .slot_count(config.range.slot_count)
         .reroute_order_flow(true)
-        .detect_failed_l1_swaps(config.detect_failed_l1_swaps)
-        .reroute_circular_arbs(config.circular_arbs)
-        .maybe_reroute_aggregators(config.reroute_aggregators)
+        .detect_failed_l1_swaps(true)
         .maybe_reroute_filter(config.filter)
-        .replay_account_state(!config.range.no_replay)
+        .replay_account_state(true)
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)
         .build();
-    config
-        .schedule
-        .overrides
-        .into_iter()
-        .fold(create, |create, (slot, overrides)| {
-            create.add_override(slot, overrides)
-        })
+    utils::session::with_overrides(create, config.schedule.overrides)
         .into_request()
         .context("building the backtest session request")
 }

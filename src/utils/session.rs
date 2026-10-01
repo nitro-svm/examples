@@ -1,8 +1,45 @@
-//! Driving a managed session: the pump loop every example needs, and the census it ends with.
+//! Driving a managed session: opening it, the pump loop every example needs, and the census it
+//! ends with.
 
 use anyhow::{Result, bail};
-use simulator_api::{RerouteStatsReport, SessionSummary};
-use simulator_client::{Continue, ManagedBacktestSession, ManagedEvent};
+use simulator_api::{
+    AccountModifications, CreateBacktestSessionRequest, RerouteStatsReport, SessionSummary,
+};
+use simulator_client::{
+    Continue, CreateSession, ManagedBacktestSession, ManagedEvent, backtest_ws_url,
+};
+
+use crate::utils::connection::ConnectionArgs;
+
+/// Open a session on the deployment `conn` names.
+pub async fn start(
+    conn: &ConnectionArgs,
+    request: CreateBacktestSessionRequest,
+) -> Result<ManagedBacktestSession> {
+    Ok(
+        ManagedBacktestSession::start(backtest_ws_url(&conn.url), conn.api_key.clone(), request)
+            .await?,
+    )
+}
+
+/// Post each `(slot, accounts)` as an override from that slot on.
+pub fn with_overrides(
+    create: CreateSession,
+    overrides: impl IntoIterator<Item = (u64, AccountModifications)>,
+) -> CreateSession {
+    overrides
+        .into_iter()
+        .fold(create, |create, (slot, accounts)| {
+            create.add_override(slot, accounts)
+        })
+}
+
+/// An `on_event` for [`drive_to_completion`] that prints each slot as it replays.
+pub fn log_slot(event: ManagedEvent) {
+    if let ManagedEvent::Slot(slot) = event {
+        eprintln!("[slot] {slot}");
+    }
+}
 
 /// The reroute census a completed session reports, if it ran one. The wire shape is a nested
 /// `Option<Box<_>>`; unwrapping it is not something an example should have to know.

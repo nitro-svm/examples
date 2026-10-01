@@ -309,7 +309,6 @@ pub(crate) fn delta_bps(base: u64, variant: u64) -> Option<f64> {
 #[derive(Default)]
 pub(crate) struct RerouteCollector {
     pub(crate) venue: Option<Target>,
-    pub(crate) record_full: bool,
     pub(crate) legs: BTreeMap<LegKey, LegRecord>,
     pub(crate) tally: VenueTally,
     pub(crate) jsonl: Option<io::BufWriter<fs::File>>,
@@ -356,14 +355,10 @@ impl RerouteCollector {
         }
     }
 
-    /// The wire type itself, with the unread fields emptied unless the run asked to keep them.
-    /// A projection here would silently drop whatever it did not name — including the `kind`
-    /// tag, without which the row does not read back as a notification at all.
+    /// The wire type itself, with the unread fields emptied. A projection here would silently
+    /// drop whatever it did not name — including the `kind` tag, without which the row does not
+    /// read back as a notification at all.
     pub(crate) fn write_jsonl_row(&mut self, notification: &ReplacementNotification) {
-        if self.record_full {
-            self.write_line(|| serde_json::to_string(notification));
-            return;
-        }
         let slim = slimmed(notification);
         self.write_line(|| serde_json::to_string(&slim));
     }
@@ -382,8 +377,7 @@ impl RerouteCollector {
 }
 
 /// Fields are emptied rather than removed, so every row still reads as a
-/// [`ReplacementNotification`]. The header's `slim` flag is what tells a reader the emptiness was
-/// deliberate. Only a requote carries logs and a routed transaction; the other variants are
+/// [`ReplacementNotification`]. Only a requote carries logs and a routed transaction; the other variants are
 /// already slim and pass through untouched.
 pub(crate) fn slimmed(notification: &ReplacementNotification) -> ReplacementNotification {
     match notification {

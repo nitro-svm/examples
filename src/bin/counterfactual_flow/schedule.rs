@@ -135,7 +135,7 @@ pub(crate) fn schedule_for(args: &RunArgs, price_shift_bps: f64) -> Result<Sched
         );
     }
     let start = args.range.start_slot;
-    let end = start + args.range.slot_count;
+    let end = args.range.end_slot();
     let schedule = Schedule {
         overrides: build_overrides(
             args.account,

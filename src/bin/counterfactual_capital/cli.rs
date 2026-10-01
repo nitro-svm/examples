@@ -6,7 +6,7 @@ use anyhow::{Result, ensure};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 
-pub(crate) use backtest_example::utils::connection::ConnectionArgs;
+pub(crate) use backtest_example::utils::{connection::ConnectionArgs, range::RangeArgs};
 
 /// Capital multiples run when none are given. The arm below the venue's real book is the one that
 /// can *lose* fills, which is the only proof the lever is connected at all.
@@ -131,14 +131,8 @@ pub(crate) struct Cli {
     #[command(flatten)]
     pub(crate) conn: ConnectionArgs,
 
-    /// First slot (inclusive) to replay. Required, since a stale default would silently price an
-    /// empty population; `sim ranges` lists what exists.
-    #[arg(long)]
-    pub(crate) start_slot: u64,
-
-    /// Slots to cover, as the inclusive range `[start, start + count]`.
-    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u64).range(1..))]
-    pub(crate) slot_count: u64,
+    #[command(flatten)]
+    pub(crate) range: RangeArgs,
 
     /// Execute transactions instead of replaying recorded account state (replay requires a
     /// recorded `.adlt` for the range).
