@@ -47,16 +47,7 @@ pub(crate) struct RunHeader {
     pub(crate) price_shift_bps: Option<f64>,
     /// Anchor slots the arm posts at; far below the range means the venue barely moved.
     pub(crate) override_slots: usize,
-    /// `logs` and `routedTransaction` were emptied rather than kept, so a reader reports them
-    /// absent by choice rather than inferring a run that streamed nothing.
-    pub(crate) slim: bool,
-    /// Serialized as `rerouteVenues`, the key already written into recorded runs.
-    #[serde(rename = "rerouteVenues")]
-    pub(crate) reroute_aggregators: Option<String>,
     pub(crate) filter_pairs: Vec<String>,
-    pub(crate) circular_arbs: bool,
-    pub(crate) detect_failed_l1_swaps: bool,
-    pub(crate) replay_account_state: bool,
 }
 
 #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]

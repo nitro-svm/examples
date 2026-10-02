@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_api::{AccountData, RerouteStatsReport};
-use simulator_client::{ManagedBacktestSession, ManagedEvent, backtest_ws_url};
+use simulator_client::ManagedBacktestSession;
 use solana_account::Account;
 use solana_address::Address;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -35,13 +35,9 @@ async fn advance(
     session: &mut ManagedBacktestSession,
     slot_count: u64,
 ) -> Result<RerouteStatsReport> {
-    utils::session::resume_to_completion(session, slot_count, |event| {
-        if let ManagedEvent::Slot(slot) = event {
-            eprintln!("[slot] {slot}");
-        }
-    })
-    .await?
-    .context("the session completed without reroute stats, so the arm priced nothing")
+    utils::session::resume_to_completion(session, slot_count, utils::session::log_slot)
+        .await?
+        .context("the session completed without reroute stats, so the arm priced nothing")
 }
 
 /// `decimals` in the SPL mint layout, after a 36-byte COption mint authority and an 8-byte supply.
@@ -93,8 +89,8 @@ async fn main() -> Result<()> {
     );
     eprintln!(
         "[range] {} + {} slots, {}",
-        args.start_slot,
-        args.slot_count,
+        args.range.start_slot,
+        args.range.slot_count,
         match args.no_replay {
             true => "executed",
             false => "replayed",
@@ -139,18 +135,12 @@ async fn capture_pass(
     plan: &Plan,
 ) -> Result<(Venue, capture::Trajectory, Option<ArmRow>)> {
     let create = session::create_session(Arm {
-        start_slot: args.start_slot,
-        slot_count: args.slot_count,
+        range: args.range.clone(),
         no_replay: args.no_replay,
         spec: plan.direct_fill.clone(),
         overrides: Vec::new(),
     })?;
-    let mut open = ManagedBacktestSession::start(
-        backtest_ws_url(&args.conn.url),
-        args.conn.api_key.clone(),
-        create,
-    )
-    .await?;
+    let mut open = utils::session::start(&args.conn, create).await?;
     let rpc_url = open.session_info().rpc_endpoint.clone();
 
     // Read at the pause: this session's RPC stops serving the moment the session completes, so a
@@ -176,7 +166,7 @@ async fn capture_pass(
 
     let capturing = capture::start(&rpc_url, &watching).await?;
     eprintln!("[arm] unfrozen (the venue priced as it actually moved — the reference)");
-    let stats = advance(&mut open, args.slot_count).await?;
+    let stats = advance(&mut open, args.range.slot_count).await?;
     let trajectory = capture::finish(capturing).await?;
     capture::require_changes(&trajectory, &watching)?;
     eprintln!(
@@ -386,7 +376,7 @@ fn schedule(
 ) -> Result<Posted> {
     let start = venue.accounts();
     let opening = scale_at(plan, venue, &start, arm)?;
-    let mut overrides = vec![(args.start_slot, opening.accounts.clone())];
+    let mut overrides = vec![(args.range.start_slot, opening.accounts.clone())];
 
     // `active_at` folds every entry up to a slot, so an unchanged account is already standing.
     let mut unscalable = 0u64;
@@ -436,20 +426,14 @@ async fn run_arm(
         posted.overrides.len()
     );
     let create = session::create_session(Arm {
-        start_slot: args.start_slot,
-        slot_count: args.slot_count,
+        range: args.range.clone(),
         no_replay: args.no_replay,
         spec: plan.direct_fill.clone(),
         overrides: posted.overrides.clone(),
     })?;
-    let mut open = ManagedBacktestSession::start(
-        backtest_ws_url(&args.conn.url),
-        args.conn.api_key.clone(),
-        create,
-    )
-    .await?;
+    let mut open = utils::session::start(&args.conn, create).await?;
     utils::session::wait_for_first_pause(&mut open).await?;
-    let stats = advance(&mut open, args.slot_count).await?;
+    let stats = advance(&mut open, args.range.slot_count).await?;
     open.shutdown().await;
     Ok(row(arm, true, Some(&posted), stats))
 }
