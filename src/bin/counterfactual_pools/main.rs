@@ -1,8 +1,11 @@
-//! Add a TaurusFi SNDK/USDC pool that never existed on mainnet and measure the taker flow the router
-//! would have sent it. The pool's accounts are posted at the start slot and offered to Metis as an
-//! extra market, and its oracle is repriced every slot from Binance, so every historical SNDK swap is
-//! requoted with the new pool available.
+//! This example adds a new TaurusFi SNDK-USDC market and measures the flow it would've received
+//! from Solana routers. The accounts are injected at the start of the test range:
+//! - the oracle is set every slot based on Binance SNDK-USDT perp pricing
+//! - the market is registered with Jupiter Metis and evaluated as part of its routing decisions
+//!
+//! The simulation reruns every historical SNDK swap with the new pool available.
 
+mod diagnostic;
 mod oracle;
 
 use std::{
@@ -19,16 +22,15 @@ use backtest_example::utils::{self, connection::ConnectionArgs};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use simulator_api::{
-    AccountData, AccountModifications, ActionAnchor, DiagnosticProbeParams, MintPair, RerouteFilter,
+    AccountData, AccountModifications, MintPair, RerouteAggregators, RerouteFilter, SwapAggregator,
 };
 use simulator_client::{
-    CreateSession, DiagnosticNotification, FULL_PERCENT, ReplacementNotification,
-    RequoteNotification, account_data_from_ui, reroute_report::short_mint, subscribe_diagnostics,
-    subscribe_replacements,
+    CreateSession, FULL_PERCENT, ReplacementNotification, RequoteNotification,
+    account_data_from_ui, reroute_report::short_mint, subscribe_replacements,
 };
 use solana_address::{Address, address};
 
-/// 2026-09-29 17:35–18:20 UTC: the start of a recorded account-state bundle, in US market hours.
+/// 2026-09-29 17:35–18:20 UTC: the start slot of the test range in US market hours.
 const START_SLOT: u64 = 451_710_501;
 const SLOT_COUNT: u64 = 10_000;
 
@@ -39,8 +41,9 @@ const ORACLE: Address = address!("ZPVuSaHzpmtipBrFeLSKajVSQwYp4dJ8Vq6eEyPYWL6");
 /// The pool's slot in its oracle (offset 320 of the pool).
 const ORACLE_ENTRY: usize = 0;
 
-/// The pool, its SNDK vault and its oracle, as `solana account --output json` writes them. USDC
-/// settles from the vault every TaurusFi pool shares, which already exists.
+/// The SNDK pool, its vault, and its oracle, as `solana account --output json` writes them.
+/// These don't yet exist on mainnet and are injected as part of the simulation.
+/// (The USDC pool already exists, so it doesn't need to be added.)
 const FIXTURES: [&str; 3] = [
     include_str!("fixtures/pool.json"),
     include_str!("fixtures/vault.json"),
@@ -70,60 +73,6 @@ fn load_account(json: &str) -> Result<(Address, AccountData)> {
     Ok((file.pubkey.parse()?, account_data_from_ui(&file.account)?))
 }
 
-/// Slots between router probes of the pool.
-const PROBE_EVERY: u64 = 250;
-/// Trade sizes, in USD, the router quotes the pool at.
-const PROBE_USD: [u32; 3] = [100, 1_000, 10_000];
-
-/// The router's direct quotes of one pool in one direction.
-#[derive(Default)]
-struct Probe {
-    quoted: u64,
-    failed: u64,
-    last_error: Option<String>,
-    /// Output per unit of input at the smallest size quoted.
-    last_rate: Option<f64>,
-}
-
-/// Probe results keyed by pool, then `(input, output)` mint.
-type Probes = BTreeMap<String, BTreeMap<(String, String), Probe>>;
-
-/// Fold one `/diagnostic` sample, whose results hold a `swapInfo` or a `quoteFailure` per direction.
-fn record_probe(probes: &mut Probes, sample: DiagnosticNotification) {
-    let pool = probes.entry(sample.market).or_default();
-    for result in sample
-        .results
-        .as_ref()
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let text = |value: &serde_json::Value, key: &str| {
-            value
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        if let Some(info) = result.get("swapInfo") {
-            let probe = pool
-                .entry((text(info, "inputMint"), text(info, "outputMint")))
-                .or_default();
-            probe.quoted += 1;
-            let amount = |key| text(info, key).parse::<f64>().ok();
-            if let (Some(input), Some(output)) = (amount("inAmount"), amount("outAmount")) {
-                probe.last_rate = Some(output / input);
-            }
-        } else if let Some(failure) = result.get("quoteFailure") {
-            let probe = pool
-                .entry((text(failure, "input_mint"), text(failure, "output_mint")))
-                .or_default();
-            probe.failed += 1;
-            probe.last_error = Some(text(failure, "error"));
-        }
-    }
-}
-
 /// One leg the router sent through the pool.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,7 +100,8 @@ struct Direction {
 
 #[derive(Default)]
 struct Tally {
-    notifications: BTreeMap<&'static str, u64>,
+    /// Requote notifications received; fewer than the summary's `rerouted` means some were dropped.
+    requotes: u64,
     requoted_legs: u64,
     by_direction: BTreeMap<(String, String), Direction>,
     rows: Vec<PoolLeg>,
@@ -159,6 +109,7 @@ struct Tally {
 
 impl Tally {
     fn record(&mut self, requote: &RequoteNotification, pool: &str) {
+        self.requotes += 1;
         for leg in &requote.legs {
             self.requoted_legs += 1;
             let share = leg
@@ -209,33 +160,35 @@ async fn main() -> Result<()> {
         .ok();
     let args = Cli::parse();
 
-    let accounts = FIXTURES
-        .into_iter()
-        .map(load_account)
-        .collect::<Result<BTreeMap<_, _>>>()?;
-
+    // 1) Configure the simulation session
     let create = CreateSession::builder()
         .start_slot(START_SLOT)
         .slot_count(SLOT_COUNT)
         .reroute_order_flow(true)
-        .detect_failed_l1_swaps(true)
-        .reroute_extra_markets(BTreeSet::from([POOL]))
+        .detect_failed_l1_swaps(false)                 // If a swap failed on mainnet, don't try to reroute it here
+        .reroute_extra_markets(BTreeSet::from([POOL])) // Register the new SNDK-USDC market for Jupiter Metis
         .reroute_filter(RerouteFilter {
             pairs: [MintPair::new(SNDK, USDC)].into(),
-        })
+        })                                                // Only reroute SNDK-USDC swaps (replay other swaps exactly as they happened historically)
+        .reroute_aggregators(RerouteAggregators::new([
+            SwapAggregator::Jupiter,
+            SwapAggregator::Okx,
+            SwapAggregator::Titan,
+            SwapAggregator::Dflow,
+        ]))                                            // Reroute swaps from every router (only Jupiter is the default)
         .replay_account_state(true)
         .capacity_wait_timeout_secs(900u16)
         .send_summary(true)
-        .diagnostic_probes(vec![DiagnosticProbeParams {
-            anchor: ActionAnchor::AfterEverySlot {
-                every_n_slots: PROBE_EVERY.try_into()?,
-            },
-            markets: vec![POOL],
-            usd_values: PROBE_USD.to_vec(),
-            label: None,
-        }])
         .build();
+
+    // 2) Update the above config with the new accounts
+    // Load the new pool, vault, and oracle accounts for SNDK and inject them
+    let accounts = FIXTURES
+        .into_iter()
+        .map(load_account)
+        .collect::<Result<BTreeMap<_, _>>>()?;
     let mut overrides = BTreeMap::from([(START_SLOT, accounts.clone())]);
+    // Add a schedule to update the oracle every slot based on hardcoded Binance SNDK-USDT perp pricing
     let oracle = accounts.get(&ORACLE).context("the oracle fixture")?;
     for (slot, state) in oracle::schedule(oracle, ORACLE_ENTRY)? {
         overrides.entry(slot).or_default().insert(ORACLE, state);
@@ -246,34 +199,22 @@ async fn main() -> Result<()> {
             .into_iter()
             .map(|(slot, accounts)| (slot, AccountModifications(accounts))),
     );
+
+    // 3) Start the session!
     let mut session = utils::session::start(&args.conn, create.into_request()?).await?;
 
     let tally = Arc::new(Mutex::new(Tally::default()));
     let sink = tally.clone();
     let pool = POOL.to_string();
+    // 4) Subscribe to the Metis reroute event feed and record the results
     let handle = subscribe_replacements(
         &session.session_info().rpc_endpoint,
         move |notification: ReplacementNotification| {
-            let mut tally = sink.lock().expect("tally");
-            let kind = match &notification {
-                ReplacementNotification::Requote(requote) => {
-                    tally.record(requote, &pool);
-                    "requote"
-                }
-                ReplacementNotification::DirectFill(_) => "directFill",
-                ReplacementNotification::Original(_) => "original",
-            };
-            *tally.notifications.entry(kind).or_default() += 1;
-            ready(())
-        },
-    )
-    .await?;
-    let probes = Arc::new(Mutex::new(Probes::default()));
-    let probe_sink = probes.clone();
-    let probe_handle = subscribe_diagnostics(
-        &session.session_info().rpc_endpoint,
-        move |sample: DiagnosticNotification| {
-            record_probe(&mut probe_sink.lock().expect("probes"), sample);
+            // The requote notification contains the new route versus the original fill
+            // (Other notifications are skipped)
+            if let ReplacementNotification::Requote(requote) = &notification {
+                sink.lock().expect("tally").record(requote, &pool);
+            }
             ready(())
         },
     )
@@ -284,10 +225,9 @@ async fn main() -> Result<()> {
             .await?;
     handle.stop.send(true).ok();
     handle.join_handle.await??;
-    probe_handle.stop.send(true).ok();
-    probe_handle.join_handle.await??;
     session.shutdown().await;
 
+    // 5) Print the results of the rerouting
     let tally = std::mem::take(&mut *tally.lock().expect("tally"));
     let mut out = BufWriter::new(fs::File::create(&args.out)?);
     for row in &tally.rows {
@@ -297,11 +237,10 @@ async fn main() -> Result<()> {
 
     if let Some(stats) = &funnel {
         println!(
-            "{} swaps detected -> {} rerouted -> {} succeeded",
-            stats.swaps_detected, stats.swaps_rerouted, stats.swaps_succeeded
+            "{} swaps detected -> {} rerouted -> {} succeeded ({} requotes received)",
+            stats.swaps_detected, stats.swaps_rerouted, stats.swaps_succeeded, tally.requotes
         );
     }
-    println!("notifications received: {:?}", tally.notifications);
     println!(
         "{} of {} requoted legs routed through the new pool",
         tally.rows.len(),
@@ -319,28 +258,6 @@ async fn main() -> Result<()> {
             direction.legs,
             direction.split
         );
-    }
-    let probes = std::mem::take(&mut *probes.lock().expect("probes"));
-    for directions in probes.values() {
-        println!("router quotes of the pool:");
-        for ((input, output), probe) in directions {
-            println!(
-                "  {}->{}: {} quoted, {} failed{}{}",
-                short_mint(input),
-                short_mint(output),
-                probe.quoted,
-                probe.failed,
-                probe
-                    .last_rate
-                    .map(|rate| format!(", rate {rate:.6}"))
-                    .unwrap_or_default(),
-                probe
-                    .last_error
-                    .as_ref()
-                    .map(|error| format!(" ({error})"))
-                    .unwrap_or_default()
-            );
-        }
     }
     println!("legs written to {}", args.out.display());
     Ok(())

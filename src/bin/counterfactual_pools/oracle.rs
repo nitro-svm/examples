@@ -1,16 +1,16 @@
-//! The SNDK pool's oracle, repriced every slot from Binance's SNDKUSDT perpetual.
+//! The SNDK pool's oracle, priced every slot based on Binance's SNDK-USDT perp.
 
 use anyhow::{Context, Result};
 use simulator_api::{AccountData, EncodedBinary};
 
 use crate::{SLOT_COUNT, START_SLOT};
 
-/// Unix milliseconds of the first and last slot's blocks, which every slot's update time is spread
-/// between.
+/// Unix milliseconds of the testing range, hardcoded from the start and end slot.
 const START_MS: i64 = 1790703321000;
 const END_MS: i64 = 1790706003000;
 
-/// Binance SNDKUSDT 1m closes over the range, from the slot each minute closed at.
+/// Binance SNDK-USDT 1m closes over the test range, hardcoded from the slot each minute closed at.
+/// (Format is slot number + SNDK price in USD.)
 const PRICES: &[(u64, f64)] = &[
     (451710501, 1712.22),
     (451710646, 1713.8),
@@ -60,8 +60,10 @@ const PRICES: &[(u64, f64)] = &[
     (451720490, 1716.33),
 ];
 
-/// TaurusFi oracle layout: 48-byte entries led by an f64 price, then the update's slot (twice) and
-/// unix milliseconds.
+/// TaurusFi oracle layout (48-byte entry):
+///     - f64 price
+///     - the update's slot (twice)
+///     - unix milliseconds
 const ENTRY_LEN: usize = 48;
 const UPDATE_SLOTS: [usize; 2] = [480, 488];
 const UPDATE_MILLIS: usize = 496;
