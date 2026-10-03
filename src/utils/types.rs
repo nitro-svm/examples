@@ -52,6 +52,8 @@ pub struct TxWithMeta {
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 #[repr(u8)]
 pub enum TitanVenueDiscriminant {
+    /// Orca's concentrated-liquidity pools — the Titan IDL calls them `Whirlpools`.
+    Whirlpools = 2,
     ZeroFi = 13,
     HumidiFi = 28,
     GoonFi = 35,
@@ -63,6 +65,7 @@ pub enum TitanVenueDiscriminant {
 impl TitanVenueDiscriminant {
     pub fn from_u8(disc: u8) -> Result<Self> {
         match disc {
+            2 => Ok(Self::Whirlpools),
             13 => Ok(Self::ZeroFi),
             23 => Ok(Self::Tessera),
             28 => Ok(Self::HumidiFi),
@@ -76,6 +79,7 @@ impl TitanVenueDiscriminant {
     /// Short lowercase venue name, used for default output filenames.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::Whirlpools => "orca",
             Self::ZeroFi => "zerofi",
             Self::HumidiFi => "humidifi",
             Self::GoonFi => "goonfi",
@@ -87,6 +91,7 @@ impl TitanVenueDiscriminant {
 
     pub fn get_program_id(self) -> Address {
         let program_id = match self {
+            Self::Whirlpools => "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",
             Self::ZeroFi => "ZERor4xhbUycZ6gb9ntrhqscUcZmAbQDjEAtCf4hbZY",
             Self::HumidiFi => "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp",
             Self::GoonFi => "goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdBUL17BnS5j",

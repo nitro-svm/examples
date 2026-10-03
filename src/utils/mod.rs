@@ -9,3 +9,4 @@ pub mod price;
 pub mod range;
 pub mod session;
 pub mod types;
+pub mod whirlpool;
