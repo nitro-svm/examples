@@ -35,6 +35,10 @@ There's always latency between quote and execution, but for a retail user swappi
 This example captures swaps for the specified router and replays each one against the next 50 slots to calculate empirically how fast output decays with landing latency.
 This helps applications gauge the router with the most stable routes, and for routers to understand which venues have the most stable quotes.
 
+## [Scheduled Fills](./src/bin/scheduled_fills)
+
+A provider's quote is priced at one slot, but what matters is what its transaction pays when it lands. This example executes each provider-built swap transaction at its quote slot and the 10 slots after, and records the fill for every provider, pair, and size next to the quoted and minimum output.
+
 ## [Capture Regressions](./src/bin/regression_test)
 
 Devnet doesn't reveal what a program upgrade does to real users. This example replays historical
