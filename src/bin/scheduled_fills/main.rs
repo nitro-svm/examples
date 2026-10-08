@@ -10,7 +10,7 @@ use backtest_example::utils::accounts::{
 };
 use backtest_example::utils::connection::ConnectionArgs;
 use backtest_example::utils::parse::{WSOL_MINT, derive_ata, extract_signer};
-use backtest_example::utils::session::{drive_to_completion, start};
+use backtest_example::utils::session::drive_to_completion;
 
 use std::collections::BTreeMap;
 use std::io::{BufRead as _, BufReader, BufWriter, Write as _};
@@ -21,7 +21,7 @@ use base64::engine::general_purpose::STANDARD;
 use clap::Parser;
 use serde::Deserialize;
 use simulator_api::{AccountModifications, ActionAnchor, ActionKind, ScheduledAction};
-use simulator_client::{CreateSession, ManagedEvent};
+use simulator_client::{CreateSession, ManagedBacktestSession, ManagedEvent, backtest_ws_url};
 use solana_account_decoder::UiAccount;
 use solana_address::Address;
 use solana_transaction::versioned::VersionedTransaction;
@@ -213,7 +213,10 @@ async fn run(cli: &Cli, samples: &[Sample]) -> Result<Vec<Fill>> {
         .build()
         .into_request()
         .context("building create-session request")?;
-    let mut session = start(&cli.conn, create).await?;
+    let ws_url = backtest_ws_url(&cli.conn.url);
+    let mut session = ManagedBacktestSession::start(ws_url, cli.conn.api_key.clone(), create)
+        .await
+        .context("starting managed session")?;
     session.subscribe_actions();
 
     let mut fills = Vec::new();
