@@ -1,3 +1,6 @@
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use anyhow::{Context, Result};
 use solana_account::Account;
 use solana_commitment_config::CommitmentConfig;
@@ -9,8 +12,13 @@ use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 use super::parse::SOLANA_RPC;
 use super::types::{BalanceDiffs, TransactionTokenBalanceSerde, TxWithMeta};
 
+/// `SOLANA_RPC_URL` (e.g. a Helius endpoint) if set, otherwise the public mainnet RPC.
 fn rpc_client() -> RpcClient {
-    RpcClient::new(SOLANA_RPC.to_string())
+    let url = std::env::var("SOLANA_RPC_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .unwrap_or_else(|| SOLANA_RPC.to_string());
+    RpcClient::new(url)
 }
 
 /// All transactions (with metadata) confirmed in `slot`, fetched from a public
@@ -94,10 +102,18 @@ pub async fn get_account_info(pubkey: &str) -> Result<Option<Account>> {
         .value)
 }
 
-/// The SPL token program that owns `mint` (legacy Token or Token-2022).
+/// The SPL token program that owns `mint` (legacy Token or Token-2022). Cached per mint,
+/// since a mint's owner never changes and callers look up the same few mints repeatedly.
 pub async fn get_mint_token_program(mint: &str) -> Result<String> {
-    get_account_info(mint)
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(program) = cache.lock().unwrap().get(mint) {
+        return Ok(program.clone());
+    }
+    let program = get_account_info(mint)
         .await?
         .map(|account| account.owner.to_string())
-        .with_context(|| format!("mint {mint} not found"))
+        .with_context(|| format!("mint {mint} not found"))?;
+    cache.lock().unwrap().insert(mint.to_string(), program.clone());
+    Ok(program)
 }

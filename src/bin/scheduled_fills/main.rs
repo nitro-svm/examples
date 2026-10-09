@@ -203,6 +203,9 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
             Ok(action) => actions.push(action),
             Err(e) => eprintln!("[skip] {} {}: {e:#}", sample.provider, sample.sample_id),
         }
+        if (i + 1) % 500 == 0 {
+            eprintln!("[build] {}/{} actions", i + 1, samples.len());
+        }
     }
     eprintln!("[session] registering {} actions", actions.len());
 

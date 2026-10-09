@@ -33,6 +33,7 @@ Then run it over a slot range the deployment serves (`sim ranges`):
 
 ```bash
 export SIMULATOR_API_KEY=<key>
+export SOLANA_RPC_URL=<helius url>  # optional; mint lookups fall back to the public mainnet RPC
 cargo run --bin scheduled_fills -- \
   --input samples.jsonl --start-slot <start> --end-slot <end> --window 10
 ```
