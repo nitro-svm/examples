@@ -1,8 +1,8 @@
 //! Execute provider-built swap transactions at their quote slot and the slots after it.
 //!
-//! Each input sample is a quote a provider returned at `provider_context_slot`, along with the
+//! Each input sample is a quote a provider returned at `rpc_slot`, along with the
 //! transaction it built. One `ScheduledAction` per sample fires that transaction after
-//! `provider_context_slot ..= provider_context_slot + window`, and the `ActionResult`
+//! `rpc_slot ..= rpc_slot + window`, and the `ActionResult`
 //! notifications it produces are the fills, keyed back to the sample by the action's label.
 
 use backtest_example::utils::accounts::{
@@ -62,7 +62,9 @@ struct Sample {
     out_amount: u64,
     /// Null for providers that don't report one.
     min_out_amount: Option<u64>,
-    provider_context_slot: u64,
+    /// The sampler's slot when the quote was requested, shared by every provider for a
+    /// `sample_id`. Only some providers report their own context slot, so it's the common anchor.
+    rpc_slot: u64,
     transaction: String,
 }
 
@@ -91,7 +93,7 @@ fn read_samples(cli: &Cli) -> Result<Vec<Sample>> {
             continue;
         }
         let sample: Sample = serde_json::from_str(&line).context("parse sample")?;
-        let slot = sample.provider_context_slot;
+        let slot = sample.rpc_slot;
         if slot >= cli.start_slot && slot + cli.window <= cli.end_slot {
             samples.push(sample);
         }
@@ -146,7 +148,7 @@ async fn build_action(sample: &Sample, window: u64, label: String) -> Result<Sch
     }
 
     let slots: Vec<u64> =
-        (sample.provider_context_slot..=sample.provider_context_slot + window).collect();
+        (sample.rpc_slot..=sample.rpc_slot + window).collect();
     // The provider's own min_out is kept: a fill that would breach it should fail, as it would onchain.
     let encoded = STANDARD.encode(bincode::serialize(&tx)?);
     Ok(ScheduledAction {
@@ -232,9 +234,19 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
     let mut rows = 0;
     let mut write_err = None;
     let slot_count = cli.end_slot - cli.start_slot;
+    let mut next_progress = cli.start_slot + 1_000;
     let result = drive_to_completion(&mut session, slot_count, |event| {
-        let ManagedEvent::ActionResult(notification) = event else {
-            return;
+        let notification = match event {
+            ManagedEvent::ActionResult(notification) => notification,
+            ManagedEvent::Slot(slot) if slot >= next_progress => {
+                eprintln!(
+                    "[slot] {slot} ({}/{slot_count}), {rows} rows written",
+                    slot - cli.start_slot
+                );
+                next_progress = slot - slot % 1_000 + 1_000;
+                return;
+            }
+            _ => return,
         };
         let Some(sample) = notification
             .label
@@ -263,7 +275,7 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
             in_amount: sample.in_amount,
             quoted_out: sample.out_amount,
             min_out: sample.min_out_amount,
-            quote_slot: sample.provider_context_slot,
+            quote_slot: sample.rpc_slot,
             exec_slot: notification.slot,
             filled_out,
             error,
