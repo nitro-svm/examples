@@ -21,7 +21,60 @@ pub const JUPITER_V6: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
 pub const JUP_FEE_AUTHORITY: &str = "45ruCyfdRkWpRNGEqWzjCiXRHkZs8WXCLQ67Pnpye7Hp";
 
 pub const TITAN_PROGRAM: &str = "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT";
+pub const COMPUTE_BUDGET_PROGRAM: &str = "ComputeBudget111111111111111111111111111111";
+/// `ComputeBudgetInstruction::SetComputeUnitLimit` tag; followed by the limit as u32 LE.
+const SET_COMPUTE_UNIT_LIMIT: u8 = 2;
 const TITAN_SPLIT_EVENT_DISCRIMINANT: [u8; 8] = [0xb7, 0x1c, 0x17, 0x87, 0xad, 0x7f, 0x7c, 0xea];
+
+// ── compute budget ──────────────────────────────────────────────────────────
+
+/// Set `tx`'s compute unit limit to `units`: rewrites an existing `SetComputeUnitLimit`, or
+/// appends one for transactions that set none (and so get the 200k-per-instruction default).
+/// Appending keeps existing instruction indices, so error messages still point at the same one.
+pub fn set_compute_unit_limit(tx: &mut VersionedTransaction, units: u32) -> Result<()> {
+    let mut data = vec![SET_COMPUTE_UNIT_LIMIT];
+    data.extend_from_slice(&units.to_le_bytes());
+    let program = COMPUTE_BUDGET_PROGRAM.parse()?;
+
+    let (header, keys, ixs) = match &mut tx.message {
+        VersionedMessage::Legacy(msg) => (&mut msg.header, &mut msg.account_keys, &mut msg.instructions),
+        VersionedMessage::V0(msg) => (&mut msg.header, &mut msg.account_keys, &mut msg.instructions),
+        VersionedMessage::V1(msg) => {
+            msg.config.compute_unit_limit = Some(units);
+            return Ok(());
+        }
+    };
+
+    if let Some(idx) = keys.iter().position(|k| *k == program) {
+        let idx = idx as u8;
+        match ixs
+            .iter_mut()
+            .find(|ix| ix.program_id_index == idx && ix.data.first() == Some(&SET_COMPUTE_UNIT_LIMIT))
+        {
+            Some(ix) => ix.data = data,
+            None => ixs.push(CompiledInstruction::new_from_raw_parts(idx, data, vec![])),
+        }
+        return Ok(());
+    }
+
+    // Add the program as the last static key (unsigned, read-only). Lookup-table accounts are
+    // indexed after the static keys, so every index at or past the insertion point shifts by one.
+    let idx = u8::try_from(keys.len()).context("too many static keys to add ComputeBudget")?;
+    let shift = |i: &mut u8| -> Result<()> {
+        if *i >= idx {
+            *i = i.checked_add(1).context("account index overflow adding ComputeBudget")?;
+        }
+        Ok(())
+    };
+    for ix in ixs.iter_mut() {
+        shift(&mut ix.program_id_index)?;
+        ix.accounts.iter_mut().try_for_each(shift)?;
+    }
+    keys.push(program);
+    header.num_readonly_unsigned_accounts += 1;
+    ixs.push(CompiledInstruction::new_from_raw_parts(idx, data, vec![]));
+    Ok(())
+}
 
 // ── Titan v3 single-venue patching ──────────────────────────────────────────
 

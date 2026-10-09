@@ -9,7 +9,9 @@ use backtest_example::utils::accounts::{
     empty_token_override, native_override, native_seed_lamports, token_override,
 };
 use backtest_example::utils::connection::ConnectionArgs;
-use backtest_example::utils::parse::{WSOL_MINT, derive_ata, extract_signer};
+use backtest_example::utils::parse::{
+    WSOL_MINT, derive_ata, extract_signer, set_compute_unit_limit,
+};
 use backtest_example::utils::session::drive_to_completion;
 
 use std::collections::BTreeMap;
@@ -45,6 +47,10 @@ struct Cli {
     window: u64,
     #[arg(long, default_value = "fills.csv")]
     output: String,
+    /// Compute unit limit set on every transaction. Titan's transactions set none, so they would
+    /// otherwise run on the 200k default; other providers' own limits are replaced.
+    #[arg(long, default_value_t = 1_400_000)]
+    cu_limit: u32,
     /// Execute every historical transaction instead of rebuilding state from recorded
     /// account deltas (the default). Much slower; for ranges with only `transactions` data.
     #[arg(long)]
@@ -79,7 +85,10 @@ struct Fill {
     quote_slot: u64,
     exec_slot: u64,
     filled_out: Option<u64>,
+    units_consumed: Option<u64>,
     error: Option<String>,
+    /// Last program log lines of a failed run, which name the program and reason behind `error`.
+    log_tail: Option<String>,
 }
 
 // ── input ────────────────────────────────────────────────────────────────────
@@ -115,8 +124,14 @@ fn decode_transaction(encoded: &str) -> Result<VersionedTransaction> {
 /// Fund the signer with `in_amount` of the input mint and zero the output side, so the
 /// returned post-execution balance *is* the fill. A wSOL input is funded both as native SOL
 /// and as a wSOL ATA, since providers differ on whether the transaction wraps its own SOL.
-async fn build_action(sample: &Sample, window: u64, label: String) -> Result<ScheduledAction> {
-    let tx = decode_transaction(&sample.transaction)?;
+async fn build_action(
+    sample: &Sample,
+    window: u64,
+    cu_limit: u32,
+    label: String,
+) -> Result<ScheduledAction> {
+    let mut tx = decode_transaction(&sample.transaction)?;
+    set_compute_unit_limit(&mut tx, cu_limit)?;
     let signer = extract_signer(&tx)?;
     let mut overrides = BTreeMap::new();
 
@@ -205,7 +220,7 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
     // action is labeled with its sample's index instead.
     let mut actions = Vec::with_capacity(samples.len());
     for (i, sample) in samples.iter().enumerate() {
-        match build_action(sample, cli.window, i.to_string()).await {
+        match build_action(sample, cli.window, cli.cu_limit, i.to_string()).await {
             Ok(action) => actions.push(action),
             Err(e) => eprintln!("[skip] {} {}: {e:#}", sample.provider, sample.sample_id),
         }
@@ -256,10 +271,11 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
         else {
             return;
         };
-        let error = notification
-            .transaction_outcomes
-            .first()
-            .and_then(|o| o.err.clone());
+        let outcome = notification.transaction_outcomes.first();
+        let error = outcome.and_then(|o| o.err.clone());
+        let log_tail = outcome
+            .filter(|o| o.err.is_some())
+            .map(|o| o.logs[o.logs.len().saturating_sub(LOG_TAIL_LINES)..].join(" | "));
         let filled_out = error
             .is_none()
             .then(|| read_fill(&sample.output_mint, &notification.accounts));
@@ -278,7 +294,9 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
             quote_slot: sample.rpc_slot,
             exec_slot: notification.slot,
             filled_out,
+            units_consumed: outcome.map(|o| o.units_consumed),
             error,
+            log_tail,
         };
         match out.write(&fill) {
             Ok(()) => rows += 1,
@@ -298,6 +316,16 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
 
 // ── output ───────────────────────────────────────────────────────────────────
 
+/// Log lines kept per failed run.
+const LOG_TAIL_LINES: usize = 6;
+
+/// Quoted so commas in error strings and logs don't break the CSV.
+fn csv_quoted(field: Option<&str>) -> String {
+    field
+        .map(|f| format!("\"{}\"", f.replace('"', "'")))
+        .unwrap_or_default()
+}
+
 /// CSV of fills, flushed per row so a session that dies partway still leaves its rows on disk.
 struct FillWriter(BufWriter<std::fs::File>);
 
@@ -307,7 +335,7 @@ impl FillWriter {
         let mut w = BufWriter::new(file);
         writeln!(
             w,
-            "sample_id,provider,input_mint,output_mint,in_amount,quoted_out,min_out,quote_slot,exec_slot,slot_offset,filled_out,error"
+            "sample_id,provider,input_mint,output_mint,in_amount,quoted_out,min_out,quote_slot,exec_slot,slot_offset,filled_out,units_consumed,error,log_tail"
         )?;
         w.flush()?;
         Ok(Self(w))
@@ -316,7 +344,7 @@ impl FillWriter {
     fn write(&mut self, f: &Fill) -> Result<()> {
         writeln!(
             self.0,
-            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
             f.sample_id,
             f.provider,
             f.input_mint,
@@ -328,11 +356,9 @@ impl FillWriter {
             f.exec_slot,
             f.exec_slot - f.quote_slot,
             f.filled_out.map(|v| v.to_string()).unwrap_or_default(),
-            // Quoted so commas in error strings don't break the CSV.
-            f.error
-                .as_deref()
-                .map(|e| format!("\"{}\"", e.replace('"', "'")))
-                .unwrap_or_default(),
+            f.units_consumed.map(|v| v.to_string()).unwrap_or_default(),
+            csv_quoted(f.error.as_deref()),
+            csv_quoted(f.log_tail.as_deref()),
         )?;
         self.0.flush()?;
         Ok(())

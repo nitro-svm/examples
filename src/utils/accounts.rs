@@ -9,7 +9,7 @@ use solana_address::Address;
 use solana_pubkey::Pubkey;
 
 use super::chain::get_mint_token_program;
-use super::parse::{TITAN_PROGRAM, WSOL_MINT, derive_ata};
+use super::parse::{TITAN_PROGRAM, WSOL_MINT, derive_ata_with_program};
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const ATA_RENT_EXEMPT: u64 = 2_039_280;
@@ -143,7 +143,8 @@ pub async fn token_override(
     mint: &str,
     amount: u64,
 ) -> Result<(Address, AccountData)> {
-    let ata = derive_ata(owner, mint).context("derive_ata failed")?;
+    let token_program = get_mint_token_program(mint).await?;
+    let ata = derive_ata_with_program(owner, mint, &token_program).context("derive_ata failed")?;
     let owner_addr: Address = owner.to_string().parse()?;
 
     let account_data = if amount == 0 {
@@ -155,7 +156,6 @@ pub async fn token_override(
             space: 0,
         }
     } else {
-        let token_program = get_mint_token_program(mint).await?;
         make_token_account(&owner_addr, mint, amount, &token_program)?
     };
 
@@ -167,9 +167,11 @@ pub async fn token_override(
 /// already exists on-chain (unlike [`token_override`]'s `amount = 0`, which
 /// wipes it to "doesn't exist" and breaks any tx that doesn't recreate it).
 pub async fn empty_token_override(owner: &Pubkey, mint: &str) -> Result<(Address, AccountData)> {
-    let ata = derive_ata(owner, mint).context("derive_ata failed")?;
-    let owner_addr: Address = owner.to_string().parse()?;
+    // The ATA address is seeded with the mint's owning program, so a Token-2022 mint's ATA
+    // differs from the legacy-derived one.
     let token_program = get_mint_token_program(mint).await?;
+    let ata = derive_ata_with_program(owner, mint, &token_program).context("derive_ata failed")?;
+    let owner_addr: Address = owner.to_string().parse()?;
     Ok((
         ata.to_string().parse::<Address>()?,
         make_token_account(&owner_addr, mint, 0, &token_program)?,
