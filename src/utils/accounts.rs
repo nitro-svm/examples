@@ -13,7 +13,9 @@ use super::parse::{TITAN_PROGRAM, WSOL_MINT, derive_ata_with_program};
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
 const ATA_RENT_EXEMPT: u64 = 2_039_280;
-const FEE_BUFFER: u64 = 1_000_000;
+/// Extra SOL for the signer to pay fees and rent on accounts a route creates (ATAs, wSOL,
+/// intermediate and Token-2022 accounts), which can exceed 0.01 SOL.
+const FEE_BUFFER: u64 = 100_000_000;
 
 /// Anchor discriminator of Titan's `TokenLedger` account (sha256("account:TokenLedger")[..8]).
 const TOKEN_LEDGER_DISCRIMINATOR: [u8; 8] = [156, 247, 9, 188, 54, 108, 85, 77];
