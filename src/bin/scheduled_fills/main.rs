@@ -45,6 +45,10 @@ struct Cli {
     window: u64,
     #[arg(long, default_value = "fills.csv")]
     output: String,
+    /// Execute every historical transaction instead of rebuilding state from recorded
+    /// account deltas (the default). Much slower; for ranges with only `transactions` data.
+    #[arg(long)]
+    replay_transactions: bool,
 }
 
 /// One row of the quote-sample export.
@@ -214,6 +218,7 @@ async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usiz
         .end_slot(cli.end_slot)
         .disconnect_timeout_secs(900u16)
         .capacity_wait_timeout_secs(900u16)
+        .replay_account_state(!cli.replay_transactions)
         .actions(actions)
         .build()
         .into_request()
