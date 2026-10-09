@@ -56,7 +56,8 @@ struct Sample {
     output_mint: String,
     in_amount: u64,
     out_amount: u64,
-    min_out_amount: u64,
+    /// Null for providers that don't report one.
+    min_out_amount: Option<u64>,
     provider_context_slot: u64,
     transaction: String,
 }
@@ -68,7 +69,7 @@ struct Fill {
     output_mint: String,
     in_amount: u64,
     quoted_out: u64,
-    min_out: u64,
+    min_out: Option<u64>,
     quote_slot: u64,
     exec_slot: u64,
     filled_out: Option<u64>,
@@ -192,7 +193,8 @@ fn read_fill(output_mint: &str, accounts: &[Option<serde_json::Value>]) -> u64 {
     }
 }
 
-async fn run(cli: &Cli, samples: &[Sample]) -> Result<Vec<Fill>> {
+/// Runs the session, writing each fill to `out` as it arrives. Returns the number of rows written.
+async fn run(cli: &Cli, samples: &[Sample], out: &mut FillWriter) -> Result<usize> {
     // `sample_id` is shared by every provider's quote for the same pair, size, and slot, so each
     // action is labeled with its sample's index instead.
     let mut actions = Vec::with_capacity(samples.len());
@@ -219,7 +221,8 @@ async fn run(cli: &Cli, samples: &[Sample]) -> Result<Vec<Fill>> {
         .context("starting managed session")?;
     session.subscribe_actions();
 
-    let mut fills = Vec::new();
+    let mut rows = 0;
+    let mut write_err = None;
     let slot_count = cli.end_slot - cli.start_slot;
     let result = drive_to_completion(&mut session, slot_count, |event| {
         let ManagedEvent::ActionResult(notification) = event else {
@@ -244,7 +247,7 @@ async fn run(cli: &Cli, samples: &[Sample]) -> Result<Vec<Fill>> {
             "  {} {} slot={} quoted={} filled={:?}",
             sample.provider, sample.sample_id, notification.slot, sample.out_amount, filled_out
         );
-        fills.push(Fill {
+        let fill = Fill {
             sample_id: sample.sample_id.clone(),
             provider: sample.provider.clone(),
             input_mint: sample.input_mint.clone(),
@@ -256,25 +259,43 @@ async fn run(cli: &Cli, samples: &[Sample]) -> Result<Vec<Fill>> {
             exec_slot: notification.slot,
             filled_out,
             error,
-        });
+        };
+        match out.write(&fill) {
+            Ok(()) => rows += 1,
+            Err(e) => {
+                write_err.get_or_insert(e);
+            }
+        }
     })
     .await;
     session.shutdown().await;
     result?;
-    Ok(fills)
+    if let Some(e) = write_err {
+        return Err(e.context("writing fills"));
+    }
+    Ok(rows)
 }
 
 // ── output ───────────────────────────────────────────────────────────────────
 
-fn write_output(path: &str, fills: &[Fill]) -> Result<()> {
-    let mut w = BufWriter::new(std::fs::File::create(path)?);
-    writeln!(
-        w,
-        "sample_id,provider,input_mint,output_mint,in_amount,quoted_out,min_out,quote_slot,exec_slot,slot_offset,filled_out,error"
-    )?;
-    for f in fills {
+/// CSV of fills, flushed per row so a session that dies partway still leaves its rows on disk.
+struct FillWriter(BufWriter<std::fs::File>);
+
+impl FillWriter {
+    fn create(path: &str) -> Result<Self> {
+        let file = std::fs::File::create(path).with_context(|| format!("create {path}"))?;
+        let mut w = BufWriter::new(file);
         writeln!(
             w,
+            "sample_id,provider,input_mint,output_mint,in_amount,quoted_out,min_out,quote_slot,exec_slot,slot_offset,filled_out,error"
+        )?;
+        w.flush()?;
+        Ok(Self(w))
+    }
+
+    fn write(&mut self, f: &Fill) -> Result<()> {
+        writeln!(
+            self.0,
             "{},{},{},{},{},{},{},{},{},{},{},{}",
             f.sample_id,
             f.provider,
@@ -282,7 +303,7 @@ fn write_output(path: &str, fills: &[Fill]) -> Result<()> {
             f.output_mint,
             f.in_amount,
             f.quoted_out,
-            f.min_out,
+            f.min_out.map(|v| v.to_string()).unwrap_or_default(),
             f.quote_slot,
             f.exec_slot,
             f.exec_slot - f.quote_slot,
@@ -293,8 +314,9 @@ fn write_output(path: &str, fills: &[Fill]) -> Result<()> {
                 .map(|e| format!("\"{}\"", e.replace('"', "'")))
                 .unwrap_or_default(),
         )?;
+        self.0.flush()?;
+        Ok(())
     }
-    Ok(())
 }
 
 #[tokio::main]
@@ -315,8 +337,8 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let fills = run(&cli, &samples).await?;
-    write_output(&cli.output, &fills)?;
-    eprintln!("[done] wrote {} rows to {}", fills.len(), cli.output);
+    let mut out = FillWriter::create(&cli.output)?;
+    let rows = run(&cli, &samples, &mut out).await?;
+    eprintln!("[done] wrote {} rows to {}", rows, cli.output);
     Ok(())
 }
