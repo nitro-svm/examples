@@ -8,7 +8,10 @@ use solana_account::Account;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use super::chain::get_mint_token_program;
+use spl_token_2022_interface::extension::{AccountType, ExtensionType};
+use spl_token_2022_interface::state::Account as TokenAccount;
+
+use super::chain::get_mint_info;
 use super::parse::{TITAN_PROGRAM, WSOL_MINT, derive_ata_with_program};
 
 pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
@@ -73,12 +76,63 @@ pub fn make_token_account(
     amount: u64,
     token_program: &str,
 ) -> Result<AccountData> {
-    let mut data = [0u8; 165];
+    make_token_account_with_extensions(owner, mint, amount, token_program, &[])
+}
+
+/// Rent-exempt minimum for an account of `len` bytes (128 bytes of metadata, 2 years of rent).
+fn rent_exempt(len: usize) -> u64 {
+    (128 + len as u64) * 3_480 * 2
+}
+
+/// Size of a freshly initialized account extension, all of whose bytes start at zero. Only the
+/// extensions `get_required_init_account_extensions` and the ATA program add are listed.
+fn account_extension_len(extension: ExtensionType) -> Result<usize> {
+    Ok(match extension {
+        ExtensionType::TransferFeeAmount => 8,
+        ExtensionType::TransferHookAccount => 1,
+        ExtensionType::ImmutableOwner
+        | ExtensionType::NonTransferableAccount
+        | ExtensionType::PausableAccount => 0,
+        other => anyhow::bail!("unsupported Token-2022 account extension {other:?}"),
+    })
+}
+
+/// [`make_token_account`] carrying Token-2022 account `extensions` (from
+/// [`get_mint_info`](super::chain::get_mint_info)). Token-2022 rejects an account that lacks an
+/// extension its mint requires — e.g. `TransferFeeAmount` for a transfer-fee mint — with
+/// `InvalidState`, so a plain 165-byte account only works for mints without such extensions.
+pub fn make_token_account_with_extensions(
+    owner: &Address,
+    mint: &str,
+    amount: u64,
+    token_program: &str,
+    extensions: &[ExtensionType],
+) -> Result<AccountData> {
+    let mut data = vec![0u8; 165];
     data[0..32].copy_from_slice(mint.parse::<Pubkey>()?.as_ref());
     data[32..64].copy_from_slice(owner.as_ref());
     data[64..72].copy_from_slice(&amount.to_le_bytes());
     data[108] = 1; // state = Initialized
-    let mut lamports = ATA_RENT_EXEMPT;
+
+    if !extensions.is_empty() {
+        // Account-type byte right after the base account, then one TLV entry per extension:
+        // u16 type, u16 length, zeroed value.
+        data.push(AccountType::Account.into());
+        for &extension in extensions {
+            let len = account_extension_len(extension)?;
+            data.extend_from_slice(&u16::from(extension).to_le_bytes());
+            data.extend_from_slice(&(len as u16).to_le_bytes());
+            data.resize(data.len() + len, 0);
+        }
+        let expected = ExtensionType::try_calculate_account_len::<TokenAccount>(extensions)
+            .map_err(|e| anyhow::anyhow!("Token-2022 account length: {e:?}"))?;
+        anyhow::ensure!(
+            data.len() == expected,
+            "Token-2022 account layout is {} bytes, expected {expected}",
+            data.len()
+        );
+    }
+    let mut lamports = rent_exempt(data.len());
 
     if mint == WSOL_MINT {
         // is_native = Some(RENT_EXEMPT): bytes [109..113] = option tag, [113..121] = value.
@@ -89,11 +143,11 @@ pub fn make_token_account(
     }
 
     Ok(AccountData {
+        space: data.len() as u64,
         data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
         executable: false,
         lamports,
         owner: token_program.parse().context("parse token program")?,
-        space: 165,
     })
 }
 
@@ -145,8 +199,9 @@ pub async fn token_override(
     mint: &str,
     amount: u64,
 ) -> Result<(Address, AccountData)> {
-    let token_program = get_mint_token_program(mint).await?;
-    let ata = derive_ata_with_program(owner, mint, &token_program).context("derive_ata failed")?;
+    let info = get_mint_info(mint).await?;
+    let ata =
+        derive_ata_with_program(owner, mint, &info.token_program).context("derive_ata failed")?;
     let owner_addr: Address = owner.to_string().parse()?;
 
     let account_data = if amount == 0 {
@@ -158,7 +213,13 @@ pub async fn token_override(
             space: 0,
         }
     } else {
-        make_token_account(&owner_addr, mint, amount, &token_program)?
+        make_token_account_with_extensions(
+            &owner_addr,
+            mint,
+            amount,
+            &info.token_program,
+            &info.account_extensions,
+        )?
     };
 
     Ok((ata.to_string().parse::<Address>()?, account_data))
@@ -171,12 +232,19 @@ pub async fn token_override(
 pub async fn empty_token_override(owner: &Pubkey, mint: &str) -> Result<(Address, AccountData)> {
     // The ATA address is seeded with the mint's owning program, so a Token-2022 mint's ATA
     // differs from the legacy-derived one.
-    let token_program = get_mint_token_program(mint).await?;
-    let ata = derive_ata_with_program(owner, mint, &token_program).context("derive_ata failed")?;
+    let info = get_mint_info(mint).await?;
+    let ata =
+        derive_ata_with_program(owner, mint, &info.token_program).context("derive_ata failed")?;
     let owner_addr: Address = owner.to_string().parse()?;
     Ok((
         ata.to_string().parse::<Address>()?,
-        make_token_account(&owner_addr, mint, 0, &token_program)?,
+        make_token_account_with_extensions(
+            &owner_addr,
+            mint,
+            0,
+            &info.token_program,
+            &info.account_extensions,
+        )?,
     ))
 }
 

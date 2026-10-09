@@ -32,6 +32,7 @@ solana-message = "4.1.1"
 solana-transaction = "4.1.1"
 solana-transaction-error = "3.2.0"
 solana-transaction-status = "4.1.0"
+spl-token-2022-interface = "3.1.1"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"

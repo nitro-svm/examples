@@ -9,7 +9,10 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::config::RpcBlockConfig;
 use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 
-use super::parse::SOLANA_RPC;
+use spl_token_2022_interface::extension::{BaseStateWithExtensions as _, ExtensionType, StateWithExtensions};
+use spl_token_2022_interface::state::Mint;
+
+use super::parse::{SOLANA_RPC, TOKEN_2022_PROGRAM};
 use super::types::{BalanceDiffs, TransactionTokenBalanceSerde, TxWithMeta};
 
 /// `SOLANA_RPC_URL` (e.g. a Helius endpoint) if set, otherwise the public mainnet RPC.
@@ -102,18 +105,53 @@ pub async fn get_account_info(pubkey: &str) -> Result<Option<Account>> {
         .value)
 }
 
-/// The SPL token program that owns `mint` (legacy Token or Token-2022). Cached per mint,
-/// since a mint's owner never changes and callers look up the same few mints repeatedly.
-pub async fn get_mint_token_program(mint: &str) -> Result<String> {
-    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+/// What it takes to build a token account for a mint.
+#[derive(Clone, Debug)]
+pub struct MintInfo {
+    /// The owning token program (legacy Token or Token-2022).
+    pub token_program: String,
+    /// Token-2022 extensions an ATA of this mint carries; empty for legacy mints.
+    pub account_extensions: Vec<ExtensionType>,
+}
+
+/// [`MintInfo`] for `mint`. Cached per mint, since a mint's owner and extensions don't change
+/// and callers look up the same few mints repeatedly.
+pub async fn get_mint_info(mint: &str) -> Result<MintInfo> {
+    static CACHE: OnceLock<Mutex<HashMap<String, MintInfo>>> = OnceLock::new();
     let cache = CACHE.get_or_init(Default::default);
-    if let Some(program) = cache.lock().unwrap().get(mint) {
-        return Ok(program.clone());
+    if let Some(info) = cache.lock().unwrap().get(mint) {
+        return Ok(info.clone());
     }
-    let program = get_account_info(mint)
+    let account = get_account_info(mint)
         .await?
-        .map(|account| account.owner.to_string())
         .with_context(|| format!("mint {mint} not found"))?;
-    cache.lock().unwrap().insert(mint.to_string(), program.clone());
-    Ok(program)
+    let token_program = account.owner.to_string();
+    let account_extensions = if token_program == TOKEN_2022_PROGRAM {
+        let state = StateWithExtensions::<Mint>::unpack(&account.data)
+            .map_err(|e| anyhow::anyhow!("unpack Token-2022 mint {mint}: {e:?}"))?;
+        let mint_extensions = state
+            .get_extension_types()
+            .map_err(|e| anyhow::anyhow!("read extensions of mint {mint}: {e:?}"))?;
+        #[allow(deprecated)]
+        let mut extensions = ExtensionType::get_required_init_account_extensions(&mint_extensions);
+        // The ATA program always initializes Token-2022 ATAs as immutable-owner.
+        extensions.push(ExtensionType::ImmutableOwner);
+        let mut unique = Vec::new();
+        for extension in extensions {
+            if !unique.contains(&extension) {
+                unique.push(extension);
+            }
+        }
+        unique
+    } else {
+        Vec::new()
+    };
+    let info = MintInfo { token_program, account_extensions };
+    cache.lock().unwrap().insert(mint.to_string(), info.clone());
+    Ok(info)
+}
+
+/// The SPL token program that owns `mint` (legacy Token or Token-2022).
+pub async fn get_mint_token_program(mint: &str) -> Result<String> {
+    Ok(get_mint_info(mint).await?.token_program)
 }

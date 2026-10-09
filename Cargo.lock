@@ -509,6 +509,7 @@ dependencies = [
  "solana-transaction",
  "solana-transaction-error",
  "solana-transaction-status",
+ "spl-token-2022-interface",
  "tokio",
  "tracing-subscriber",
  "url",
