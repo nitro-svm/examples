@@ -40,6 +40,10 @@ This helps applications gauge the router with the most stable routes, and for ro
 Devnet doesn't reveal what a program upgrade does to real users. This example replays historical
 mainnet slots with custom program logic, runs the real transactions from those blocks against it, and reports every failure, log line, and token balance change--a regression suite whose inputs are real mainnet traffic.
 
+## [Running Pallas Alongside a Session](./src/bin/pallas)
+
+This example runs OKX's self-hosted router (Pallas) against a session paused where each swap was quoted, and simulates the route it builds where the swap landed. It ships with real swaps whose re-routed replacements failed, as a starting point for testing failure cases.
+
 ## Notes
 Please see the [documentation](https://docs.termina.technology/documentation) for a comprehensive overview of the API interface and client libraries.
 

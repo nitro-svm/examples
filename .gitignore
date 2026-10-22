@@ -3,3 +3,4 @@ target/
 *.so
 *idl.json
 *.csv
+.env

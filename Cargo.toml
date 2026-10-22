@@ -10,9 +10,10 @@ base64 = "0.22"
 bincode = "1"
 bs58 = "0.5"
 clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
 reqwest = { version = "0.12", features = ["json"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_with = "3"
@@ -21,8 +22,11 @@ simulator-client = "0.26.0"
 solana-account = "4.1.0"
 solana-account-decoder = "4.1.0"
 solana-address = "2.6.0"
+solana-address-lookup-table-interface = { version = "3.2.0", features = ["bincode", "bytemuck"] }
 solana-client = "4.1.0"
 solana-commitment-config = "3.1.1"
+solana-compute-budget-interface = "3.1.0"
+solana-instruction = "3.5.1"
 solana-loader-v3-interface = "7.0.0"
 solana-pubkey = "3"
 solana-rpc-client = "4.1.0"
@@ -35,6 +39,7 @@ solana-transaction-status = "4.1.0"
 tokio = { version = "1", features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+wincode = "0.6.2"
 
 [dev-dependencies]
 rstest = "0.26"

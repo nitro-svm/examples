@@ -1,0 +1,38 @@
+[
+  {
+    "name": "min-return-not-reached",
+    "signature": "5BNmQ8ayn4N8PdzZEm6D5JzSkoUoXD43D2yBUfiaW9wysPQZnnNhpCqoDxaW6ds5sFV96SS6W36kqNUEr21TNUoc",
+    "observed_error": "Custom 6010 (OKX MinReturnNotReached)",
+    "route": "20% Manifest | 43% StabbleStableSwap | 100% GoonfiV2 | 80% Manifest | 57% BisonFi",
+    "quote_slot": 450159984,
+    "land_slot": 450160023,
+    "request": {
+      "fromTokenAddress": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+      "toTokenAddress": "11111111111111111111111111111111",
+      "amount": "99",
+      "slippagePercent": "0",
+      "userWalletAddress": "8vcTHReohDoQn2TndkaoiUj1Ss4PE18AsY4fTH6WSNh4",
+      "expectAmountOut": "851",
+      "enableJit": false,
+      "cyclicArbitrageIntermediateTokens": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v,So11111111111111111111111111111111111111112,Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB,USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB,cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij,27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4,7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs,J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn,SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3,3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh,pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn,2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH,9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump,JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN,98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g,EicWvteVi2fWepEzS3FYWsnuPoP6caZfjnKqNvydLjCH,mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So,CtzPWv73Sn1dMGVU3ZtLv9yWSyUAanBni19YWDaznnkn,JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD,METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"
+    }
+  },
+  {
+    "name": "byreal-panic",
+    "signature": "4p6wXLC7ED7FqAKiSjeLunqbbPPVf3GERVScATJUoeX9zhUGkhu3mAt8FnyJ4QaLZWdsRrVFAGYEY4oHwtzKt8eu",
+    "observed_error": "ProgramFailedToComplete (ByReal panic)",
+    "route": "52% RaydiumClmmV2 | 52% ByrealClmm3 | 48% RaydiumClmmV2 | 48% BisonFi | 100% BisonFi",
+    "quote_slot": 450160061,
+    "land_slot": 450160066,
+    "request": {
+      "fromTokenAddress": "CYPHuMmCL1GxJWa2tsPhLKykC7GrHJTCHwbXD4g5uawK",
+      "toTokenAddress": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+      "amount": "100000000",
+      "slippagePercent": "0",
+      "userWalletAddress": "5H2HkTjfJD5HBXSKRmQEsnKXMPNUJrTZoCMhj3hkMhMD",
+      "expectAmountOut": "403262785",
+      "enableJit": false,
+      "cyclicArbitrageIntermediateTokens": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v,So11111111111111111111111111111111111111112,Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB,USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB,cbbtcf3aa214zXHbiAZQwf4122FBYbraNdFqgw4iMij,27G8MtK7VtTcCHkpASjSDdkWWYfoqT6ggEuKidVJidD4,7vfCXTUXx5WJV5JADk17DUJ4ksgau7utNKj4b963voxs,J1toso1uCk3RLmjorhTtrVwY9HJ7X8V9yYac6Y7kGCPn,SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3,3NZ9JMVBmGAqocybic2c7LQCJScmgsAZ6vQqTDzcqmJh,pumpCmXqMfrsAkQ5r49WcJnRayYRqmXz6ae8H7H9Dfn,2u1tszSeqZ3qBWF3uNGPFc8TzMk2tdiwknnRMWGWjGWH,9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump,JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN,98sMhvDwXj1RQi5c5Mndm3vPe9cBqPrbLaufMXFNMh5g,EicWvteVi2fWepEzS3FYWsnuPoP6caZfjnKqNvydLjCH,mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So,CtzPWv73Sn1dMGVU3ZtLv9yWSyUAanBni19YWDaznnkn,JuprjznTrTSp2UFa3ZBUFgwdAmtZCq4MQCwysN55USD,METvsvVRapdj9cFLzq4Tr43xK4tAjQfwX76z3n6mWQL"
+    }
+  }
+]
