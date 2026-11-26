@@ -22,7 +22,7 @@ use std::sync::LazyLock;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use simulator_api::{AccountModifications, ContinueParams};
+use simulator_api::{AccountModifications, ContinueParams, token::TokenProgram};
 use simulator_client::{
     CreateSession, ManagedBacktestSession, ManagedEvent, ManagedSessionError, backtest_ws_url,
 };
@@ -96,8 +96,8 @@ pub(crate) struct Template {
     base_signer: Pubkey,
     quote_receiver: Pubkey,
     base_receiver: Pubkey,
-    quote_token_program: Address,
-    base_token_program: Address,
+    quote_token_program: TokenProgram,
+    base_token_program: TokenProgram,
     /// only used when the base mint has token-2022 extensions
     /// since a synthetic account can't replicate.
     base_account: Option<Account>,
@@ -148,10 +148,10 @@ async fn get_template(
     let quote_token_program = get_mint_token_program(quote_mint).await?;
     let base_token_program = get_mint_token_program(base_mint).await?;
     // q2b (quote->base) output lands in the quote signer's ATA for the base mint.
-    let q2b_receiver = derive_ata_with_program(&quote_signer, base_mint, &base_token_program)
+    let q2b_receiver = derive_ata_with_program(&quote_signer, base_mint, base_token_program)
         .context("derive q2b base receiver")?;
     // b2q (base->quote) output lands in the base signer's ATA for the quote mint (USDC or USDT).
-    let b2q_receiver = derive_ata_with_program(&base_signer, quote_mint, &quote_token_program)
+    let b2q_receiver = derive_ata_with_program(&base_signer, quote_mint, quote_token_program)
         .context("derive b2q quote receiver")?;
     let q2b_data = get_account_info(&q2b_receiver.to_string()).await?;
 
@@ -173,12 +173,8 @@ async fn get_template(
         base_signer,
         quote_receiver: q2b_receiver,
         base_receiver: b2q_receiver,
-        quote_token_program: quote_token_program
-            .parse()
-            .context("parse quote token program")?,
-        base_token_program: base_token_program
-            .parse()
-            .context("parse base token program")?,
+        quote_token_program,
+        base_token_program,
         base_account: q2b_data,
     })
 }
@@ -383,10 +379,10 @@ struct Cli {
     #[arg(long, env = "SIMULATOR_API_KEY")]
     api_key: String,
 
-    #[arg(long, default_value_t = 422_818_048)]
+    #[arg(long, default_value_t = 460_919_623)]
     start_slot: u64,
 
-    #[arg(long, default_value_t = 422_818_148)]
+    #[arg(long, default_value_t = 460_919_625)]
     end_slot: u64,
 
     /// Spread CSV path. Defaults to `spread_<venue>.csv` so runs don't clobber each other.

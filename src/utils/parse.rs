@@ -3,12 +3,17 @@ use std::collections::HashMap;
 use super::types::{TitanVenueDiscriminant, TransactionTokenBalanceSerde, TxWithMeta};
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use simulator_api::{BinaryEncoding, EncodedBinary, token::TokenProgram};
+use simulator_client::decode_transaction;
 use solana_message::{VersionedMessage, compiled_instruction::CompiledInstruction};
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::response::RpcSimulateTransactionResult;
 use solana_transaction::versioned::VersionedTransaction;
 
 pub const SOLANA_RPC: &str = "https://api.mainnet-beta.solana.com";
+
+/// The newest transaction version these examples decode.
+pub const MAX_SUPPORTED_TRANSACTION_VERSION: u8 = 1;
 pub const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 pub const TOKEN_2022_PROGRAM: &str = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb";
 const ASSOCIATED_TOKEN_PROGRAM: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
@@ -210,32 +215,6 @@ pub fn patch_titan_disable_positive_slippage_fee(
     *slot = none_sentinel;
 
     Ok(new_tx)
-}
-
-/// Fetch an Address Lookup Table account and return its stored addresses.
-/// ALT layout: 56-byte meta header (LOOKUP_TABLE_META_SIZE), then packed 32-byte pubkeys.
-async fn fetch_alt_addresses(alt_pubkey: &str) -> Result<Vec<Pubkey>> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0", "id": 1,
-        "method": "getAccountInfo",
-        "params": [alt_pubkey, {"encoding": "base64"}]
-    });
-    let resp: serde_json::Value = reqwest::Client::new()
-        .post(SOLANA_RPC)
-        .json(&body)
-        .send()
-        .await?
-        .json()
-        .await?;
-    let encoded = resp["result"]["value"]["data"][0]
-        .as_str()
-        .context("alt account data not found")?;
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded)?;
-    anyhow::ensure!(bytes.len() >= 56, "alt too short");
-    Ok(bytes[56..]
-        .chunks_exact(32)
-        .map(|c| Pubkey::try_from(c).unwrap())
-        .collect())
 }
 
 pub struct SwapData {
@@ -449,7 +428,7 @@ pub async fn get_titan_template_data(signature: &str) -> Result<VersionedTransac
     let body = serde_json::json!({
         "jsonrpc": "2.0", "id": 1,
         "method": "getTransaction",
-        "params": [signature, {"encoding": "base64", "maxSupportedTransactionVersion": 0}]
+        "params": [signature, {"encoding": "base64", "maxSupportedTransactionVersion": MAX_SUPPORTED_TRANSACTION_VERSION}]
     });
     let resp: serde_json::Value = reqwest::Client::new()
         .post(SOLANA_RPC)
@@ -461,11 +440,13 @@ pub async fn get_titan_template_data(signature: &str) -> Result<VersionedTransac
     let encoded = resp["result"]["transaction"][0]
         .as_str()
         .context("titan template tx not found")?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .context("base64 decode titan template tx")?;
+    let transaction = decode_transaction(&EncodedBinary::new(
+        encoded.to_string(),
+        BinaryEncoding::Base64,
+    ))
+    .context("decode titan template tx")?;
     eprintln!("[titan] loaded template: {signature}");
-    bincode::deserialize(&bytes).context("deserialize titan template tx")
+    Ok(transaction)
 }
 
 pub fn patch_titan_template_transaction(
@@ -863,7 +844,7 @@ pub fn extract_signer(tx: &VersionedTransaction) -> Result<Pubkey> {
 /// use [`derive_ata_with_program`] when the mint's owning program isn't already known
 /// to be legacy Token.
 pub fn derive_ata(wallet: &Pubkey, mint_str: &str) -> Option<Pubkey> {
-    derive_ata_with_program(wallet, mint_str, TOKEN_PROGRAM)
+    derive_ata_with_program(wallet, mint_str, TokenProgram::Token)
 }
 
 /// ATA derivation seeded with `token_program` — must be the mint's real owning program
@@ -871,10 +852,10 @@ pub fn derive_ata(wallet: &Pubkey, mint_str: &str) -> Option<Pubkey> {
 pub fn derive_ata_with_program(
     wallet: &Pubkey,
     mint_str: &str,
-    token_program: &str,
+    token_program: TokenProgram,
 ) -> Option<Pubkey> {
     let assoc: Pubkey = ASSOCIATED_TOKEN_PROGRAM.parse().ok()?;
-    let token: Pubkey = token_program.parse().ok()?;
+    let token = token_program.id();
     let mint: Pubkey = mint_str.parse().ok()?;
     let (ata, _) =
         Pubkey::find_program_address(&[wallet.as_ref(), token.as_ref(), mint.as_ref()], &assoc);

@@ -12,8 +12,8 @@ It also includes total transactions, successes, failures, and net token P&L per 
 ## Usage
 ```sh
 export SIMULATOR_API_KEY=<key>
-cargo run --bin regression_test -- --start-slot 123 --end-slot 456 --log-file baseline.txt
+cargo run --bin regression_test -- --start-slot 460919623 --end-slot 460919624 --log-file baseline.txt
 
-cargo run --bin regression_test -- --start-slot 123 --end-slot 456 \
+cargo run --bin regression_test -- --start-slot 460919623 --end-slot 460919624 \
   --program-id addr1234 --program-so path/to/program.so --log-file experiment.txt
 ```

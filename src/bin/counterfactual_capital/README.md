@@ -19,28 +19,49 @@ Set the environment with the plan and time range of interest.
 ```sh
 export SIMULATOR_API_KEY=<key>
 PLAN=src/bin/counterfactual_capital/<plan_name>.json
-RANGE="--start-slot 439649408 --slot-count 9999"
+RANGE="--start-slot 460919623 --slot-count 2"
 ```
 
 ### Plan
-`--plan` names the venue's routing identity and where its capital and curve live in bytes. Neither half can be derived from the other: a router's IDL declares only the accounts the *router* touches, while the venue's own account run arrives as `remaining_accounts`. Take it from a landed swap that routed through the venue.
+`--plan` holds the venue template and says where the venue's capital and curve live in bytes. Neither half can be derived from the other. The template is one venue instruction that you serialized from a landed swap that routed through the venue. The server rewrites the amount and the taker accounts in it for each probe.
+
+The `venueTemplate` object has the format in the [venue template reference](https://docs.termina.technology/documentation/cli/file-formats#venue-templates). `sim` reads a JSON list of templates from `--venue-templates`. The plan holds one object. The plan also accepts the old `directFill` key for the same object.
 
 ```jsonc
 {
-  "directFill": {
-    "aggregator": "titan",       // the router whose encoder builds the replacement hop
-    "venue": "temp",             // as that router's IDL names it, or its ordinal
-    "pair": ["So111...", "EPjFW..."],
-    "slippageBps": 50,
-    "market": {
-      "mints": ["So111...", "EPjFW..."],  // the VENUE's ordering; a direction byte indexes it
-      "accounts": [{ "address": "...", "writable": true }]   // its account run, in program order
+  "venueTemplate": {
+    "label": "temp-sol-usdc",    // names the template on every row and in the stats
+    "mode": "ExactIn",           // which hops match; ExactIn writes the input amount
+    "inputMint": "So11111111111111111111111111111111111111112",   // the mint the matched hops sell
+    "outputMint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // the mint the matched hops buy
+    "instruction": {
+      "programId": "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi",
+      "accounts": [
+        // The role accounts come first. The server rewrites their addresses for each probe,
+        // so each holds the zero address as a placeholder.
+        { "address": "11111111111111111111111111111111", "signer": true },    // 0: taker
+        { "address": "11111111111111111111111111111111", "writable": true }, // 1: taker's input token account
+        { "address": "11111111111111111111111111111111", "writable": true }, // 2: taker's output token account
+        // The venue's own accounts follow, in program order.
+        { "address": "FQmFVQ7i8GCLqwE7EriUA4WQCvyCKxAeY4XUr55ZD6D7", "writable": true }, // state
+        { "address": "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp", "writable": true }, // vault 0
+        { "address": "goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdBUL17BnS5j", "writable": true }  // vault 1
+      ],
+      "data": { "data": "AAAAAAAAAAAAAAAAAAAAAA==", "encoding": "base64" }
+    },
+    "amountOffset": 8,           // byte offset of the 8-byte little-endian amount in the data
+    "taker": {
+      "user": 0,                 // account slots the server points at each probe's taker
+      "inputTokenAccount": 1,
+      "outputTokenAccount": 2
     }
+    // Optional: "resolve" refreshes the instruction at each probe pass, and "taker.derived"
+    // names accounts the venue derives from the taker.
   },
   "inventory": {
-    "vaults": ["...", "..."],                    // in the order the state mirrors them
+    "vaults": ["9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp", "goonERTdGsjnkZqWuVjs73BZ3Pb9qoCUdBUL17BnS5j"], // in the order the state mirrors them
     "state": {
-      "account": "...",
+      "account": "FQmFVQ7i8GCLqwE7EriUA4WQCvyCKxAeY4XUr55ZD6D7",
       "discriminator": "temp",                   // asserted before a byte is written
       "len": 2385,                               // likewise
       "maxTiers": 32,
@@ -54,16 +75,18 @@ RANGE="--start-slot 439649408 --slot-count 9999"
 }
 ```
 
+The state, vault and venue addresses in this sample are placeholders. Replace them with the venue's real accounts. With placeholder vaults, a run stops at `mint ... does not declare decimals`.
+
 A `ladders` entry reads: the tier count is `width` bytes at `count`; tier *i* sits at `entries + stride*i` as a `width`-byte price then a `width`-byte size. To find the offsets, diff the state account across slots — of the fields that move, prices change and sizes do not. Omit `state` for a constant-product pool, whose vaults are its curve.
 
 ### Validate
-Check the plan before opening a session. This catches what otherwise costs a replay per arm to discover: an account outside the venue's run, one the venue writes to but the plan marks read-only, and a ladder running past the end of the account.
+Check the plan before opening a session. This catches what otherwise costs a replay per arm to discover: an account outside the template's instruction, one the venue writes to but the plan marks read-only, and a ladder running past the end of the account.
 ```sh
 cargo run --bin counterfactual_capital -- $RANGE --plan $PLAN --dry-run
 ```
 
 ### Run
-Replay the range once per arm, scaled, and report what each would have filled. Every arm is a full replay plus one for the reference pass; the range above takes 4–6 minutes per arm.
+Replay the range once per arm, scaled, and report what each would have filled. Every arm is a full replay plus one for the reference pass. The 2-slot `RANGE` above only shows that the commands work. A real measurement needs a long range, and a long range takes minutes per arm. If the venue's state does not move in a short range, `capture::require_changes` refuses the plan.
 ```sh
 cargo run --bin counterfactual_capital -- $RANGE --plan $PLAN \
   --multiple 1 --multiple 100 --scale all --scale vaults --scale ladder \

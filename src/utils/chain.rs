@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use simulator_api::token::TokenProgram;
 use solana_account::Account;
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
@@ -6,7 +7,7 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use solana_rpc_client_api::config::RpcBlockConfig;
 use solana_transaction_status::{TransactionDetails, UiTransactionEncoding};
 
-use super::parse::SOLANA_RPC;
+use super::parse::{MAX_SUPPORTED_TRANSACTION_VERSION, SOLANA_RPC};
 use super::types::{BalanceDiffs, TransactionTokenBalanceSerde, TxWithMeta};
 
 fn rpc_client() -> RpcClient {
@@ -24,7 +25,7 @@ pub async fn get_transactions(slot: u64) -> Result<Vec<TxWithMeta>> {
                 transaction_details: Some(TransactionDetails::Full),
                 rewards: Some(false),
                 commitment: Some(CommitmentConfig::confirmed()),
-                max_supported_transaction_version: Some(0),
+                max_supported_transaction_version: Some(MAX_SUPPORTED_TRANSACTION_VERSION),
             },
         )
         .await
@@ -95,9 +96,10 @@ pub async fn get_account_info(pubkey: &str) -> Result<Option<Account>> {
 }
 
 /// The SPL token program that owns `mint` (legacy Token or Token-2022).
-pub async fn get_mint_token_program(mint: &str) -> Result<String> {
-    get_account_info(mint)
+pub async fn get_mint_token_program(mint: &str) -> Result<TokenProgram> {
+    let owner = get_account_info(mint)
         .await?
-        .map(|account| account.owner.to_string())
-        .with_context(|| format!("mint {mint} not found"))
+        .map(|account| account.owner)
+        .with_context(|| format!("mint {mint} not found"))?;
+    TokenProgram::of(&owner).with_context(|| format!("mint {mint} is owned by {owner}"))
 }

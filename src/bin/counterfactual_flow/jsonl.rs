@@ -3,14 +3,14 @@
 use std::{fs, io, io::BufRead, path::Path};
 
 use anyhow::{Context, Result, anyhow};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use simulator_api::RerouteStatsReport;
-use simulator_client::ReplacementNotification;
+use simulator_client::{ReplacementNotification, encode_transaction};
 use solana_message::{
     Message, MessageHeader, VersionedMessage,
     compiled_instruction::CompiledInstruction,
     v0::{self, MessageAddressTableLookup},
+    v1,
 };
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
@@ -169,7 +169,8 @@ struct RowKind {
 
 /// Rebuild the signed wire encoding from the JSON the transaction subscription pushes. A v0
 /// message with no lookups is indistinguishable from legacy, so `version` decides — but lookups
-/// exist only in v0, so their presence outranks a missing or stale `version`.
+/// exist only in v0, so their presence outranks a missing or stale `version`. A v1 message
+/// carries its own config and has no lookups.
 pub(crate) fn wire_transaction(
     encoded: &EncodedTransactionWithStatusMeta,
 ) -> Option<(String, String)> {
@@ -213,17 +214,39 @@ pub(crate) fn wire_transaction(
             })
         })
         .collect::<Option<Vec<_>>>()?;
-    let versioned = matches!(encoded.version, Some(TransactionVersion::Number(0)))
-        || !address_table_lookups.is_empty();
-    let message = match versioned {
-        true => VersionedMessage::V0(v0::Message {
+    let message = match (&encoded.version, address_table_lookups.is_empty()) {
+        (Some(TransactionVersion::Number(1)), _) => {
+            let config = raw
+                .transaction_config
+                .as_ref()
+                .map(|config| v1::TransactionConfig {
+                    priority_fee: config.priority_fee,
+                    compute_unit_limit: config.compute_unit_limit,
+                    loaded_accounts_data_size_limit: config.loaded_accounts_data_size_limit,
+                    heap_size: config.heap_size,
+                })
+                .unwrap_or_else(v1::TransactionConfig::empty);
+            VersionedMessage::V1(v1::Message::new(
+                header,
+                config,
+                recent_blockhash,
+                account_keys,
+                instructions,
+            ))
+        }
+        (
+            Some(TransactionVersion::Number(0)) | None | Some(TransactionVersion::Legacy(_)),
+            false,
+        )
+        | (Some(TransactionVersion::Number(0)), true) => VersionedMessage::V0(v0::Message {
             header,
             account_keys,
             recent_blockhash,
             instructions,
             address_table_lookups,
         }),
-        false => VersionedMessage::Legacy(Message {
+        (Some(TransactionVersion::Number(_)), _) => return None,
+        (None | Some(TransactionVersion::Legacy(_)), true) => VersionedMessage::Legacy(Message {
             header,
             account_keys,
             recent_blockhash,
@@ -240,6 +263,6 @@ pub(crate) fn wire_transaction(
     };
     Some((
         ui.signatures.first()?.clone(),
-        BASE64.encode(bincode::serialize(&transaction).ok()?),
+        encode_transaction(&transaction).ok()?,
     ))
 }

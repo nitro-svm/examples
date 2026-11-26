@@ -2,17 +2,17 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use simulator_api::{AccountData, AccountModifications, BinaryEncoding, EncodedBinary};
+use simulator_api::{
+    AccountData, AccountModifications, BinaryEncoding, EncodedBinary,
+    token::{TOKEN_ACCOUNT_RENT_EXEMPT_LAMPORTS, token_account, token_amount},
+};
 use simulator_client::BacktestSession;
-use solana_account::Account;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
 use super::chain::get_mint_token_program;
 use super::parse::{TITAN_PROGRAM, WSOL_MINT, derive_ata};
 
-pub const SYSTEM_PROGRAM: &str = "11111111111111111111111111111111";
-const ATA_RENT_EXEMPT: u64 = 2_039_280;
 const FEE_BUFFER: u64 = 1_000_000;
 
 /// Anchor discriminator of Titan's `TokenLedger` account (sha256("account:TokenLedger")[..8]).
@@ -63,70 +63,18 @@ async fn modify_with_retry(
     Err(last.unwrap()).with_context(|| format!("{label} failed after {ATTEMPTS} attempts"))
 }
 
-/// `token_program` must be the mint's real owning program (legacy Token or Token-2022) —
-/// overriding a Token-2022 account with a legacy-Token owner breaks any CPI into it.
-pub fn make_token_account(
-    owner: &Address,
-    mint: &str,
-    amount: u64,
-    token_program: &str,
-) -> Result<AccountData> {
-    let mut data = [0u8; 165];
-    data[0..32].copy_from_slice(mint.parse::<Pubkey>()?.as_ref());
-    data[32..64].copy_from_slice(owner.as_ref());
-    data[64..72].copy_from_slice(&amount.to_le_bytes());
-    data[108] = 1; // state = Initialized
-    let mut lamports = ATA_RENT_EXEMPT;
-
-    if mint == WSOL_MINT {
-        // is_native = Some(RENT_EXEMPT): bytes [109..113] = option tag, [113..121] = value.
-        // Without this, Token::SyncNative rejects the account as non-native.
-        data[109..113].copy_from_slice(&1u32.to_le_bytes());
-        data[113..121].copy_from_slice(&ATA_RENT_EXEMPT.to_le_bytes());
-        lamports += amount;
-    }
-
-    Ok(AccountData {
-        data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
-        executable: false,
-        lamports,
-        owner: token_program.parse().context("parse token program")?,
-        space: 165,
-    })
-}
-
-/// Build an account override for a token 2022 account, patching only the amount
-/// field (offset 64) and leaving every other byte (state, extensions) untouched.
-pub fn patch_real_token22_account(account: &Account, amount: u64) -> Result<AccountData> {
-    let mut data = account.data.clone();
-    data[64..72].copy_from_slice(&amount.to_le_bytes());
-    Ok(AccountData {
-        space: data.len() as u64,
-        data: EncodedBinary::from_bytes(&data, BinaryEncoding::Base64),
-        executable: account.executable,
-        lamports: account.lamports,
-        owner: account.owner.to_string().parse().context("parse owner")?,
-    })
-}
-
 /// Lamports a [`make_native_account`] seeds for `amount`: the requested amount
 /// plus the rent-exempt minimum and a fee buffer. Reading a native account's
 /// balance back as a swap output must subtract *this*, not just `amount`, or the
 /// padding leaks into the reading as a constant offset.
 pub fn native_seed_lamports(amount: u64) -> u64 {
     amount
-        .saturating_add(ATA_RENT_EXEMPT)
+        .saturating_add(TOKEN_ACCOUNT_RENT_EXEMPT_LAMPORTS)
         .saturating_add(FEE_BUFFER)
 }
 
 pub fn make_native_account(amount: u64) -> AccountData {
-    AccountData {
-        data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
-        executable: false,
-        lamports: native_seed_lamports(amount),
-        owner: SYSTEM_PROGRAM.parse().expect("Should parse system program"),
-        space: 0,
-    }
+    AccountData::system_account(native_seed_lamports(amount))
 }
 
 /// Address + account data for a native SOL override at `amount`.
@@ -147,16 +95,10 @@ pub async fn token_override(
     let owner_addr: Address = owner.to_string().parse()?;
 
     let account_data = if amount == 0 {
-        AccountData {
-            data: EncodedBinary::from_bytes(&[], BinaryEncoding::Base64),
-            executable: false,
-            lamports: 0,
-            owner: SYSTEM_PROGRAM.parse()?,
-            space: 0,
-        }
+        AccountData::system_account(0)
     } else {
         let token_program = get_mint_token_program(mint).await?;
-        make_token_account(&owner_addr, mint, amount, &token_program)?
+        token_account(token_program, mint.parse()?, owner_addr, amount)
     };
 
     Ok((ata.to_string().parse::<Address>()?, account_data))
@@ -172,7 +114,7 @@ pub async fn empty_token_override(owner: &Pubkey, mint: &str) -> Result<(Address
     let token_program = get_mint_token_program(mint).await?;
     Ok((
         ata.to_string().parse::<Address>()?,
-        make_token_account(&owner_addr, mint, 0, &token_program)?,
+        token_account(token_program, mint.parse()?, owner_addr, 0),
     ))
 }
 
@@ -219,8 +161,7 @@ pub async fn set_ata_balance(
         .get_account(&ata)
         .await
         .ok()
-        .filter(|a| a.data.len() >= 72)
-        .map(|a| u64::from_le_bytes(a.data[64..72].try_into().unwrap()))
+        .and_then(|a| token_amount(&a.data))
         .unwrap_or(0);
 
     let mods = AccountModifications(BTreeMap::from([(ata, account_data)]));

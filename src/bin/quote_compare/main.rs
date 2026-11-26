@@ -25,7 +25,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use simulator_api::DiscoveryFilter;
-use simulator_client::{BacktestClient, CreateSession, DiscoveryStepResult};
+use simulator_client::{
+    BacktestClient, CreateSession, DiscoveryStepResult, backtest_ws_url, decode_transaction,
+};
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 use solana_transaction::versioned::VersionedTransaction;
@@ -48,11 +50,11 @@ struct Cli {
     api_key: String,
 
     /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 417_811_170)]
+    #[arg(long, default_value_t = 460_919_623)]
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 417_811_175)]
+    #[arg(long, default_value_t = 460_919_624)]
     end_slot: u64,
 
     /// CSV output file path.
@@ -156,12 +158,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let program_addr: Address = cli.program_id.parse().context("invalid --program-id")?;
 
+    let ws_url = backtest_ws_url(&cli.url);
     let client = BacktestClient::builder()
-        .url(format!("wss://{}/backtest", &cli.url))
+        .url(&ws_url)
         .api_key(cli.api_key)
         .build();
 
-    eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
+    eprintln!("[ws] connecting to {ws_url}");
 
     let mut session = client
         .create_session(
@@ -181,8 +184,9 @@ async fn main() -> Result<()> {
             .session_id()
             .map_or_else(|| "?".to_string(), |id| id.to_string())
     );
-    session.ensure_ready(Some(Duration::from_secs(600))).await?;
-    eprintln!("[ws] ready — scanning for {} batches", cli.program_id);
+    // No `ensure_ready`: it discards the `DiscoveryBatch` events that arrive before the session is
+    // ready, and `advance_to_discovery` then waits for batches that never come.
+    eprintln!("[ws] scanning for {} batches", cli.program_id);
 
     let timeout = Some(Duration::from_secs(120));
     let mut pause_count = 0u64;
@@ -203,8 +207,14 @@ async fn main() -> Result<()> {
                     .transactions
                     .iter()
                     .filter_map(|bin| {
-                        let bytes = bin.decode().ok()?;
-                        bincode::deserialize(&bytes).ok()
+                        let transaction = decode_transaction(bin).ok()?;
+                        Some(TxWithMeta {
+                            transaction,
+                            error: None,
+                            balance_diffs: None,
+                            logs: None,
+                            inner_instructions: None,
+                        })
                     })
                     .collect();
 

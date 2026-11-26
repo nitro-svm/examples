@@ -10,7 +10,7 @@ export SIMULATOR_API_KEY=<key>
 PROGRAM=BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi
 POOL=8FnX3xo2yYw3EUE6w3nQA4GfXGS9wpK6oj3veJpbFzLo # BisonFi, SOL/USDC
 PAIR=So11111111111111111111111111111111111111112,EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v
-RANGE="--start-slot 439649408 --slot-count 9999"
+RANGE="--start-slot 460919623 --slot-count 2"
 
 # 1. Record every state the pool held over the range.
 cargo run --bin counterfactual_flow -- capture $RANGE --account $POOL --out capture.jsonl
@@ -25,7 +25,7 @@ cargo run --bin counterfactual_flow -- compare $RANGE --account $POOL --program-
 
 ## Results
 
-BisonFi SOL/USDC, slots 439649408–439659407 (2026-08-24), legs routed through the pool:
+The 2-slot `RANGE` above only shows that the commands work. A real measurement needs a long range, and a short range can show no price moves. The table is from a long range: BisonFi SOL/USDC, slots 439649408–439659407 (2026-08-24), legs routed through the pool:
 
 | arm | SOL→USDC (sell) | USDC→SOL (buy) | total |
 |---|---|---|---|

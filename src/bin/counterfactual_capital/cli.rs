@@ -139,7 +139,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false)]
     pub(crate) no_replay: bool,
 
-    /// The venue plan as JSON: its direct-fill spec (aggregator, venue, pair, account run) and
+    /// The venue plan as JSON: its venue template (swap mode, mints, instruction, taker slots) and
     /// where its capital and quoting curve live in bytes. See the README on building one.
     #[arg(long, value_name = "PATH")]
     pub(crate) plan: PathBuf,

@@ -18,8 +18,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{BufWriter, Write as _};
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use clap::Parser;
 use serde::Deserialize;
 use simulator_api::{
@@ -27,6 +25,7 @@ use simulator_api::{
 };
 use simulator_client::{
     CreateSession, ManagedBacktestSession, ManagedEvent, ManagedSessionError, backtest_ws_url,
+    encode_transaction,
 };
 use solana_account_decoder::UiAccount;
 use solana_address::Address;
@@ -44,7 +43,7 @@ struct Cli {
     #[arg(long, default_value = JUPITER_V6)]
     program_id: String,
     /// Starting slot: collect all swaps for the given `program_id` at this slot.
-    #[arg(long, default_value_t = 437_249_802)]
+    #[arg(long, default_value_t = 460_919_623)]
     start_slot: u64,
     /// Slot count: simulate all swaps from `start_slot` for this many successive slots.
     #[arg(long, default_value_t = 50)]
@@ -237,7 +236,7 @@ async fn build_action(
     } = build_overrides(swap).await?;
 
     let patched = patch_jup_min_out(&swap.transaction);
-    let tx = STANDARD.encode(bincode::serialize(&patched)?);
+    let tx = encode_transaction(&patched)?;
 
     Ok(ScheduledAction {
         anchor: ActionAnchor::AfterSlot {
@@ -249,6 +248,8 @@ async fn build_action(
         feeds_reroute: false,
         return_accounts,
         label: Some(swap.signature.clone()),
+        resolve: None,
+        within: None,
     })
 }
 
