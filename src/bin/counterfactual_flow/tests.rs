@@ -4,6 +4,11 @@
 use super::*;
 use simulator_api::{AccountData, AccountModifications};
 use solana_address::Address;
+use solana_message::VersionedMessage;
+use solana_transaction::versioned::{TransactionVersion, VersionedTransaction};
+use solana_transaction_status::{
+    EncodedTransactionWithStatusMeta, UiTransactionEncoding, VersionedTransactionWithStatusMeta,
+};
 
 use crate::{
     cli::RangeArgs,
@@ -341,4 +346,57 @@ fn no_selector_measures_the_venue_the_run_named() {
         Some("slots 1–2"),
         "the subtitle names the range the run covered"
     );
+}
+
+fn v1_transaction() -> VersionedTransaction {
+    let payer = Address::from([1; 32]);
+    let instruction = solana_message::Instruction::new_with_bytes(
+        Address::from([2; 32]),
+        &[1, 2, 3],
+        vec![solana_message::AccountMeta::new(payer, true)],
+    );
+    let message = solana_message::v1::Message::try_compile_with_config(
+        &payer,
+        &[instruction],
+        solana_message::Hash::from([7; 32]),
+        solana_message::v1::TransactionConfig::empty(),
+    )
+    .expect("compile a v1 message");
+    VersionedTransaction {
+        signatures: vec![solana_signature::Signature::default()],
+        message: VersionedMessage::V1(message),
+    }
+}
+
+fn encoded_json(transaction: &VersionedTransaction) -> EncodedTransactionWithStatusMeta {
+    VersionedTransactionWithStatusMeta {
+        transaction: transaction.clone(),
+        meta: Default::default(),
+    }
+    .encode(UiTransactionEncoding::Json, Some(1), false)
+    .expect("encode as JSON")
+}
+
+/// A v1 message is not the bincode layout, so the wire bytes must decode back to the same
+/// transaction the subscription pushed.
+#[test]
+fn a_v1_transaction_survives_the_json_to_wire_round_trip() {
+    let transaction = v1_transaction();
+
+    let (_, wire) = wire_transaction(&encoded_json(&transaction)).expect("a v1 transaction");
+
+    let decoded =
+        simulator_client::decode_transaction(&EncodedBinary::new(wire, BinaryEncoding::Base64))
+            .expect("decode the wire bytes");
+    assert_eq!(decoded, transaction);
+}
+
+#[rstest]
+#[case::next(2)]
+#[case::max(255)]
+fn an_unknown_version_is_undecodable(#[case] version: u8) {
+    let mut encoded = encoded_json(&v1_transaction());
+    encoded.version = Some(TransactionVersion::Number(version));
+
+    assert!(wire_transaction(&encoded).is_none());
 }

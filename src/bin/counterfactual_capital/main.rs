@@ -83,9 +83,7 @@ async fn main() -> Result<()> {
 
     eprintln!(
         "[venue] {}, pair {} -> {}",
-        plan.direct_fill.label,
-        plan.direct_fill.input_mint,
-        plan.direct_fill.output_mint
+        plan.venue_template.label, plan.venue_template.input_mint, plan.venue_template.output_mint
     );
     eprintln!(
         "[range] {} + {} slots, {}",
@@ -137,7 +135,7 @@ async fn capture_pass(
     let create = session::create_session(Arm {
         range: args.range.clone(),
         no_replay: args.no_replay,
-        spec: plan.direct_fill.clone(),
+        template: plan.venue_template.clone(),
         overrides: Vec::new(),
     })?;
     let mut open = utils::session::start(&args.conn, create).await?;
@@ -145,9 +143,9 @@ async fn capture_pass(
 
     // Read at the pause: this session's RPC stops serving the moment the session completes, so a
     // read deferred until the pass has finished answers 502.
-    utils::session::wait_for_first_pause(&mut open).await?;
-    let read = session::read_accounts(&rpc_url, &plan.overridden()).await?;
-    let venue = resolve(&rpc_url, plan, read).await?;
+    open.wait_until_ready().await?;
+    let read = session::read_accounts(open.rpc(), &plan.overridden()).await?;
+    let venue = resolve(open.rpc(), plan, read).await?;
     report::baseline(&venue);
 
     let watching = plan.overridden();
@@ -187,7 +185,7 @@ async fn capture_pass(
 }
 
 /// Pair each address read back with what it is, so the report can name units rather than bytes.
-async fn resolve(rpc_url: &str, plan: &Plan, read: Vec<(Address, Account)>) -> Result<Venue> {
+async fn resolve(rpc: &RpcClient, plan: &Plan, read: Vec<(Address, Account)>) -> Result<Venue> {
     let found = |address: &Address| {
         read.iter()
             .find(|(candidate, _)| candidate == address)
@@ -213,7 +211,7 @@ async fn resolve(rpc_url: &str, plan: &Plan, read: Vec<(Address, Account)>) -> R
             Ok(Address::from(mint))
         })
         .collect::<Result<Vec<_>>>()?;
-    let mint_accounts = RpcClient::new(rpc_url.to_string())
+    let mint_accounts = rpc
         .get_multiple_accounts(&mints)
         .await
         .context("reading the vaults' mints for their decimals")?;
@@ -428,11 +426,11 @@ async fn run_arm(
     let create = session::create_session(Arm {
         range: args.range.clone(),
         no_replay: args.no_replay,
-        spec: plan.direct_fill.clone(),
+        template: plan.venue_template.clone(),
         overrides: posted.overrides.clone(),
     })?;
     let mut open = utils::session::start(&args.conn, create).await?;
-    utils::session::wait_for_first_pause(&mut open).await?;
+    open.wait_until_ready().await?;
     let stats = advance(&mut open, args.range.slot_count).await?;
     open.shutdown().await;
     Ok(row(arm, true, Some(&posted), stats))
@@ -447,14 +445,18 @@ fn row(arm: ArmSpec, frozen: bool, posted: Option<&Posted>, stats: RerouteStatsR
         vaults: posted.map(|p| p.vaults.clone()).unwrap_or_default(),
         tiers: posted.map(|p| p.tiers.clone()).unwrap_or_default(),
         ceiling: posted.and_then(|p| p.ceiling).map(|top| top.to_string()),
-        matched: stats.direct_fill_matched,
+        matched: stats.venue_matched,
         // Every matched hop lands in exactly one outcome bucket, so the ones that ran are all of
         // them bar the ones that could not be compiled or run.
-        built: stats
-            .direct_fill_matched
-            .saturating_sub(stats.direct_fill_outcomes.get(UNSIMULATABLE).copied().unwrap_or(0)),
-        scored: stats.direct_fill_scored,
-        bps_total: stats.direct_fill_bps_total,
-        outcomes: stats.direct_fill_outcomes,
+        built: stats.venue_matched.saturating_sub(
+            stats
+                .venue_outcomes
+                .get(UNSIMULATABLE)
+                .copied()
+                .unwrap_or(0),
+        ),
+        scored: stats.venue_scored,
+        bps_total: stats.venue_bps_total,
+        outcomes: stats.venue_outcomes,
     }
 }

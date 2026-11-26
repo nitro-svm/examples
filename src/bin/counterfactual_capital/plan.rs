@@ -5,7 +5,7 @@ use std::path::Path;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_with::{DisplayFromStr, serde_as};
-use simulator_api::DirectFillTemplate;
+use simulator_api::VenueTemplate;
 use solana_address::Address;
 
 /// Where one ladder lives inside the venue's state account.
@@ -64,7 +64,8 @@ pub(crate) struct Inventory {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Plan {
-    pub(crate) direct_fill: DirectFillTemplate,
+    #[serde(alias = "directFill")]
+    pub(crate) venue_template: VenueTemplate,
     pub(crate) inventory: Inventory,
 }
 
@@ -96,7 +97,7 @@ impl Plan {
         );
         for account in self.overridden() {
             let named = self
-                .direct_fill
+                .venue_template
                 .instruction
                 .accounts
                 .iter()
@@ -164,5 +165,80 @@ impl Plan {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const VAULT: &str = "11111111111111111111111111111112";
+    const SOL: &str = "So11111111111111111111111111111111111111112";
+    const USDC: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+    fn plan_json(vault_writable: bool) -> String {
+        format!(
+            r#"{{
+                "venueTemplate": {{
+                    "label": "temp-sol-usdc",
+                    "mode": "ExactIn",
+                    "inputMint": "{SOL}",
+                    "outputMint": "{USDC}",
+                    "instruction": {{
+                        "programId": "{VAULT}",
+                        "accounts": [
+                            {{ "address": "{SOL}", "signer": true }},
+                            {{ "address": "{USDC}", "writable": true }},
+                            {{ "address": "{SOL}", "writable": true }},
+                            {{ "address": "{VAULT}", "writable": {vault_writable} }}
+                        ],
+                        "data": {{ "data": "AAAAAAAAAAAAAAAA", "encoding": "base64" }}
+                    }},
+                    "amountOffset": 0,
+                    "taker": {{ "user": 0, "inputTokenAccount": 1, "outputTokenAccount": 2 }}
+                }},
+                "inventory": {{ "vaults": ["{VAULT}"] }}
+            }}"#
+        )
+    }
+
+    fn readme_plan_json() -> String {
+        include_str!("README.md")
+            .split("```jsonc\n")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("the README holds a jsonc plan sample")
+            .lines()
+            .map(|line| line.split_once("//").map_or(line, |(code, _)| code))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_readme_sample_parses_and_validates() {
+        let plan: Plan = serde_json::from_str(&readme_plan_json()).expect("sample parses");
+        plan.validate().expect("sample validates");
+    }
+
+    #[test]
+    fn a_plan_under_the_old_direct_fill_key_still_parses() {
+        let json = plan_json(true).replace("venueTemplate", "directFill");
+        let plan: Plan = serde_json::from_str(&json).expect("old key parses");
+        plan.validate().expect("plan validates");
+    }
+
+    #[test]
+    fn a_plan_with_a_writable_vault_in_the_template_is_accepted() {
+        let plan: Plan = serde_json::from_str(&plan_json(true)).expect("plan parses");
+        plan.validate().expect("plan validates");
+    }
+
+    #[test]
+    fn a_plan_whose_vault_is_read_only_in_the_template_is_refused() {
+        let plan: Plan = serde_json::from_str(&plan_json(false)).expect("plan parses");
+        let error = plan
+            .validate()
+            .expect_err("a read-only vault must be refused");
+        assert!(error.to_string().contains("read-only"), "{error}");
     }
 }

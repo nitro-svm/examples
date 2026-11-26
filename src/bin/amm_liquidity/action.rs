@@ -33,6 +33,7 @@ const SPREAD_LABEL: &str = "spread";
 const DEPTH_Q2B_PREFIX: &str = "depth-q2b-";
 const DEPTH_B2Q_PREFIX: &str = "depth-b2q-";
 
+#[expect(dead_code)]
 pub(crate) fn spread_label(venue: TitanVenueDiscriminant) -> String {
     format!("{}-{SPREAD_LABEL}", venue as u8)
 }

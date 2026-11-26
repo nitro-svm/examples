@@ -1,5 +1,5 @@
 //! Scaling a venue's inventory: the SPL token accounts a venue quotes against, rewritten to hold
-//! a multiple of what they held, as an account override the direct-fill probe prices against.
+//! a multiple of what they held, as an account override the venue template's probe prices against.
 
 use anyhow::{Result, bail, ensure};
 use simulator_api::{AccountData, BinaryEncoding, EncodedBinary};

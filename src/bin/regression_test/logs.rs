@@ -6,12 +6,16 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
+use reqwest::header::HeaderValue;
+use simulator_api::session_endpoint::{SESSION_TOKEN_HEADER, SessionGrant};
 use simulator_client::{LogSubscriptionHandle, subscribe_program_logs};
-use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_client::{nonblocking::rpc_client::RpcClient, rpc_client::RpcClientConfig};
 use solana_commitment_config::CommitmentConfig;
+use solana_rpc_client::http_sender::HttpSender;
 use tokio::{sync::watch, task::JoinHandle};
 
 use backtest_example::utils::fetch::fetch_balance_changes;
@@ -31,15 +35,14 @@ use crate::{Stats, Transaction};
 ///   2. `await` the handle.
 ///   3. Close the session only after the handle resolves.
 pub async fn subscribe_logs(
-    rpc_url: &str,
+    grant: &SessionGrant,
     program: &str,
     log_file: PathBuf,
     stats: Arc<Mutex<Stats>>,
 ) -> Result<(JoinHandle<()>, watch::Sender<bool>)> {
-    let rpc = Arc::new(RpcClient::new_with_commitment(
-        rpc_url.to_string(),
-        CommitmentConfig::confirmed(),
-    ));
+    let rpc = Arc::new(session_rpc_client(grant)?);
+    let rpc_url = grant.rpc_url_with_token();
+    let rpc_url = rpc_url.as_str();
 
     // Shared state collected by per-notification callbacks.
     let records: Arc<Mutex<Vec<(usize, Transaction)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -75,9 +78,14 @@ pub async fn subscribe_logs(
                     if success { "ok" } else { "FAIL" }
                 );
 
-                let (sol_changes, token_changes) = fetch_balance_changes(&rpc, &signature)
-                    .await
-                    .unwrap_or_default();
+                let (sol_changes, token_changes) =
+                    match fetch_balance_changes(&rpc, &signature).await {
+                        Ok(changes) => (changes.sol, changes.token),
+                        Err(error) => {
+                            eprintln!("[{program}] no balance changes for {signature}: {error:#}");
+                            Default::default()
+                        }
+                    };
 
                 let tx = Transaction {
                     slot,
@@ -132,13 +140,13 @@ pub async fn subscribe_logs(
             }
 
             for account in &tx.sol_changes {
-                *s.sol_net.entry(account.pubkey.clone()).or_default() += account.delta();
+                *s.sol_net.entry(account.pubkey).or_default() += account.delta();
             }
 
             for account in &tx.token_changes {
                 let entry = s
                     .token_net
-                    .entry((account.pubkey.clone(), account.mint.clone()))
+                    .entry((account.pubkey, account.mint))
                     .or_insert((0, account.decimals));
                 entry.0 += account.delta();
             }
@@ -185,12 +193,41 @@ fn write_tx_record(writer: &mut impl Write, tx: &Transaction) {
             "  spl  {}  {}  {:.prec$} → {:.prec$}  (Δ {:+.prec$})  owner={}",
             account.pubkey,
             account.mint,
-            account.to_ui(account.pre_amount),
-            account.to_ui(account.post_amount),
-            account.to_ui(account.delta().unsigned_abs()),
-            account.owner,
-            prec = account.decimals as usize,
+            to_ui(account.pre_amount.into(), account.decimals),
+            to_ui(account.post_amount.into(), account.decimals),
+            to_ui(account.delta(), account.decimals),
+            account
+                .owner
+                .map(|owner| owner.to_string())
+                .unwrap_or_default(),
+            prec = usize::from(account.decimals),
         );
     }
     let _ = writeln!(writer); // blank line between transactions
+}
+
+/// The values `RpcClient::new` uses.
+const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const RPC_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A client the log tasks can share, which sends the session token as a header. A token in the
+/// URL would appear in every error the client returns.
+fn session_rpc_client(grant: &SessionGrant) -> Result<RpcClient> {
+    let mut headers = HttpSender::default_headers();
+    let mut token = HeaderValue::from_str(grant.token.expose())?;
+    token.set_sensitive(true);
+    headers.insert(SESSION_TOKEN_HEADER, token);
+    let client = reqwest::Client::builder()
+        .default_headers(headers)
+        .timeout(RPC_TIMEOUT)
+        .pool_idle_timeout(RPC_POOL_IDLE_TIMEOUT)
+        .build()?;
+    Ok(RpcClient::new_sender(
+        HttpSender::new_with_client(grant.rpc_url(), client),
+        RpcClientConfig::with_commitment(CommitmentConfig::confirmed()),
+    ))
+}
+
+fn to_ui(raw: i128, decimals: u8) -> f64 {
+    raw as f64 / 10f64.powi(i32::from(decimals))
 }

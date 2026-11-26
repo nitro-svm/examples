@@ -14,9 +14,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use simulator_client::{BacktestClient, Continue, CreateSession};
-
-use backtest_example::utils::fetch::{SolAccount, TokenAccount};
+use simulator_client::balances::{SolChange, TokenChange};
+use simulator_client::{Address, BacktestClient, Continue, CreateSession, backtest_ws_url};
 
 mod logs;
 use crate::logs::subscribe_logs;
@@ -35,11 +34,11 @@ struct Cli {
     api_key: String,
 
     /// First slot (inclusive) to replay.
-    #[arg(long, default_value_t = 399_834_992)]
+    #[arg(long, default_value_t = 460_919_623)]
     start_slot: u64,
 
     /// Last slot (inclusive) to replay.
-    #[arg(long, default_value_t = 399_834_997)]
+    #[arg(long, default_value_t = 460_919_624)]
     end_slot: u64,
 
     /// File to write transaction logs to.
@@ -56,17 +55,6 @@ struct Cli {
     program_so: Option<PathBuf>,
 }
 
-// ── URL helpers ────────────────────────────────────────────────────────────────
-
-/// If `endpoint` is a relative path, resolve it against `base`.
-fn resolve_url(base: &str, endpoint: &str) -> Result<String> {
-    if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
-        return Ok(endpoint.to_string());
-    }
-    let path = endpoint.trim_start_matches('/');
-    Ok(format!("{base}/{path}"))
-}
-
 /// All data captured for a single transaction.
 struct Transaction {
     slot: u64,
@@ -74,8 +62,8 @@ struct Transaction {
     success: bool,
     err: Option<String>,
     logs: Vec<String>,
-    sol_changes: Vec<SolAccount>,
-    token_changes: Vec<TokenAccount>,
+    sol_changes: Vec<SolChange>,
+    token_changes: Vec<TokenChange>,
 }
 
 // ── Stats ──────────────────────────────────────────────────────────────────────
@@ -86,9 +74,9 @@ struct Stats {
     successes: usize,
     failures: usize,
     /// Cumulative lamport delta per account across all transactions.
-    sol_net: HashMap<String, i64>,
+    sol_net: HashMap<Address, i128>,
     /// Cumulative raw-token delta per (pubkey, mint) pair; also stores decimals.
-    token_net: HashMap<(String, String), (i64, u8)>,
+    token_net: HashMap<(Address, Address), (i128, u8)>,
 }
 
 // ── main ──────────────────────────────────────────────────────────────────────
@@ -98,12 +86,13 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // ── 1. Connect and create a session ───────────────────────────────────────
+    let ws_url = backtest_ws_url(&cli.url);
     let client = BacktestClient::builder()
-        .url(format!("wss://{}/backtest", &cli.url))
+        .url(&ws_url)
         .api_key(cli.api_key.clone())
         .build();
 
-    eprintln!("[ws] connecting to wss://{}/backtest", &cli.url);
+    eprintln!("[ws] connecting to {ws_url}");
     let mut session = client
         .create_session(
             CreateSession::builder()
@@ -120,12 +109,7 @@ async fn main() -> Result<()> {
             .session_id()
             .map_or_else(|| "?".to_string(), |id| id.to_string())
     );
-    let rpc_endpoint = session
-        .rpc_endpoint()
-        .context("no rpc_endpoint")?
-        .to_string();
-    let rpc_url = resolve_url(&format!("https://{}", cli.url), &rpc_endpoint)?;
-    eprintln!("[ws] rpc_endpoint: {rpc_url}");
+    eprintln!("[ws] rpc_endpoint: {}", session.grant().rpc_url());
 
     eprintln!("[ws] waiting for ReadyForContinue...");
     session.ensure_ready(Some(Duration::from_secs(600))).await?;
@@ -142,7 +126,7 @@ async fn main() -> Result<()> {
     let stats = Arc::new(Mutex::new(Stats::default()));
     let log_task = if let Some(program_id) = &cli.program_id {
         let (handle, stop_tx) = subscribe_logs(
-            &rpc_url,
+            session.grant(),
             program_id,
             cli.log_file.clone(),
             Arc::clone(&stats),

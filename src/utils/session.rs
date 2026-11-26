@@ -5,9 +5,7 @@ use anyhow::{Result, bail};
 use simulator_api::{
     AccountModifications, CreateBacktestSessionRequest, RerouteStatsReport, SessionSummary,
 };
-use simulator_client::{
-    Continue, CreateSession, ManagedBacktestSession, ManagedEvent, backtest_ws_url,
-};
+use simulator_client::{Continue, CreateSession, ManagedBacktestSession, ManagedEvent};
 
 use crate::utils::connection::ConnectionArgs;
 
@@ -16,10 +14,7 @@ pub async fn start(
     conn: &ConnectionArgs,
     request: CreateBacktestSessionRequest,
 ) -> Result<ManagedBacktestSession> {
-    Ok(
-        ManagedBacktestSession::start(backtest_ws_url(&conn.url), conn.api_key.clone(), request)
-            .await?,
-    )
+    Ok(ManagedBacktestSession::start(conn.url.clone(), conn.api_key.clone(), request).await?)
 }
 
 /// Post each `(slot, accounts)` as an override from that slot on.
@@ -45,23 +40,6 @@ pub fn log_slot(event: ManagedEvent) {
 /// `Option<Box<_>>`; unwrapping it is not something an example should have to know.
 pub fn reroute_stats(summary: Option<SessionSummary>) -> Option<RerouteStatsReport> {
     summary.and_then(|summary| summary.reroute_stats.map(|stats| *stats))
-}
-
-/// Pump until the session first reports ready to advance.
-///
-/// Chain reads belong at this moment and no other: the session is only positioned at its start
-/// slot once it says so, and its RPC endpoint stops serving the moment the session completes.
-pub async fn wait_for_first_pause(session: &mut ManagedBacktestSession) -> Result<()> {
-    loop {
-        match session.next_event().await? {
-            ManagedEvent::ReadyForContinue => return Ok(()),
-            ManagedEvent::Completed { .. } => {
-                bail!("the session finished its range before it was ready to advance")
-            }
-            ManagedEvent::Error(error) => bail!("session error: {error}"),
-            _ => {}
-        }
-    }
 }
 
 /// Advance the session over its whole range. `on_event` sees every event the loop does not consume

@@ -24,8 +24,8 @@ Both measurements use a Titan swap transaction as a starting template but patch 
 ```sh
 export SIMULATOR_API_KEY=<key>
 cargo run --bin amm_liquidity -- \
-  --start-slot 422818048 \
-  --end-slot 422818148 \
+  --start-slot 460919623 \
+  --end-slot 460919625 \
   --venue-disciminant 55
 ```
 

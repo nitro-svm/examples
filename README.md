@@ -53,3 +53,5 @@ or
 curl -fsSL https://cli.simulator.termina.technology/install.sh | bash
 sim ranges
 ```
+
+A start slot must be a `bundle_start_slot` from `/available-ranges`.

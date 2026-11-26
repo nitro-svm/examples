@@ -3,17 +3,15 @@ use std::fs::File;
 use std::io::{BufWriter, Write as _};
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use simulator_api::{
     AccountModifications, ActionAnchor, ActionKind, DiscoveryFilter, ScheduledAction,
+    token::token_account,
 };
+use simulator_client::encode_transaction;
 use solana_address::Address;
 use solana_pubkey::Pubkey;
 
-use backtest_example::utils::accounts::{
-    make_native_account, make_token_account, make_token_ledger_account,
-};
+use backtest_example::utils::accounts::{make_native_account, make_token_ledger_account};
 use backtest_example::utils::parse::{
     TITAN_PROGRAM, WSOL_MINT, add_token_ledger, derive_ata, patch_titan_template_transaction,
     repoint_titan_static_account,
@@ -113,6 +111,7 @@ impl SpreadStore {
 /// Final base (`Y`) is `output`'s balance delta over the seeded baseline;
 /// spread = (size − Y) / size.
 #[allow(clippy::too_many_arguments)]
+#[expect(dead_code)]
 pub(crate) fn get_spread_action(
     template: &Template,
     size: u64,
@@ -149,8 +148,6 @@ pub(crate) fn get_spread_action(
 
     let quote = &quote_mint.to_string();
     let base = &base_mint.to_string();
-    let quote_token_program = &quote_token_program.to_string();
-    let base_token_program = &base_token_program.to_string();
     let is_native_base = base.as_str() == WSOL_MINT;
     let output = if is_native_base {
         *quote_signer
@@ -180,8 +177,8 @@ pub(crate) fn get_spread_action(
         ledger,
     )?;
 
-    let hop1 = STANDARD.encode(bincode::serialize(&hop1)?);
-    let hop2 = STANDARD.encode(bincode::serialize(&hop2)?);
+    let hop1 = encode_transaction(&hop1)?;
+    let hop2 = encode_transaction(&hop2)?;
     let transactions = if program_id.is_some() {
         vec![hop1, hop2]
     } else {
@@ -193,17 +190,17 @@ pub(crate) fn get_spread_action(
     let output_account = if is_native_base {
         make_native_account(DEPTH_SIGNER_LAMPORTS)
     } else {
-        make_token_account(quote_signer, base, 0, base_token_program)?
+        token_account(*base_token_program, *base_mint, *quote_signer, 0)
     };
 
     let account_overrides = AccountModifications(BTreeMap::from([
         (
             input,
-            make_token_account(base_signer, base, size, base_token_program)?,
+            token_account(*base_token_program, *base_mint, *base_signer, size),
         ),
         (
             intermediate,
-            make_token_account(quote_signer, quote, 0, quote_token_program)?,
+            token_account(*quote_token_program, *quote_mint, *quote_signer, 0),
         ),
         (ledger, make_token_ledger_account(&intermediate, 0)),
         (output, output_account),
@@ -217,6 +214,8 @@ pub(crate) fn get_spread_action(
         feeds_reroute: false,
         return_accounts: vec![output],
         label: Some(spread_label(venue)),
+        resolve: None,
+        within: None,
     };
 
     Ok(action)

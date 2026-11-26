@@ -278,7 +278,7 @@ mod tests {
             account: "FQmFVQ7i8GCLqwE7EriUA4WQCvyCKxAeY4XUr55ZD6D7"
                 .parse()
                 .expect("an address"),
-            discriminator: Some("temp".to_string()),
+            discriminator: Some("tempvenu".to_string()),
             len: 2385,
             max_tiers: 32,
             balance_mirrors: vec![2321, 2329],
@@ -307,7 +307,7 @@ mod tests {
     fn state(vault_amounts: [u64; 2]) -> Account {
         let layout = layout();
         let mut data = vec![0u8; layout.len];
-        data[..8].copy_from_slice(b"temp");
+        data[..8].copy_from_slice(b"tempvenu");
         for (side, prices) in [PRICES_A, PRICES_B].into_iter().enumerate() {
             let ladder = &layout.ladders[side];
             write_u128(&mut data, ladder.count, ladder.width, 4).expect("in bounds");

@@ -23,7 +23,7 @@ Implementation Details:
 ## Usage
 ```bash
 export SIMULATOR_API_KEY=<key>
-cargo run --bin quote_decay -- --start-slot 422818048
+cargo run --bin quote_decay -- --start-slot 460919623 --slot-count 2
 ```
 
 The output CSV (specified via `--output`) contains one row per swap + slot, with the original onchain output next to the simulated result. Use `--program-id` to test a different aggregator.

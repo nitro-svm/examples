@@ -3,16 +3,14 @@ use std::fs::File;
 use std::io::{BufWriter, Write as _};
 
 use anyhow::{Context, Result};
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
 use simulator_api::{
     AccountModifications, ActionAnchor, ActionKind, DiscoveryFilter, ScheduledAction,
+    token::{token_account, with_token_amount},
 };
+use simulator_client::encode_transaction;
 use solana_address::Address;
 
-use backtest_example::utils::accounts::{
-    make_native_account, make_token_account, patch_real_token22_account,
-};
+use backtest_example::utils::accounts::make_native_account;
 use backtest_example::utils::parse::{WSOL_MINT, derive_ata, patch_titan_template_transaction};
 use backtest_example::utils::types::TitanVenueDiscriminant;
 
@@ -249,21 +247,19 @@ pub(crate) fn get_depth_actions(
     // Pre-fund enough to cover all `ITERATIONS` doublings of each leg's start size.
     let q2b_max = q2b_start.saturating_mul(1 << ITERATIONS);
     let b2q_max = b2q_start.saturating_mul(1 << ITERATIONS);
-    let quote_mint = &quote_mint.to_string();
-    let base_mint = &base_mint.to_string();
-    let quote_token_program = &quote_token_program.to_string();
-    let base_token_program = &base_token_program.to_string();
+    let quote_mint_str = &quote_mint.to_string();
+    let base_mint_str = &base_mint.to_string();
 
     // Inputs are each signer's ATA for the mint it spends (derived here).
     //   q2b (quote->base): swap quote from q2b_input to base in q2b_output.
     //   b2q (base->quote): swap base from b2q_input ATA to USDC in b2q_output ATA.
-    let q2b_input = derive_ata(quote_signer, quote_mint).context("derive q2b USDC input")?;
+    let q2b_input = derive_ata(quote_signer, quote_mint_str).context("derive q2b USDC input")?;
     let q2b_output = if is_native_base {
         *quote_signer
     } else {
         *quote_receiver
     };
-    let b2q_input = derive_ata(base_signer, base_mint).context("derive b2q base input")?;
+    let b2q_input = derive_ata(base_signer, base_mint_str).context("derive b2q base input")?;
     let b2q_output = base_receiver;
 
     // Fund the input ATA and seed each signer with native SOL for fees and rent.
@@ -273,14 +269,14 @@ pub(crate) fn get_depth_actions(
     let q2b_output_account = if is_native_base {
         make_native_account(DEPTH_SIGNER_LAMPORTS)
     } else if let Some(real) = quote_receiver_real {
-        patch_real_token22_account(real, 0)?
+        with_token_amount(real, 0)?
     } else {
-        make_token_account(quote_signer, base_mint, 0, base_token_program)?
+        token_account(*base_token_program, *base_mint, *quote_signer, 0)
     };
     let mut q2b_overrides_map = BTreeMap::from([
         (
             q2b_input,
-            make_token_account(quote_signer, quote_mint, q2b_max, quote_token_program)?,
+            token_account(*quote_token_program, *quote_mint, *quote_signer, q2b_max),
         ),
         (q2b_output, q2b_output_account),
     ]);
@@ -293,11 +289,11 @@ pub(crate) fn get_depth_actions(
     let b2q_overrides = AccountModifications(BTreeMap::from([
         (
             b2q_input,
-            make_token_account(base_signer, base_mint, b2q_max, base_token_program)?,
+            token_account(*base_token_program, *base_mint, *base_signer, b2q_max),
         ),
         (
             *b2q_output,
-            make_token_account(base_signer, quote_mint, 0, quote_token_program)?,
+            token_account(*quote_token_program, *quote_mint, *base_signer, 0),
         ),
     ]));
 
@@ -305,16 +301,16 @@ pub(crate) fn get_depth_actions(
     let mut b2q_size = b2q_start;
     let mut actions = vec![];
     for _ in 0..ITERATIONS {
-        let q2b_tx = STANDARD.encode(bincode::serialize(&patch_titan_template_transaction(
+        let q2b_tx = encode_transaction(&patch_titan_template_transaction(
             quote_to_base,
             q2b_input,
             q2b_size,
-        )?)?);
-        let b2q_tx = STANDARD.encode(bincode::serialize(&patch_titan_template_transaction(
+        )?)?;
+        let b2q_tx = encode_transaction(&patch_titan_template_transaction(
             base_to_quote,
             b2q_input,
             b2q_size,
-        )?)?);
+        )?)?;
 
         actions.push(ScheduledAction {
             anchor: anchor.clone(),
@@ -324,6 +320,8 @@ pub(crate) fn get_depth_actions(
             feeds_reroute: false,
             return_accounts: vec![q2b_output],
             label: Some(depth_q2b_label(venue, q2b_size)),
+            resolve: None,
+            within: None,
         });
 
         actions.push(ScheduledAction {
@@ -334,6 +332,8 @@ pub(crate) fn get_depth_actions(
             feeds_reroute: false,
             return_accounts: vec![*b2q_output],
             label: Some(depth_b2q_label(venue, b2q_size)),
+            resolve: None,
+            within: None,
         });
 
         q2b_size = q2b_size.saturating_mul(2);
